@@ -1,0 +1,67 @@
+// ============================================
+// 共享常量
+// ============================================
+
+export const APP_NAME = '数据采集上传工具'
+
+export const DEFAULT_SETTINGS = {
+  scan: {
+    directories: [],
+    intervalSeconds: 30
+  },
+  upload: {
+    maxConcurrentTasks: 5,
+    maxFilesPerTask: 6,
+    maxConcurrentUploads: 30,
+    multipartThreshold: 100 * 1024 * 1024 // 100MB
+  },
+  oss: {
+    endpoint: '',
+    bucket: '',
+    region: '',
+    prefix: '',
+    accessKeyId: '',
+    accessKeySecret: ''
+  },
+  filter: {
+    whitelist: [],
+    blacklist: [],
+    regex: [],
+    suffixes: ['.jpg', '.jpeg', '.png', '.bmp', '.csv', '.json', '.log', '.txt']
+  },
+  webhook: {
+    url: '',
+    headers: {},
+    enabled: false
+  },
+  hotkey: 'CommandOrControl+Shift+U',
+  stability: {
+    checkIntervalMs: 5000,
+    checkCount: 3
+  },
+  log: {
+    directory: '',  // 空字符串表示使用默认 userData/logs
+    maxDays: 30
+  },
+  dataCollect: {
+    enabled: false
+  },
+  cleanup: {
+    enabled: false,
+    retentionDays: 7
+  }
+}
+
+export const MARKER_FILES = {
+  TMP_UPLOAD: 'tmp_upload.json',
+  PROCESS_TASK: 'process_task.json'
+} as const
+
+export const TASK_STATUS_LABELS: Record<string, string> = {
+  pending: '等待中',
+  scanning: '扫描中',
+  uploading: '上传中',
+  completed: '已完成',
+  failed: '失败',
+  paused: '已暂停'
+}

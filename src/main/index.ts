@@ -1,0 +1,291 @@
+import { app, BrowserWindow, shell, globalShortcut, Tray, Menu, nativeImage } from 'electron'
+import { join } from 'path'
+import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+import { registerAllIpc } from './ipc'
+import { initDatabase } from './db/database'
+import { getSettingsRepo } from './db/settings.repo'
+import { getScannerService } from './services/scanner.service'
+import { getTaskQueueService } from './services/task-queue.service'
+import { getTaskRunnerService } from './services/task-runner.service'
+import { getWebhookService } from './services/webhook.service'
+import { getCleanupService } from './services/cleanup.service'
+import { getTaskRepo } from './db/task.repo'
+import { initLogger } from './utils/logger'
+import type { WebhookConfig, LogConfig } from '@shared/types'
+import log from 'electron-log'
+
+let mainWindow: BrowserWindow | null = null
+let annotationWindow: BrowserWindow | null = null
+let tray: Tray | null = null
+
+function createWindow(): void {
+  mainWindow = new BrowserWindow({
+    width: 1100,
+    height: 750,
+    minWidth: 900,
+    minHeight: 600,
+    show: false,
+    title: '数据采集上传工具',
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  })
+
+  mainWindow.on('ready-to-show', () => {
+    mainWindow?.show()
+  })
+
+  // 关闭时隐藏到托盘而不是退出
+  mainWindow.on('close', (e) => {
+    if (!(app as unknown as { isQuitting: boolean }).isQuitting) {
+      e.preventDefault()
+      mainWindow?.hide()
+    }
+  })
+
+  mainWindow.webContents.setWindowOpenHandler((details) => {
+    shell.openExternal(details.url)
+    return { action: 'deny' }
+  })
+
+  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+  } else {
+    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+  }
+}
+
+function createTray(): void {
+  // 使用一个简单的 16x16 图标（纯色方块作为占位）
+  const icon = nativeImage.createEmpty()
+  tray = new Tray(icon.isEmpty() ? nativeImage.createFromBuffer(Buffer.alloc(0)) : icon)
+
+  const contextMenu = Menu.buildFromTemplate([
+    {
+      label: '显示主窗口',
+      click: () => {
+        mainWindow?.show()
+        mainWindow?.focus()
+      }
+    },
+    { type: 'separator' },
+    {
+      label: '退出',
+      click: () => {
+        ; (app as unknown as { isQuitting: boolean }).isQuitting = true
+        app.quit()
+      }
+    }
+  ])
+
+  tray.setToolTip('数据采集上传工具')
+  tray.setContextMenu(contextMenu)
+  tray.on('click', () => {
+    mainWindow?.show()
+    mainWindow?.focus()
+  })
+}
+
+function registerHotkey(): void {
+  try {
+    const settingsRepo = getSettingsRepo()
+    const hotkey = settingsRepo.get<string>('hotkey') || 'CommandOrControl+Shift+U'
+    globalShortcut.register(hotkey, () => {
+      if (mainWindow) {
+        if (mainWindow.isVisible()) {
+          mainWindow.hide()
+        } else {
+          mainWindow.show()
+          mainWindow.focus()
+        }
+      }
+    })
+  } catch (err) {
+    log.error('注册快捷键失败:', err)
+  }
+}
+
+function startServices(): void {
+  const taskQueue = getTaskQueueService()
+  const taskRunner = getTaskRunnerService()
+  const webhookService = getWebhookService()
+  const taskRepo = getTaskRepo()
+  const settingsRepo = getSettingsRepo()
+
+  // 连接任务队列和执行器
+  taskQueue.setTaskRunner(async (task, signal) => {
+    await taskRunner.run(task, signal)
+
+    // 上传完成后发送 webhook
+    const webhookConfig = settingsRepo.get<WebhookConfig>('webhook')
+    if (webhookConfig?.enabled) {
+      const updatedTask = taskRepo.getById(task.id)
+      if (updatedTask) {
+        const createdAt = new Date(updatedTask.createdAt).getTime()
+        const now = Date.now()
+        const durationSeconds = Math.round((now - createdAt) / 1000)
+
+        webhookService.notify(webhookConfig, {
+          event: 'task_completed',
+          taskId: updatedTask.id,
+          folderName: updatedTask.folderName,
+          fileCount: updatedTask.totalFiles,
+          totalBytes: updatedTask.totalBytes,
+          durationSeconds,
+          status: 'completed',
+          timestamp: new Date().toISOString()
+        })
+      }
+    }
+  })
+
+  // 监听任务失败事件发送 webhook
+  taskQueue.on('task:status-change', (event: { taskId: string; newStatus: string }) => {
+    if (event.newStatus === 'failed') {
+      const webhookConfig = settingsRepo.get<WebhookConfig>('webhook')
+      if (webhookConfig?.enabled) {
+        const task = taskRepo.getById(event.taskId)
+        if (task) {
+          webhookService.notify(webhookConfig, {
+            event: 'task_failed',
+            taskId: task.id,
+            folderName: task.folderName,
+            fileCount: task.totalFiles,
+            totalBytes: task.totalBytes,
+            durationSeconds: 0,
+            status: 'failed',
+            timestamp: new Date().toISOString()
+          })
+        }
+      }
+    }
+
+    // 广播状态变更到渲染进程
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send('task:status-change', event)
+    }
+  })
+
+  // 恢复未完成的任务
+  const unfinished = taskRepo.getUnfinishedTasks()
+  if (unfinished.length > 0) {
+    log.info(`发现 ${unfinished.length} 个未完成任务，重新加入队列`)
+    for (const task of unfinished) {
+      if (task.status === 'uploading' || task.status === 'scanning') {
+        taskRepo.updateStatus(task.id, 'pending')
+      }
+    }
+  }
+
+  // 启动任务队列
+  taskQueue.start()
+
+  // 启动扫描器
+  const scanner = getScannerService()
+  scanner.start()
+
+  // 启动自动清理服务
+  getCleanupService().start()
+
+  log.info('所有服务已启动')
+}
+
+app.whenReady().then(() => {
+  electronApp.setAppUserModelId('com.uploader.app')
+
+  app.on('browser-window-created', (_, window) => {
+    optimizer.watchWindowShortcuts(window)
+  })
+
+  // 初始化日志系统（在数据库之前，使用默认配置）
+  initLogger()
+
+  // 初始化数据库
+  initDatabase()
+
+  // 从数据库读取日志配置并重新初始化
+  const logConfig = getSettingsRepo().get<LogConfig>('log')
+  if (logConfig?.directory) {
+    initLogger(logConfig)
+  }
+
+  // 注册所有 IPC 处理器
+  registerAllIpc()
+
+  // 创建窗口
+  createWindow()
+
+  // 创建托盘
+  createTray()
+
+  // 注册全局快捷键
+  registerHotkey()
+
+  // 启动后端服务
+  startServices()
+
+  log.info('应用启动完成')
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow()
+    }
+  })
+})
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit()
+  }
+})
+
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll()
+  getScannerService().stop()
+  getTaskQueueService().stop()
+  getCleanupService().stop()
+})
+
+  ; (app as unknown as { isQuitting: boolean }).isQuitting = false
+
+app.on('before-quit', () => {
+  ; (app as unknown as { isQuitting: boolean }).isQuitting = true
+})
+
+export function getMainWindow(): BrowserWindow | null {
+  return mainWindow
+}
+
+export function createAnnotationWindow(): void {
+  if (annotationWindow && !annotationWindow.isDestroyed()) {
+    annotationWindow.focus()
+    return
+  }
+
+  annotationWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    minWidth: 960,
+    minHeight: 640,
+    title: '图像标注',
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  })
+
+  annotationWindow.on('closed', () => {
+    annotationWindow = null
+  })
+
+  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+    annotationWindow.loadURL(process.env['ELECTRON_RENDERER_URL'] + '#/annotation')
+  } else {
+    annotationWindow.loadFile(join(__dirname, '../renderer/index.html'), { hash: 'annotation' })
+  }
+}

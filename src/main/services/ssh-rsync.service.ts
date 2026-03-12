@@ -1,0 +1,342 @@
+import { spawn, type ChildProcess } from 'child_process'
+import { Client as SSHClient, type SFTPWrapper } from 'ssh2'
+import { readFileSync } from 'fs'
+import { join, posix } from 'path'
+import log from 'electron-log'
+import type { SSHMachine, RsyncProgress, SftpProgress, AppSettings } from '@shared/types'
+import type { OSSUploadService } from './oss-upload.service'
+
+/**
+ * SSH + rsync / SFTP 远程传输服务
+ * - rsync: 拉取到本地后自动触发 OSS 上传
+ * - sftp: 流式直传到 OSS，不落盘
+ */
+export class SSHRsyncService {
+  private runningProcesses: Map<string, ChildProcess | SSHClient> = new Map()
+
+  /**
+   * 测试 SSH 连接
+   */
+  async testConnection(machine: SSHMachine, password?: string): Promise<{ ok: boolean; error?: string }> {
+    return new Promise((resolve) => {
+      const client = new SSHClient()
+      const timeout = setTimeout(() => {
+        client.end()
+        resolve({ ok: false, error: '连接超时 (10s)' })
+      }, 10000)
+
+      client.on('ready', () => {
+        clearTimeout(timeout)
+        client.end()
+        resolve({ ok: true })
+      })
+
+      client.on('error', (err) => {
+        clearTimeout(timeout)
+        resolve({ ok: false, error: err.message })
+      })
+
+      const connectOpts: Record<string, unknown> = {
+        host: machine.host,
+        port: machine.port,
+        username: machine.username
+      }
+
+      if (machine.authType === 'key' && machine.privateKeyPath) {
+        try {
+          connectOpts.privateKey = readFileSync(machine.privateKeyPath)
+        } catch (err) {
+          resolve({ ok: false, error: `无法读取密钥文件: ${err}` })
+          return
+        }
+      } else if (password) {
+        connectOpts.password = password
+      }
+
+      client.connect(connectOpts as Parameters<typeof client.connect>[0])
+    })
+  }
+
+  /**
+   * 执行 rsync 拉取
+   */
+  async startRsync(
+    machine: SSHMachine,
+    password?: string,
+    onProgress?: (progress: RsyncProgress) => void
+  ): Promise<void> {
+    if (this.runningProcesses.has(machine.id)) {
+      throw new Error('该机器已有传输进程在运行')
+    }
+
+    return new Promise((resolve, reject) => {
+      const args = this.buildRsyncArgs(machine)
+      const env = { ...process.env }
+
+      let cmd: string
+      let cmdArgs: string[]
+
+      if (machine.authType === 'password' && password) {
+        cmd = 'sshpass'
+        cmdArgs = ['-p', password, 'rsync', ...args]
+      } else {
+        cmd = 'rsync'
+        cmdArgs = args
+      }
+
+      log.info(`rsync 启动: ${cmd} ${cmdArgs.join(' ')}`)
+
+      const proc = spawn(cmd, cmdArgs, { env })
+      this.runningProcesses.set(machine.id, proc)
+
+      let stderr = ''
+
+      proc.stdout?.on('data', (data: Buffer) => {
+        const line = data.toString()
+        const progress = this.parseRsyncProgress(machine.id, line)
+        if (progress && onProgress) {
+          onProgress(progress)
+        }
+      })
+
+      proc.stderr?.on('data', (data: Buffer) => {
+        stderr += data.toString()
+      })
+
+      proc.on('close', (code) => {
+        this.runningProcesses.delete(machine.id)
+        if (code === 0) {
+          log.info(`rsync 完成: ${machine.name}`)
+          resolve()
+        } else {
+          const err = `rsync 退出码 ${code}: ${stderr}`
+          log.error(err)
+          reject(new Error(err))
+        }
+      })
+
+      proc.on('error', (err) => {
+        this.runningProcesses.delete(machine.id)
+        reject(err)
+      })
+    })
+  }
+
+  /**
+   * SFTP 流式直传到 OSS（不落盘）
+   */
+  async sftpStreamToOSS(
+    machine: SSHMachine,
+    password: string | undefined,
+    ossService: OSSUploadService,
+    ossConfig: AppSettings['oss'],
+    onProgress?: (progress: SftpProgress) => void
+  ): Promise<void> {
+    if (this.runningProcesses.has(machine.id)) {
+      throw new Error('该机器已有传输进程在运行')
+    }
+
+    ossService.configure(ossConfig)
+
+    const client = new SSHClient()
+    this.runningProcesses.set(machine.id, client)
+
+    return new Promise((resolve, reject) => {
+      const connectOpts: Record<string, unknown> = {
+        host: machine.host,
+        port: machine.port,
+        username: machine.username
+      }
+
+      if (machine.authType === 'key' && machine.privateKeyPath) {
+        try {
+          connectOpts.privateKey = readFileSync(machine.privateKeyPath)
+        } catch (err) {
+          this.runningProcesses.delete(machine.id)
+          reject(new Error(`无法读取密钥文件: ${err}`))
+          return
+        }
+      } else if (password) {
+        connectOpts.password = password
+      }
+
+      client.on('error', (err) => {
+        this.runningProcesses.delete(machine.id)
+        reject(err)
+      })
+
+      client.on('ready', () => {
+        client.sftp(async (err, sftp) => {
+          if (err) {
+            client.end()
+            this.runningProcesses.delete(machine.id)
+            reject(err)
+            return
+          }
+
+          try {
+            await this.sftpUploadDir(
+              sftp,
+              machine,
+              ossService,
+              ossConfig.prefix || '',
+              onProgress
+            )
+            client.end()
+            this.runningProcesses.delete(machine.id)
+            resolve()
+          } catch (uploadErr) {
+            client.end()
+            this.runningProcesses.delete(machine.id)
+            reject(uploadErr)
+          }
+        })
+      })
+
+      client.connect(connectOpts as Parameters<typeof client.connect>[0])
+    })
+  }
+
+  private async sftpUploadDir(
+    sftp: SFTPWrapper,
+    machine: SSHMachine,
+    ossService: OSSUploadService,
+    ossPrefix: string,
+    onProgress?: (progress: SftpProgress) => void
+  ): Promise<void> {
+    // 递归列出所有远程文件
+    const files = await this.sftpListFiles(sftp, machine.remoteDir, machine.remoteDir)
+    log.info(`SFTP 发现 ${files.length} 个文件`)
+
+    const folderName = posix.basename(machine.remoteDir)
+    let uploadedCount = 0
+
+    for (const remoteFile of files) {
+      const relativePath = remoteFile.slice(machine.remoteDir.length).replace(/^\//, '')
+      const ossKey = [ossPrefix, folderName, relativePath].filter(Boolean).join('/').replace(/\/+/g, '/')
+
+      onProgress?.({
+        machineId: machine.id,
+        totalFiles: files.length,
+        uploadedFiles: uploadedCount,
+        currentFile: relativePath,
+        speed: ''
+      })
+
+      // 通过 SFTP 流式读取并上传到 OSS
+      await new Promise<void>((res, rej) => {
+        const readStream = sftp.createReadStream(remoteFile)
+        const chunks: Buffer[] = []
+
+        readStream.on('data', (chunk: Buffer) => {
+          chunks.push(chunk)
+        })
+
+        readStream.on('end', async () => {
+          try {
+            const buffer = Buffer.concat(chunks)
+            await ossService.uploadBuffer(buffer, ossKey)
+            uploadedCount++
+            res()
+          } catch (e) {
+            rej(e)
+          }
+        })
+
+        readStream.on('error', rej)
+      })
+    }
+
+    onProgress?.({
+      machineId: machine.id,
+      totalFiles: files.length,
+      uploadedFiles: uploadedCount,
+      currentFile: '',
+      speed: ''
+    })
+
+    log.info(`SFTP 直传完成: ${uploadedCount}/${files.length} 个文件`)
+  }
+
+  private sftpListFiles(sftp: SFTPWrapper, basePath: string, currentPath: string): Promise<string[]> {
+    return new Promise((resolve, reject) => {
+      sftp.readdir(currentPath, async (err, list) => {
+        if (err) {
+          reject(err)
+          return
+        }
+
+        const files: string[] = []
+        for (const item of list) {
+          if (item.filename.startsWith('.')) continue
+          const fullPath = posix.join(currentPath, item.filename)
+
+          if (item.attrs.isDirectory()) {
+            const subFiles = await this.sftpListFiles(sftp, basePath, fullPath)
+            files.push(...subFiles)
+          } else if (item.attrs.isFile()) {
+            files.push(fullPath)
+          }
+        }
+        resolve(files)
+      })
+    })
+  }
+
+  stopRsync(machineId: string): void {
+    const running = this.runningProcesses.get(machineId)
+    if (running) {
+      if (running instanceof SSHClient) {
+        running.end()
+      } else {
+        (running as ChildProcess).kill('SIGTERM')
+      }
+      this.runningProcesses.delete(machineId)
+      log.info('传输已停止:', machineId)
+    }
+  }
+
+  private buildRsyncArgs(machine: SSHMachine): string[] {
+    const args: string[] = [
+      '-avz',
+      '--partial',
+      '--progress',
+      `--bwlimit=${machine.bwLimit}`
+    ]
+
+    const sshCmd = machine.authType === 'key' && machine.privateKeyPath
+      ? `ssh -i ${machine.privateKeyPath} -p ${machine.port} -o StrictHostKeyChecking=no`
+      : `ssh -p ${machine.port} -o StrictHostKeyChecking=no`
+
+    const remoteRsync = `nice -n ${machine.cpuNice} ionice -c 3 rsync`
+    args.push(`--rsync-path=${remoteRsync}`)
+    args.push('-e', sshCmd)
+
+    const remotePath = machine.remoteDir.endsWith('/') ? machine.remoteDir : machine.remoteDir + '/'
+    const source = `${machine.username}@${machine.host}:${remotePath}`
+    const dest = machine.localDir.endsWith('/') ? machine.localDir : machine.localDir + '/'
+
+    args.push(source, dest)
+
+    return args
+  }
+
+  private parseRsyncProgress(machineId: string, line: string): RsyncProgress | null {
+    const match = line.match(/(\d+)%\s+([\d.]+\w+\/s)/)
+    if (match) {
+      return {
+        machineId,
+        percent: parseInt(match[1]),
+        speed: match[2],
+        file: line.trim().split('\n')[0] || ''
+      }
+    }
+    return null
+  }
+}
+
+let instance: SSHRsyncService | null = null
+export function getSSHRsyncService(): SSHRsyncService {
+  if (!instance) instance = new SSHRsyncService()
+  return instance
+}
