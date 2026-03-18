@@ -13,7 +13,9 @@ export const DEFAULT_SETTINGS = {
     maxConcurrentTasks: 5,
     maxFilesPerTask: 6,
     maxConcurrentUploads: 30,
-    multipartThreshold: 100 * 1024 * 1024 // 100MB
+    multipartThreshold: 100 * 1024 * 1024, // 100MB
+    startAfterTime: '20:30',
+    endBeforeTime: '23:59'
   },
   oss: {
     endpoint: '',

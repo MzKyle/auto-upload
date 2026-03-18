@@ -137,19 +137,48 @@ export class OSSUploadService {
   }
 
   async testConnection(config: AppSettings['oss']): Promise<{ ok: boolean; error?: string }> {
+    const endpoint = config.endpoint.trim()
+    const region = config.region.trim()
+    const bucket = config.bucket.trim()
+    const accessKeyId = config.accessKeyId.trim()
+    const accessKeySecret = config.accessKeySecret.trim()
+
+    if (!region) return { ok: false, error: 'Region 不能为空' }
+    if (!bucket) return { ok: false, error: 'Bucket 不能为空' }
+    if (!accessKeyId) return { ok: false, error: 'AccessKey ID 不能为空' }
+    if (!accessKeySecret) return { ok: false, error: 'AccessKey Secret 不能为空' }
+
     try {
       const OSS = (await import('ali-oss')).default
       const client = new OSS({
-        region: config.region,
-        accessKeyId: config.accessKeyId,
-        accessKeySecret: config.accessKeySecret,
-        bucket: config.bucket,
-        endpoint: config.endpoint || undefined
+        region,
+        accessKeyId,
+        accessKeySecret,
+        bucket,
+        endpoint: endpoint || undefined,
+        timeout: '10s',
+        secure: true
       })
-      await (client as unknown as { listBuckets: (opts: Record<string, never>) => Promise<unknown> }).listBuckets({})
-      return { ok: true }
-    } catch (err) {
-      return { ok: false, error: String(err) }
+
+      // 必须访问当前配置的 bucket，才能真正验证“桶可连接且有权限”
+      const result = await (client as unknown as {
+        list: (query?: Record<string, string | number>) => Promise<{ res?: { status?: number } }>
+      }).list({ 'max-keys': 1 })
+
+      const statusCode = result?.res?.status
+      if (typeof statusCode === 'number' && statusCode >= 200 && statusCode < 300) {
+        return { ok: true }
+      }
+
+      return { ok: false, error: `桶连接校验失败，HTTP 状态码: ${statusCode ?? 'unknown'}` }
+    } catch (err: unknown) {
+      const e = err as { message?: string; code?: string; status?: number; name?: string }
+      const parts = [
+        e.code || e.name,
+        typeof e.status === 'number' ? `status=${e.status}` : undefined,
+        e.message
+      ].filter(Boolean)
+      return { ok: false, error: parts.join(', ') || String(err) }
     }
   }
 }

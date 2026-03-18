@@ -3,13 +3,14 @@ import { Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { formatBytes, formatDuration } from "@/lib/utils";
-import { fetchHistory, clearHistory } from "@/lib/ipc-client";
+import { fetchHistory, clearHistory, deleteHistoryItem } from "@/lib/ipc-client";
 import type { HistoryItem } from "@shared/types";
 
 export default function History() {
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const pageSize = 20;
 
   const load = useCallback(async () => {
@@ -26,6 +27,26 @@ export default function History() {
     await clearHistory();
     load();
   }, [load]);
+
+  const handleDeleteItem = useCallback(
+    async (item: HistoryItem) => {
+      const ok = window.confirm(`确认删除历史记录「${item.folderName}」吗？`);
+      if (!ok) return;
+
+      setDeletingId(item.id);
+      try {
+        await deleteHistoryItem(item.id);
+        if (items.length === 1 && page > 1) {
+          setPage((p) => p - 1);
+          return;
+        }
+        await load();
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [items.length, load, page]
+  );
 
   const totalPages = Math.ceil(total / pageSize);
 
@@ -59,6 +80,7 @@ export default function History() {
                 <th className="text-left p-3 font-medium">耗时</th>
                 <th className="text-left p-3 font-medium">状态</th>
                 <th className="text-left p-3 font-medium">完成时间</th>
+                <th className="text-left p-3 font-medium">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -81,6 +103,18 @@ export default function History() {
                   </td>
                   <td className="p-3 text-muted-foreground">
                     {new Date(item.completedAt).toLocaleString("zh-CN")}
+                  </td>
+                  <td className="p-3">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-destructive hover:text-destructive"
+                      onClick={() => handleDeleteItem(item)}
+                      disabled={deletingId === item.id}
+                    >
+                      <Trash2 className="h-4 w-4 mr-1" />
+                      {deletingId === item.id ? "删除中..." : "删除"}
+                    </Button>
                   </td>
                 </tr>
               ))}

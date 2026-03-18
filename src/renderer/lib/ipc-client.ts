@@ -120,6 +120,10 @@ export async function clearHistory(before?: string): Promise<void> {
   await api.invoke(IPC.HISTORY_CLEAR, before ? { before } : undefined)
 }
 
+export async function deleteHistoryItem(id: string): Promise<void> {
+  await api.invoke(IPC.HISTORY_DELETE, { id })
+}
+
 // ---- 对话框 ----
 export async function selectFolder(): Promise<string | null> {
   return (await api.invoke(IPC.DIALOG_SELECT_FOLDER)) as string | null

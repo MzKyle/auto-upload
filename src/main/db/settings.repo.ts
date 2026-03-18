@@ -2,6 +2,17 @@ import { getDb } from './database'
 import { DEFAULT_SETTINGS } from '@shared/constants'
 import type { AppSettings } from '@shared/types'
 
+function normalizeSuffixes(suffixes: string[]): string[] {
+  const normalized = suffixes
+    .map((suffix) => suffix.trim().toLowerCase())
+    .filter(Boolean)
+    .map((suffix) => (suffix.startsWith('.') ? suffix : `.${suffix}`))
+
+  const unique = Array.from(new Set(normalized))
+  if (!unique.includes('.csv')) unique.push('.csv')
+  return unique
+}
+
 export class SettingsRepo {
   get<T>(key: string): T | null {
     const db = getDb()
@@ -10,7 +21,18 @@ export class SettingsRepo {
       | undefined
     if (!row) return null
     try {
-      return JSON.parse(row.value) as T
+      const parsed = JSON.parse(row.value) as T
+      if (
+        key === 'filter' &&
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        'suffixes' in (parsed as Record<string, unknown>) &&
+        Array.isArray((parsed as Record<string, unknown>).suffixes)
+      ) {
+        const filter = parsed as Record<string, unknown>
+        filter.suffixes = normalizeSuffixes(filter.suffixes as string[])
+      }
+      return parsed
     } catch {
       return row.value as unknown as T
     }
@@ -19,7 +41,23 @@ export class SettingsRepo {
   set(key: string, value: unknown): void {
     const db = getDb()
     const now = new Date().toISOString()
-    const serialized = typeof value === 'string' ? value : JSON.stringify(value)
+    let persistedValue = value
+
+    if (
+      key === 'filter' &&
+      typeof value === 'object' &&
+      value !== null &&
+      'suffixes' in (value as Record<string, unknown>) &&
+      Array.isArray((value as Record<string, unknown>).suffixes)
+    ) {
+      const filter = value as Record<string, unknown>
+      persistedValue = {
+        ...filter,
+        suffixes: normalizeSuffixes(filter.suffixes as string[])
+      }
+    }
+
+    const serialized = typeof persistedValue === 'string' ? persistedValue : JSON.stringify(persistedValue)
     db.prepare(
       'INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?'
     ).run(key, serialized, now, serialized, now)
@@ -42,12 +80,29 @@ export class SettingsRepo {
     for (const { section, key } of keys) {
       const val = this.get(key)
       if (val !== null) {
-        ; (settings as Record<string, unknown>)[section] = val
+        const defaultSection = (settings as Record<string, unknown>)[section]
+        if (
+          typeof defaultSection === 'object' &&
+          defaultSection !== null &&
+          typeof val === 'object' &&
+          val !== null
+        ) {
+          ; (settings as Record<string, unknown>)[section] = {
+            ...(defaultSection as Record<string, unknown>),
+            ...(val as Record<string, unknown>)
+          }
+        } else {
+          ; (settings as Record<string, unknown>)[section] = val
+        }
       }
     }
 
     const hotkey = this.get<string>('hotkey')
     if (hotkey) settings.hotkey = hotkey
+
+    if (settings.filter && Array.isArray(settings.filter.suffixes)) {
+      settings.filter.suffixes = normalizeSuffixes(settings.filter.suffixes)
+    }
 
     return settings
   }

@@ -60,7 +60,7 @@ export class FileFilterService {
 
     // 4. 后缀匹配：如果配置了后缀列表，只包含匹配的
     if (this.rules.suffixes.length > 0) {
-      return this.rules.suffixes.some((s) => ext === s.toLowerCase())
+      return this.rules.suffixes.some((suffix) => ext === this.normalizeSuffix(suffix))
     }
 
     // 未配置任何后缀规则时默认包含
@@ -116,5 +116,11 @@ export class FileFilterService {
       }
     }
     return false
+  }
+
+  private normalizeSuffix(suffix: string): string {
+    const trimmed = suffix.trim().toLowerCase()
+    if (!trimmed) return ''
+    return trimmed.startsWith('.') ? trimmed : `.${trimmed}`
   }
 }

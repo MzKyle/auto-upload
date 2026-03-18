@@ -5,11 +5,14 @@ directories:
   output: dist
 files:
   - out/**/*
-  - "!node_modules/**/*"
+  - package.json
+  - node_modules/**/*
 extraResources:
   - from: resources/
     to: resources/
 asar: true
+asarUnpack:
+  - node_modules/better-sqlite3/**/*
 linux:
   target:
     - target: AppImage

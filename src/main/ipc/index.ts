@@ -222,6 +222,10 @@ export function registerAllIpc(): void {
     getHistoryRepo().clear(args?.before)
   })
 
+  ipcMain.handle(IPC.HISTORY_DELETE, (_event, args: { id: string }) => {
+    getHistoryRepo().deleteById(args.id)
+  })
+
   // ---- 对话框 ----
   ipcMain.handle(IPC.DIALOG_SELECT_FOLDER, async () => {
     const win = getMainWindow()

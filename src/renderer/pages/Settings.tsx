@@ -276,7 +276,7 @@ export default function Settings() {
           <CardTitle className="text-base">上传配置</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
             <div>
               <Label>最大并发任务数</Label>
               <Input
@@ -335,6 +335,46 @@ export default function Settings() {
               />
               <p className="text-xs text-muted-foreground mt-1">
                 跨任务全局上限
+              </p>
+            </div>
+            <div>
+              <Label>开始上传时间</Label>
+              <Input
+                type="time"
+                value={local.upload.startAfterTime || "20:30"}
+                onChange={(e) =>
+                  setLocal((p) => ({
+                    ...p,
+                    upload: {
+                      ...p.upload,
+                      startAfterTime: e.target.value || "20:30",
+                    },
+                  }))
+                }
+                className="mt-1"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                新任务仅在时间窗口内启动
+              </p>
+            </div>
+            <div>
+              <Label>结束上传时间</Label>
+              <Input
+                type="time"
+                value={local.upload.endBeforeTime || "23:59"}
+                onChange={(e) =>
+                  setLocal((p) => ({
+                    ...p,
+                    upload: {
+                      ...p.upload,
+                      endBeforeTime: e.target.value || "23:59",
+                    },
+                  }))
+                }
+                className="mt-1"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                支持跨天（如 20:30 - 06:00）
               </p>
             </div>
           </div>

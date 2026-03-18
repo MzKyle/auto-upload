@@ -47,6 +47,7 @@ export const IPC = {
   // 历史
   HISTORY_LIST: 'history:list',
   HISTORY_CLEAR: 'history:clear',
+  HISTORY_DELETE: 'history:delete',
 
   // 磁盘用量
   DISK_USAGE: 'disk:usage',

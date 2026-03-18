@@ -50,6 +50,11 @@ export class HistoryRepo {
       db.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed')").run()
     }
   }
+
+  deleteById(id: string): void {
+    const db = getDb()
+    db.prepare("DELETE FROM tasks WHERE id = ? AND status IN ('completed', 'failed')").run(id)
+  }
 }
 
 let instance: HistoryRepo | null = null

@@ -171,6 +171,7 @@ const IPC = {
   // 历史
   HISTORY_LIST: "history:list",
   HISTORY_CLEAR: "history:clear",
+  HISTORY_DELETE: "history:delete",
   // 磁盘用量
   DISK_USAGE: "disk:usage",
   // 窗口
@@ -437,8 +438,10 @@ const DEFAULT_SETTINGS = {
     maxConcurrentTasks: 5,
     maxFilesPerTask: 6,
     maxConcurrentUploads: 30,
-    multipartThreshold: 100 * 1024 * 1024
+    multipartThreshold: 100 * 1024 * 1024,
     // 100MB
+    startAfterTime: "20:30",
+    endBeforeTime: "23:59"
   },
   oss: {
     endpoint: "",
@@ -481,13 +484,24 @@ const MARKER_FILES = {
   TMP_UPLOAD: "tmp_upload.json",
   PROCESS_TASK: "process_task.json"
 };
+function normalizeSuffixes(suffixes) {
+  const normalized = suffixes.map((suffix) => suffix.trim().toLowerCase()).filter(Boolean).map((suffix) => suffix.startsWith(".") ? suffix : `.${suffix}`);
+  const unique = Array.from(new Set(normalized));
+  if (!unique.includes(".csv")) unique.push(".csv");
+  return unique;
+}
 class SettingsRepo {
   get(key) {
     const db2 = getDb();
     const row = db2.prepare("SELECT value FROM settings WHERE key = ?").get(key);
     if (!row) return null;
     try {
-      return JSON.parse(row.value);
+      const parsed = JSON.parse(row.value);
+      if (key === "filter" && typeof parsed === "object" && parsed !== null && "suffixes" in parsed && Array.isArray(parsed.suffixes)) {
+        const filter = parsed;
+        filter.suffixes = normalizeSuffixes(filter.suffixes);
+      }
+      return parsed;
     } catch {
       return row.value;
     }
@@ -495,7 +509,15 @@ class SettingsRepo {
   set(key, value) {
     const db2 = getDb();
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    const serialized = typeof value === "string" ? value : JSON.stringify(value);
+    let persistedValue = value;
+    if (key === "filter" && typeof value === "object" && value !== null && "suffixes" in value && Array.isArray(value.suffixes)) {
+      const filter = value;
+      persistedValue = {
+        ...filter,
+        suffixes: normalizeSuffixes(filter.suffixes)
+      };
+    }
+    const serialized = typeof persistedValue === "string" ? persistedValue : JSON.stringify(persistedValue);
     db2.prepare(
       "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?"
     ).run(key, serialized, now, serialized, now);
@@ -515,11 +537,22 @@ class SettingsRepo {
     for (const { section, key } of keys) {
       const val = this.get(key);
       if (val !== null) {
-        settings[section] = val;
+        const defaultSection = settings[section];
+        if (typeof defaultSection === "object" && defaultSection !== null && typeof val === "object" && val !== null) {
+          settings[section] = {
+            ...defaultSection,
+            ...val
+          };
+        } else {
+          settings[section] = val;
+        }
       }
     }
     const hotkey = this.get("hotkey");
     if (hotkey) settings.hotkey = hotkey;
+    if (settings.filter && Array.isArray(settings.filter.suffixes)) {
+      settings.filter.suffixes = normalizeSuffixes(settings.filter.suffixes);
+    }
     return settings;
   }
   saveAll(partial) {
@@ -577,6 +610,10 @@ class HistoryRepo {
     } else {
       db2.prepare("DELETE FROM tasks WHERE status IN ('completed', 'failed')").run();
     }
+  }
+  deleteById(id) {
+    const db2 = getDb();
+    db2.prepare("DELETE FROM tasks WHERE id = ? AND status IN ('completed', 'failed')").run(id);
   }
 }
 let instance$9 = null;
@@ -1127,6 +1164,8 @@ function getScannerService() {
   return instance$7;
 }
 class TaskQueueService extends events.EventEmitter {
+  defaultStartAfterTime = "20:30";
+  defaultEndBeforeTime = "23:59";
   runningTasks = /* @__PURE__ */ new Map();
   processTimer = null;
   taskRunner = null;
@@ -1162,6 +1201,7 @@ class TaskQueueService extends events.EventEmitter {
     if (!this.taskRunner) return;
     const settings = getSettingsRepo();
     const uploadConfig = settings.get("upload");
+    if (!this.isWithinUploadWindow(uploadConfig?.startAfterTime, uploadConfig?.endBeforeTime)) return;
     const maxConcurrent = uploadConfig?.maxConcurrentTasks || 5;
     const taskRepo = getTaskRepo();
     const availableSlots = maxConcurrent - this.runningTasks.size;
@@ -1207,6 +1247,33 @@ class TaskQueueService extends events.EventEmitter {
     } finally {
       this.runningTasks.delete(task.id);
     }
+  }
+  isWithinUploadWindow(startAfterTime, endBeforeTime) {
+    const normalizedStart = this.normalizeTime(startAfterTime, this.defaultStartAfterTime);
+    const normalizedEnd = this.normalizeTime(endBeforeTime, this.defaultEndBeforeTime);
+    const startMinutes = this.timeToMinutes(normalizedStart);
+    const endMinutes = this.timeToMinutes(normalizedEnd);
+    const now = /* @__PURE__ */ new Date();
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+    if (startMinutes === endMinutes) return true;
+    if (startMinutes < endMinutes) {
+      return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
+    }
+    return currentMinutes >= startMinutes || currentMinutes <= endMinutes;
+  }
+  timeToMinutes(time) {
+    const [hour, minute] = time.split(":").map(Number);
+    return hour * 60 + minute;
+  }
+  normalizeTime(time, fallback) {
+    if (!time) return fallback;
+    const match = time.match(/^(\d{1,2}):(\d{1,2})$/);
+    if (!match) return fallback;
+    const hour = Number(match[1]);
+    const minute = Number(match[2]);
+    if (Number.isNaN(hour) || Number.isNaN(minute)) return fallback;
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return fallback;
+    return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
   }
 }
 let instance$6 = null;
@@ -1573,19 +1640,40 @@ class OSSUploadService {
     return ossKey;
   }
   async testConnection(config) {
+    const endpoint = config.endpoint.trim();
+    const region = config.region.trim();
+    const bucket = config.bucket.trim();
+    const accessKeyId = config.accessKeyId.trim();
+    const accessKeySecret = config.accessKeySecret.trim();
+    if (!region) return { ok: false, error: "Region 不能为空" };
+    if (!bucket) return { ok: false, error: "Bucket 不能为空" };
+    if (!accessKeyId) return { ok: false, error: "AccessKey ID 不能为空" };
+    if (!accessKeySecret) return { ok: false, error: "AccessKey Secret 不能为空" };
     try {
       const OSS = (await import("ali-oss")).default;
       const client = new OSS({
-        region: config.region,
-        accessKeyId: config.accessKeyId,
-        accessKeySecret: config.accessKeySecret,
-        bucket: config.bucket,
-        endpoint: config.endpoint || void 0
+        region,
+        accessKeyId,
+        accessKeySecret,
+        bucket,
+        endpoint: endpoint || void 0,
+        timeout: "10s",
+        secure: true
       });
-      await client.listBuckets({});
-      return { ok: true };
+      const result = await client.list({ "max-keys": 1 });
+      const statusCode = result?.res?.status;
+      if (typeof statusCode === "number" && statusCode >= 200 && statusCode < 300) {
+        return { ok: true };
+      }
+      return { ok: false, error: `桶连接校验失败，HTTP 状态码: ${statusCode ?? "unknown"}` };
     } catch (err) {
-      return { ok: false, error: String(err) };
+      const e = err;
+      const parts = [
+        e.code || e.name,
+        typeof e.status === "number" ? `status=${e.status}` : void 0,
+        e.message
+      ].filter(Boolean);
+      return { ok: false, error: parts.join(", ") || String(err) };
     }
   }
 }
@@ -1760,6 +1848,9 @@ function registerAllIpc() {
   });
   electron.ipcMain.handle(IPC.HISTORY_CLEAR, (_event, args) => {
     getHistoryRepo().clear(args?.before);
+  });
+  electron.ipcMain.handle(IPC.HISTORY_DELETE, (_event, args) => {
+    getHistoryRepo().deleteById(args.id);
   });
   electron.ipcMain.handle(IPC.DIALOG_SELECT_FOLDER, async () => {
     const win = getMainWindow();
@@ -1989,7 +2080,7 @@ class FileFilterService {
       }
     }
     if (this.rules.suffixes.length > 0) {
-      return this.rules.suffixes.some((s) => ext === s.toLowerCase());
+      return this.rules.suffixes.some((suffix) => ext === this.normalizeSuffix(suffix));
     }
     return true;
   }
@@ -2030,6 +2121,11 @@ class FileFilterService {
       }
     }
     return false;
+  }
+  normalizeSuffix(suffix) {
+    const trimmed = suffix.trim().toLowerCase();
+    if (!trimmed) return "";
+    return trimmed.startsWith(".") ? trimmed : `.${trimmed}`;
   }
 }
 class SpeedCalculator {
