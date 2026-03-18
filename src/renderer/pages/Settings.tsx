@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { Save, TestTube, Plus, X, FolderOpen } from "lucide-react";
+import { TestTube, Plus, X, FolderOpen } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -17,7 +17,10 @@ export default function Settings() {
     ok: boolean;
     error?: string;
   } | null>(null);
-  const [saving, setSaving] = useState(false);
+  const [autoSaveState, setAutoSaveState] = useState<
+    "idle" | "saving" | "saved" | "error"
+  >("idle");
+  const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
   const [suffixInput, setSuffixInput] = useState("");
 
   useEffect(() => {
@@ -28,17 +31,32 @@ export default function Settings() {
     setLocal(settings);
   }, [settings]);
 
-  const handleSave = useCallback(async () => {
-    setSaving(true);
-    try {
-      await saveSettings(local);
-      showToast("设置已保存", "success");
-    } catch (err) {
-      showToast(`保存失败: ${err}`, "error");
-    } finally {
-      setSaving(false);
+  useEffect(() => {
+    if (loading) return;
+
+    const localSnapshot = JSON.stringify(local);
+    const settingsSnapshot = JSON.stringify(settings);
+
+    if (localSnapshot === settingsSnapshot) {
+      return;
     }
-  }, [local, saveSettings]);
+
+    setAutoSaveState("saving");
+    const timer = setTimeout(async () => {
+      try {
+        await saveSettings(local);
+        setAutoSaveState("saved");
+        setLastSavedAt(
+          new Date().toLocaleTimeString("zh-CN", { hour12: false })
+        );
+      } catch (err) {
+        setAutoSaveState("error");
+        showToast(`自动保存失败: ${err}`, "error");
+      }
+    }, 600);
+
+    return () => clearTimeout(timer);
+  }, [local, settings, loading, saveSettings]);
 
   const handleTestOSS = useCallback(async () => {
     setOssTestResult(null);
@@ -103,10 +121,12 @@ export default function Settings() {
     <div className="p-6 space-y-6 max-w-3xl">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold">设置</h1>
-        <Button onClick={handleSave} disabled={saving}>
-          <Save className="h-4 w-4 mr-1" />
-          {saving ? "保存中..." : "保存设置"}
-        </Button>
+        <div className="text-sm text-muted-foreground">
+          {autoSaveState === "saving" && "自动保存中..."}
+          {autoSaveState === "saved" &&
+            (lastSavedAt ? `已自动保存 ${lastSavedAt}` : "已自动保存")}
+          {autoSaveState === "error" && "自动保存失败"}
+        </div>
       </div>
 
       {/* 扫描配置 */}
