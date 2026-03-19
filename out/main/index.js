@@ -1164,8 +1164,6 @@ function getScannerService() {
   return instance$7;
 }
 class TaskQueueService extends events.EventEmitter {
-  defaultStartAfterTime = "20:30";
-  defaultEndBeforeTime = "23:59";
   runningTasks = /* @__PURE__ */ new Map();
   processTimer = null;
   taskRunner = null;
@@ -1207,7 +1205,10 @@ class TaskQueueService extends events.EventEmitter {
     const availableSlots = maxConcurrent - this.runningTasks.size;
     if (availableSlots <= 0) return;
     const pendingTasks = taskRepo.listByStatus("pending");
-    const toRun = pendingTasks.slice(0, availableSlots);
+    const eligibleTasks = pendingTasks.filter(
+      (task) => this.isTaskEligibleForCurrentStartCycle(task, uploadConfig?.startAfterTime)
+    );
+    const toRun = eligibleTasks.slice(0, availableSlots);
     for (const task of toRun) {
       this.executeTask(task);
     }
@@ -1249,31 +1250,51 @@ class TaskQueueService extends events.EventEmitter {
     }
   }
   isWithinUploadWindow(startAfterTime, endBeforeTime) {
-    const normalizedStart = this.normalizeTime(startAfterTime, this.defaultStartAfterTime);
-    const normalizedEnd = this.normalizeTime(endBeforeTime, this.defaultEndBeforeTime);
-    const startMinutes = this.timeToMinutes(normalizedStart);
-    const endMinutes = this.timeToMinutes(normalizedEnd);
+    const startMinutes = this.parseMinutes(startAfterTime);
+    const endMinutes = this.parseMinutes(endBeforeTime);
     const now = /* @__PURE__ */ new Date();
     const currentMinutes = now.getHours() * 60 + now.getMinutes();
+    if (startMinutes === null && endMinutes === null) return true;
+    if (startMinutes !== null && endMinutes === null) {
+      return currentMinutes >= startMinutes;
+    }
+    if (startMinutes === null && endMinutes !== null) {
+      return currentMinutes <= endMinutes;
+    }
+    if (startMinutes === null || endMinutes === null) return true;
     if (startMinutes === endMinutes) return true;
     if (startMinutes < endMinutes) {
       return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
     }
     return currentMinutes >= startMinutes || currentMinutes <= endMinutes;
   }
-  timeToMinutes(time) {
-    const [hour, minute] = time.split(":").map(Number);
-    return hour * 60 + minute;
-  }
-  normalizeTime(time, fallback) {
-    if (!time) return fallback;
+  parseMinutes(time) {
+    if (!time || !time.trim()) return null;
     const match = time.match(/^(\d{1,2}):(\d{1,2})$/);
-    if (!match) return fallback;
+    if (!match) return null;
     const hour = Number(match[1]);
     const minute = Number(match[2]);
-    if (Number.isNaN(hour) || Number.isNaN(minute)) return fallback;
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return fallback;
-    return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+    if (Number.isNaN(hour) || Number.isNaN(minute)) return null;
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+    return hour * 60 + minute;
+  }
+  isTaskEligibleForCurrentStartCycle(task, startAfterTime) {
+    const startMinutes = this.parseMinutes(startAfterTime);
+    if (startMinutes === null) return true;
+    const cycleStart = this.getCurrentStartCycleStart(startMinutes, /* @__PURE__ */ new Date());
+    const createdAtMs = new Date(task.createdAt).getTime();
+    if (Number.isNaN(createdAtMs)) return true;
+    return createdAtMs <= cycleStart.getTime();
+  }
+  getCurrentStartCycleStart(startMinutes, now) {
+    const todayStart = new Date(now);
+    todayStart.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
+    if (now.getTime() >= todayStart.getTime()) {
+      return todayStart;
+    }
+    const previousStart = new Date(todayStart);
+    previousStart.setDate(previousStart.getDate() - 1);
+    return previousStart;
   }
 }
 let instance$6 = null;
