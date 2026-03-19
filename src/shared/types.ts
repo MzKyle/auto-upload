@@ -131,8 +131,8 @@ export interface UploadConfig {
   maxFilesPerTask: number
   maxConcurrentUploads: number // 全局并发上传文件数上限（跨任务）
   multipartThreshold: number // bytes, default 100MB
-  startAfterTime: string // 每日最早开始上传时间，格式 HH:mm
-  endBeforeTime: string // 每日最晚结束上传时间，格式 HH:mm
+  startAfterTime: string | null // 每日最早开始上传时间，格式 HH:mm；null 表示不限制
+  endBeforeTime: string | null // 每日最晚结束上传时间，格式 HH:mm；null 表示不限制
 }
 
 export interface StabilityConfig {

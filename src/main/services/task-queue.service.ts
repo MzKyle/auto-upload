@@ -10,8 +10,6 @@ import type { Task, TaskStatus, UploadConfig } from '@shared/types'
  * - 状态机管理：pending → scanning → uploading → completed / failed
  */
 export class TaskQueueService extends EventEmitter {
-  private readonly defaultStartAfterTime = '20:30'
-  private readonly defaultEndBeforeTime = '23:59'
   private runningTasks: Map<string, { cancel: () => void }> = new Map()
   private processTimer: ReturnType<typeof setInterval> | null = null
   private taskRunner: ((task: Task, signal: AbortSignal) => Promise<void>) | null = null
@@ -66,7 +64,10 @@ export class TaskQueueService extends EventEmitter {
     if (availableSlots <= 0) return
 
     const pendingTasks = taskRepo.listByStatus('pending')
-    const toRun = pendingTasks.slice(0, availableSlots)
+    const eligibleTasks = pendingTasks.filter((task) =>
+      this.isTaskEligibleForCurrentStartCycle(task, uploadConfig?.startAfterTime)
+    )
+    const toRun = eligibleTasks.slice(0, availableSlots)
 
     for (const task of toRun) {
       this.executeTask(task)
@@ -114,13 +115,26 @@ export class TaskQueueService extends EventEmitter {
     }
   }
 
-  private isWithinUploadWindow(startAfterTime?: string, endBeforeTime?: string): boolean {
-    const normalizedStart = this.normalizeTime(startAfterTime, this.defaultStartAfterTime)
-    const normalizedEnd = this.normalizeTime(endBeforeTime, this.defaultEndBeforeTime)
-    const startMinutes = this.timeToMinutes(normalizedStart)
-    const endMinutes = this.timeToMinutes(normalizedEnd)
+  private isWithinUploadWindow(startAfterTime?: string | null, endBeforeTime?: string | null): boolean {
+    const startMinutes = this.parseMinutes(startAfterTime)
+    const endMinutes = this.parseMinutes(endBeforeTime)
     const now = new Date()
     const currentMinutes = now.getHours() * 60 + now.getMinutes()
+
+    // 开始/结束都不设置：随时可启动
+    if (startMinutes === null && endMinutes === null) return true
+
+    // 只设置开始时间：每天到达开始时间后可启动
+    if (startMinutes !== null && endMinutes === null) {
+      return currentMinutes >= startMinutes
+    }
+
+    // 只设置结束时间：每天在结束时间前可启动
+    if (startMinutes === null && endMinutes !== null) {
+      return currentMinutes <= endMinutes
+    }
+
+    if (startMinutes === null || endMinutes === null) return true
 
     // 开始时间 == 结束时间：视为全天可上传
     if (startMinutes === endMinutes) return true
@@ -134,20 +148,38 @@ export class TaskQueueService extends EventEmitter {
     return currentMinutes >= startMinutes || currentMinutes <= endMinutes
   }
 
-  private timeToMinutes(time: string): number {
-    const [hour, minute] = time.split(':').map(Number)
+  private parseMinutes(time: string | null | undefined): number | null {
+    if (!time || !time.trim()) return null
+    const match = time.match(/^(\d{1,2}):(\d{1,2})$/)
+    if (!match) return null
+    const hour = Number(match[1])
+    const minute = Number(match[2])
+    if (Number.isNaN(hour) || Number.isNaN(minute)) return null
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null
     return hour * 60 + minute
   }
 
-  private normalizeTime(time: string | undefined, fallback: string): string {
-    if (!time) return fallback
-    const match = time.match(/^(\d{1,2}):(\d{1,2})$/)
-    if (!match) return fallback
-    const hour = Number(match[1])
-    const minute = Number(match[2])
-    if (Number.isNaN(hour) || Number.isNaN(minute)) return fallback
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return fallback
-    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+  private isTaskEligibleForCurrentStartCycle(task: Task, startAfterTime?: string | null): boolean {
+    const startMinutes = this.parseMinutes(startAfterTime)
+    if (startMinutes === null) return true
+
+    const cycleStart = this.getCurrentStartCycleStart(startMinutes, new Date())
+    const createdAtMs = new Date(task.createdAt).getTime()
+    if (Number.isNaN(createdAtMs)) return true
+    return createdAtMs <= cycleStart.getTime()
+  }
+
+  private getCurrentStartCycleStart(startMinutes: number, now: Date): Date {
+    const todayStart = new Date(now)
+    todayStart.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0)
+
+    if (now.getTime() >= todayStart.getTime()) {
+      return todayStart
+    }
+
+    const previousStart = new Date(todayStart)
+    previousStart.setDate(previousStart.getDate() - 1)
+    return previousStart
   }
 }
 

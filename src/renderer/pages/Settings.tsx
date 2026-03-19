@@ -296,7 +296,7 @@ export default function Settings() {
           <CardTitle className="text-base">上传配置</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+          <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4">
             <div>
               <Label>最大并发任务数</Label>
               <Input
@@ -359,42 +359,84 @@ export default function Settings() {
             </div>
             <div>
               <Label>开始上传时间</Label>
-              <Input
-                type="time"
-                value={local.upload.startAfterTime || "20:30"}
-                onChange={(e) =>
-                  setLocal((p) => ({
-                    ...p,
-                    upload: {
-                      ...p.upload,
-                      startAfterTime: e.target.value || "20:30",
-                    },
-                  }))
-                }
-                className="mt-1"
-              />
+              <div className="mt-1 space-y-2">
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    className="rounded"
+                    checked={local.upload.startAfterTime !== null}
+                    onChange={(e) =>
+                      setLocal((p) => ({
+                        ...p,
+                        upload: {
+                          ...p.upload,
+                          startAfterTime: e.target.checked
+                            ? p.upload.startAfterTime ?? "20:30"
+                            : null,
+                        },
+                      }))
+                    }
+                  />
+                  <span>启用开始时间</span>
+                </label>
+                <Input
+                  type="time"
+                  value={local.upload.startAfterTime ?? "20:30"}
+                  disabled={local.upload.startAfterTime === null}
+                  onChange={(e) =>
+                    setLocal((p) => ({
+                      ...p,
+                      upload: {
+                        ...p.upload,
+                        startAfterTime: e.target.value || "20:30",
+                      },
+                    }))
+                  }
+                />
+              </div>
               <p className="text-xs text-muted-foreground mt-1">
-                新任务仅在时间窗口内启动
+                关闭后等价于“不设置”，开始时间不限制
               </p>
             </div>
             <div>
               <Label>结束上传时间</Label>
-              <Input
-                type="time"
-                value={local.upload.endBeforeTime || "23:59"}
-                onChange={(e) =>
-                  setLocal((p) => ({
-                    ...p,
-                    upload: {
-                      ...p.upload,
-                      endBeforeTime: e.target.value || "23:59",
-                    },
-                  }))
-                }
-                className="mt-1"
-              />
+              <div className="mt-1 space-y-2">
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    className="rounded"
+                    checked={local.upload.endBeforeTime !== null}
+                    onChange={(e) =>
+                      setLocal((p) => ({
+                        ...p,
+                        upload: {
+                          ...p.upload,
+                          endBeforeTime: e.target.checked
+                            ? p.upload.endBeforeTime ?? "23:59"
+                            : null,
+                        },
+                      }))
+                    }
+                  />
+                  <span>启用结束时间</span>
+                </label>
+                <Input
+                  type="time"
+                  value={local.upload.endBeforeTime ?? "23:59"}
+                  disabled={local.upload.endBeforeTime === null}
+                  onChange={(e) =>
+                    setLocal((p) => ({
+                      ...p,
+                      upload: {
+                        ...p.upload,
+                        endBeforeTime: e.target.value || "23:59",
+                      },
+                    }))
+                  }
+                />
+              </div>
               <p className="text-xs text-muted-foreground mt-1">
-                支持跨天（如 20:30 - 06:00）
+                关闭后等价于“不设置”，仅影响新任务启动，不中断进行中任务
               </p>
             </div>
           </div>
