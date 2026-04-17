@@ -12,16 +12,22 @@ import type { CleanupConfig } from '@shared/types'
  */
 export class CleanupService {
   private timer: ReturnType<typeof setInterval> | null = null
+  private pendingRun: ReturnType<typeof setTimeout> | null = null
+  private running = false
 
   start(): void {
     if (this.timer) return
     // 启动时延迟 30 秒执行第一次，之后每小时执行
-    setTimeout(() => this.cleanup(), 30000)
+    this.scheduleCleanup(30000)
     this.timer = setInterval(() => this.cleanup(), 3600000)
     log.info('自动清理服务已启动')
   }
 
   stop(): void {
+    if (this.pendingRun) {
+      clearTimeout(this.pendingRun)
+      this.pendingRun = null
+    }
     if (this.timer) {
       clearInterval(this.timer)
       this.timer = null
@@ -29,13 +35,27 @@ export class CleanupService {
     log.info('自动清理服务已停止')
   }
 
+  scheduleCleanup(delayMs = 0): void {
+    if (this.pendingRun) {
+      clearTimeout(this.pendingRun)
+    }
+
+    this.pendingRun = setTimeout(() => {
+      this.pendingRun = null
+      this.cleanup()
+    }, Math.max(0, delayMs))
+  }
+
   cleanup(): void {
+    if (this.running) return
+    this.running = true
+
     try {
       const settings = getSettingsRepo()
       const config = settings.get<CleanupConfig>('cleanup')
       if (!config?.enabled) return
 
-      const retentionDays = config.retentionDays || 7
+      const retentionDays = this.normalizeRetentionDays(config)
       const taskRepo = getTaskRepo()
       const tasks = taskRepo.getCompletedForCleanup(retentionDays)
 
@@ -62,7 +82,17 @@ export class CleanupService {
       }
     } catch (err) {
       log.error('自动清理服务异常:', err)
+    } finally {
+      this.running = false
     }
+  }
+
+  private normalizeRetentionDays(config: CleanupConfig): number {
+    if (!Number.isFinite(config.retentionDays)) {
+      return 7
+    }
+
+    return Math.max(0, Math.floor(config.retentionDays))
   }
 }
 

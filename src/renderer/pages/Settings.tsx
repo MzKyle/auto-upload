@@ -262,13 +262,13 @@ export default function Settings() {
               }
               className="rounded"
             />
-            <Label>启用自动清理（上传完成后自动删除本地文件夹）</Label>
+            <Label>启用自动清理（按保留天数自动删除已上传的本地文件夹）</Label>
           </div>
           <div>
-            <Label>保留天数</Label>
+            <Label>保留天数（0 表示上传完成后尽快删除）</Label>
             <Input
               type="number"
-              min={1}
+              min={0}
               max={365}
               value={local.cleanup.retentionDays}
               onChange={(e) =>

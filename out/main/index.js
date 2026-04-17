@@ -532,7 +532,8 @@ class SettingsRepo {
       { section: "webhook", key: "webhook" },
       { section: "stability", key: "stability" },
       { section: "log", key: "log" },
-      { section: "dataCollect", key: "dataCollect" }
+      { section: "dataCollect", key: "dataCollect" },
+      { section: "cleanup", key: "cleanup" }
     ];
     for (const { section, key } of keys) {
       const val = this.get(key);
@@ -1163,6 +1164,82 @@ function getScannerService() {
   if (!instance$7) instance$7 = new ScannerService();
   return instance$7;
 }
+class CleanupService {
+  timer = null;
+  pendingRun = null;
+  running = false;
+  start() {
+    if (this.timer) return;
+    this.scheduleCleanup(3e4);
+    this.timer = setInterval(() => this.cleanup(), 36e5);
+    log.info("自动清理服务已启动");
+  }
+  stop() {
+    if (this.pendingRun) {
+      clearTimeout(this.pendingRun);
+      this.pendingRun = null;
+    }
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    log.info("自动清理服务已停止");
+  }
+  scheduleCleanup(delayMs = 0) {
+    if (this.pendingRun) {
+      clearTimeout(this.pendingRun);
+    }
+    this.pendingRun = setTimeout(() => {
+      this.pendingRun = null;
+      this.cleanup();
+    }, Math.max(0, delayMs));
+  }
+  cleanup() {
+    if (this.running) return;
+    this.running = true;
+    try {
+      const settings = getSettingsRepo();
+      const config = settings.get("cleanup");
+      if (!config?.enabled) return;
+      const retentionDays = this.normalizeRetentionDays(config);
+      const taskRepo = getTaskRepo();
+      const tasks = taskRepo.getCompletedForCleanup(retentionDays);
+      if (tasks.length === 0) return;
+      log.info(`自动清理: 发现 ${tasks.length} 个可清理任务 (保留天数: ${retentionDays})`);
+      let cleaned = 0;
+      for (const task of tasks) {
+        try {
+          if (!fs.existsSync(task.folderPath)) {
+            continue;
+          }
+          fs.rmSync(task.folderPath, { recursive: true, force: true });
+          cleaned++;
+          log.info(`自动清理: 已删除 ${task.folderPath} (任务ID: ${task.id}, 完成于: ${task.completedAt})`);
+        } catch (err) {
+          log.error(`自动清理失败: ${task.folderPath}`, err);
+        }
+      }
+      if (cleaned > 0) {
+        log.info(`自动清理完成: 共删除 ${cleaned} 个文件夹`);
+      }
+    } catch (err) {
+      log.error("自动清理服务异常:", err);
+    } finally {
+      this.running = false;
+    }
+  }
+  normalizeRetentionDays(config) {
+    if (!Number.isFinite(config.retentionDays)) {
+      return 7;
+    }
+    return Math.max(0, Math.floor(config.retentionDays));
+  }
+}
+let instance$6 = null;
+function getCleanupService() {
+  if (!instance$6) instance$6 = new CleanupService();
+  return instance$6;
+}
 class TaskQueueService extends events.EventEmitter {
   runningTasks = /* @__PURE__ */ new Map();
   processTimer = null;
@@ -1227,6 +1304,7 @@ class TaskQueueService extends events.EventEmitter {
       await this.taskRunner(task, controller.signal);
       if (!controller.signal.aborted) {
         taskRepo.updateStatus(task.id, "completed");
+        getCleanupService().scheduleCleanup();
         this.emit("task:status-change", {
           taskId: task.id,
           oldStatus: "uploading",
@@ -1297,10 +1375,10 @@ class TaskQueueService extends events.EventEmitter {
     return previousStart;
   }
 }
-let instance$6 = null;
+let instance$5 = null;
 function getTaskQueueService() {
-  if (!instance$6) instance$6 = new TaskQueueService();
-  return instance$6;
+  if (!instance$5) instance$5 = new TaskQueueService();
+  return instance$5;
 }
 class SSHRsyncService {
   runningProcesses = /* @__PURE__ */ new Map();
@@ -1558,16 +1636,19 @@ class SSHRsyncService {
     return null;
   }
 }
-let instance$5 = null;
+let instance$4 = null;
 function getSSHRsyncService() {
-  if (!instance$5) instance$5 = new SSHRsyncService();
-  return instance$5;
+  if (!instance$4) instance$4 = new SSHRsyncService();
+  return instance$4;
 }
 class OSSUploadService {
   client = null;
   config = null;
   multipartThreshold = 100 * 1024 * 1024;
   // 100MB
+  minPartSize = 1024 * 1024;
+  // 1MB
+  maxMultipartParts = 1e4;
   configure(config, multipartThreshold) {
     this.config = config;
     if (multipartThreshold) this.multipartThreshold = multipartThreshold;
@@ -1618,9 +1699,9 @@ class OSSUploadService {
     const client = taskClient || await this.getClient();
     if (fileSize > this.multipartThreshold) {
       try {
+        const partSize = this.getPartSizeForMultipart(fileSize);
         await client.multipartUpload(ossKey, filePath, {
-          partSize: 1024 * 1024,
-          // 1MB 分片
+          partSize,
           progress: (percentage) => {
             onProgress?.(percentage);
           }
@@ -1651,6 +1732,12 @@ class OSSUploadService {
       }
     }
     return ossKey;
+  }
+  getPartSizeForMultipart(fileSize) {
+    const minPartSizeByCount = Math.ceil(fileSize / (this.maxMultipartParts - 1));
+    const partSize = Math.max(this.minPartSize, minPartSizeByCount);
+    const step = 1024 * 1024;
+    return Math.ceil(partSize / step) * step;
   }
   /**
    * 上传 Buffer 到 OSS（用于 SFTP 直传场景）
@@ -1698,10 +1785,10 @@ class OSSUploadService {
     }
   }
 }
-let instance$4 = null;
+let instance$3 = null;
 function getOSSUploadService() {
-  if (!instance$4) instance$4 = new OSSUploadService();
-  return instance$4;
+  if (!instance$3) instance$3 = new OSSUploadService();
+  return instance$3;
 }
 function rowToSSHMachine(row) {
   return {
@@ -1782,6 +1869,9 @@ function registerAllIpc() {
   });
   electron.ipcMain.handle(IPC.SETTINGS_SAVE, (_event, data) => {
     getSettingsRepo().saveAll(data);
+    if (data.cleanup !== void 0) {
+      getCleanupService().scheduleCleanup();
+    }
     return { ok: true };
   });
   electron.ipcMain.handle(IPC.SETTINGS_TEST_OSS, async (_event, config) => {
@@ -2236,16 +2326,17 @@ class UploadSemaphore {
     }
   }
 }
-let instance$3 = null;
+let instance$2 = null;
 function getUploadSemaphore(max) {
-  if (!instance$3) {
-    instance$3 = new UploadSemaphore(max ?? 30);
+  if (!instance$2) {
+    instance$2 = new UploadSemaphore(max ?? 30);
   } else if (max !== void 0) {
-    instance$3.setMax(max);
+    instance$2.setMax(max);
   }
-  return instance$3;
+  return instance$2;
 }
 class TaskRunnerService {
+  maxUploadRetries = 2;
   /**
    * 执行一个文件夹上传任务
    */
@@ -2343,11 +2434,29 @@ class TaskRunnerService {
           taskRepo.updateFileStatus(file.id, "uploading");
           processMarker.files[file.relativePath] = "uploading";
           broadcastProgress(file.relativePath);
-          await ossService.uploadFile(localPath, ossKey, file.fileSize, (fraction) => {
-            const bytesDone = Math.round(file.fileSize * fraction);
-            speedCalc.addSample(bytesDone);
-            broadcastProgress(file.relativePath);
-          }, signal, taskClient);
+          let attempt = 0;
+          while (true) {
+            try {
+              await ossService.uploadFile(localPath, ossKey, file.fileSize, (fraction) => {
+                const bytesDone = Math.round(file.fileSize * fraction);
+                speedCalc.addSample(bytesDone);
+                broadcastProgress(file.relativePath);
+              }, signal, taskClient);
+              break;
+            } catch (uploadErr) {
+              if (uploadErr instanceof DOMException && uploadErr.name === "AbortError") {
+                throw uploadErr;
+              }
+              const retriable = this.isRetriableUploadError(uploadErr);
+              if (!retriable || attempt >= this.maxUploadRetries) {
+                throw uploadErr;
+              }
+              attempt += 1;
+              const delayMs = Math.min(5e3, 500 * 2 ** (attempt - 1));
+              log.warn(`任务 ${task.id} 文件重试 ${attempt}/${this.maxUploadRetries}: ${file.relativePath}`);
+              await this.sleep(delayMs);
+            }
+          }
           taskRepo.updateFileStatus(file.id, "completed", ossKey);
           processMarker.files[file.relativePath] = "completed";
           uploadedCount++;
@@ -2386,20 +2495,44 @@ class TaskRunnerService {
     }
     const finalFailedFiles = taskRepo.listFiles(task.id, "failed");
     if (finalFailedFiles.length > 0) {
+      const sampleDetails = finalFailedFiles.slice(0, 3).map((f) => `${f.relativePath}: ${f.errorMessage || "unknown error"}`);
+      const summary = sampleDetails.length > 0 ? `${finalFailedFiles.length} 个文件上传失败，例如 ${sampleDetails.join(" | ")}` : `${finalFailedFiles.length} 个文件上传失败`;
       processMarker.status = "failed";
-      processMarker.error = `${finalFailedFiles.length} 个文件上传失败`;
+      processMarker.error = summary;
       writeProcessTask(task.folderPath, processMarker);
-      throw new Error(`${finalFailedFiles.length} 个文件上传失败`);
+      throw new Error(summary);
     }
     processMarker.status = "completed";
     processMarker.lastUpdated = (/* @__PURE__ */ new Date()).toISOString();
     writeProcessTask(task.folderPath, processMarker);
   }
+  isRetriableUploadError(err) {
+    const e = err;
+    if (typeof e.status === "number" && (e.status === 429 || e.status >= 500)) {
+      return true;
+    }
+    const transientCodes = /* @__PURE__ */ new Set([
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "ESOCKETTIMEDOUT",
+      "EAI_AGAIN",
+      "ENOTFOUND",
+      "EPIPE"
+    ]);
+    if (e.code && transientCodes.has(e.code)) {
+      return true;
+    }
+    const text = `${e.name || ""} ${e.message || ""}`.toLowerCase();
+    return text.includes("timeout") || text.includes("temporarily unavailable");
+  }
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
 }
-let instance$2 = null;
+let instance$1 = null;
 function getTaskRunnerService() {
-  if (!instance$2) instance$2 = new TaskRunnerService();
-  return instance$2;
+  if (!instance$1) instance$1 = new TaskRunnerService();
+  return instance$1;
 }
 class WebhookService {
   async notify(config, payload) {
@@ -2431,60 +2564,9 @@ class WebhookService {
     log.error(`Webhook 通知最终失败: ${config.url}`);
   }
 }
-let instance$1 = null;
-function getWebhookService() {
-  if (!instance$1) instance$1 = new WebhookService();
-  return instance$1;
-}
-class CleanupService {
-  timer = null;
-  start() {
-    if (this.timer) return;
-    setTimeout(() => this.cleanup(), 3e4);
-    this.timer = setInterval(() => this.cleanup(), 36e5);
-    log.info("自动清理服务已启动");
-  }
-  stop() {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    log.info("自动清理服务已停止");
-  }
-  cleanup() {
-    try {
-      const settings = getSettingsRepo();
-      const config = settings.get("cleanup");
-      if (!config?.enabled) return;
-      const retentionDays = config.retentionDays || 7;
-      const taskRepo = getTaskRepo();
-      const tasks = taskRepo.getCompletedForCleanup(retentionDays);
-      if (tasks.length === 0) return;
-      log.info(`自动清理: 发现 ${tasks.length} 个可清理任务 (保留天数: ${retentionDays})`);
-      let cleaned = 0;
-      for (const task of tasks) {
-        try {
-          if (!fs.existsSync(task.folderPath)) {
-            continue;
-          }
-          fs.rmSync(task.folderPath, { recursive: true, force: true });
-          cleaned++;
-          log.info(`自动清理: 已删除 ${task.folderPath} (任务ID: ${task.id}, 完成于: ${task.completedAt})`);
-        } catch (err) {
-          log.error(`自动清理失败: ${task.folderPath}`, err);
-        }
-      }
-      if (cleaned > 0) {
-        log.info(`自动清理完成: 共删除 ${cleaned} 个文件夹`);
-      }
-    } catch (err) {
-      log.error("自动清理服务异常:", err);
-    }
-  }
-}
 let instance = null;
-function getCleanupService() {
-  if (!instance) instance = new CleanupService();
+function getWebhookService() {
+  if (!instance) instance = new WebhookService();
   return instance;
 }
 let logDir = "";

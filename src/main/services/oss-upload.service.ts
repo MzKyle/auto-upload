@@ -21,6 +21,8 @@ export class OSSUploadService {
   private client: OSSClient | null = null
   private config: AppSettings['oss'] | null = null
   private multipartThreshold: number = 100 * 1024 * 1024 // 100MB
+  private readonly minPartSize: number = 1024 * 1024 // 1MB
+  private readonly maxMultipartParts: number = 10000
 
   configure(config: AppSettings['oss'], multipartThreshold?: number): void {
     this.config = config
@@ -88,8 +90,9 @@ export class OSSUploadService {
     if (fileSize > this.multipartThreshold) {
       // 分片上传
       try {
+        const partSize = this.getPartSizeForMultipart(fileSize)
         await client.multipartUpload(ossKey, filePath, {
-          partSize: 1024 * 1024, // 1MB 分片
+          partSize,
           progress: (percentage: number) => {
             onProgress?.(percentage)
           }
@@ -125,6 +128,13 @@ export class OSSUploadService {
     }
 
     return ossKey
+  }
+
+  private getPartSizeForMultipart(fileSize: number): number {
+    const minPartSizeByCount = Math.ceil(fileSize / (this.maxMultipartParts - 1))
+    const partSize = Math.max(this.minPartSize, minPartSizeByCount)
+    const step = 1024 * 1024
+    return Math.ceil(partSize / step) * step
   }
 
   /**

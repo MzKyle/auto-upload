@@ -74,7 +74,8 @@ export class SettingsRepo {
       { section: 'webhook', key: 'webhook' },
       { section: 'stability', key: 'stability' },
       { section: 'log', key: 'log' },
-      { section: 'dataCollect', key: 'dataCollect' }
+      { section: 'dataCollect', key: 'dataCollect' },
+      { section: 'cleanup', key: 'cleanup' }
     ]
 
     for (const { section, key } of keys) {

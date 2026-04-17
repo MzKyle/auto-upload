@@ -7,6 +7,7 @@ import { getScannerService } from '../services/scanner.service'
 import { getTaskQueueService } from '../services/task-queue.service'
 import { getSSHRsyncService } from '../services/ssh-rsync.service'
 import { getOSSUploadService } from '../services/oss-upload.service'
+import { getCleanupService } from '../services/cleanup.service'
 import { getMainWindow, createAnnotationWindow } from '../index'
 import { getDb } from '../db/database'
 import { getDataCollectService } from '../services/data-collect.service'
@@ -115,6 +116,9 @@ export function registerAllIpc(): void {
 
   ipcMain.handle(IPC.SETTINGS_SAVE, (_event, data: Partial<AppSettings>) => {
     getSettingsRepo().saveAll(data)
+    if (data.cleanup !== undefined) {
+      getCleanupService().scheduleCleanup()
+    }
     return { ok: true }
   })
 

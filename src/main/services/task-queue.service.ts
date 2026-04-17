@@ -2,6 +2,7 @@ import { EventEmitter } from 'events'
 import log from 'electron-log'
 import { getTaskRepo } from '../db/task.repo'
 import { getSettingsRepo } from '../db/settings.repo'
+import { getCleanupService } from './cleanup.service'
 import type { Task, TaskStatus, UploadConfig } from '@shared/types'
 
 /**
@@ -92,6 +93,7 @@ export class TaskQueueService extends EventEmitter {
 
       if (!controller.signal.aborted) {
         taskRepo.updateStatus(task.id, 'completed')
+        getCleanupService().scheduleCleanup()
         this.emit('task:status-change', {
           taskId: task.id,
           oldStatus: 'uploading',

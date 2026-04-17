@@ -16,6 +16,8 @@ import type { Task, TaskProgress, ProcessTaskMarker, FilterRules, UploadConfig }
  * 处理单个文件夹的完整上传流程：扫描 → 过滤 → 上传 → 更新标记
  */
 export class TaskRunnerService {
+  private readonly maxUploadRetries = 2
+
   /**
    * 执行一个文件夹上传任务
    */
@@ -147,11 +149,31 @@ export class TaskRunnerService {
           processMarker.files[file.relativePath] = 'uploading'
           broadcastProgress(file.relativePath)
 
-          await ossService.uploadFile(localPath, ossKey, file.fileSize, (fraction) => {
-            const bytesDone = Math.round(file.fileSize * fraction)
-            speedCalc.addSample(bytesDone)
-            broadcastProgress(file.relativePath)
-          }, signal, taskClient)
+          let attempt = 0
+          while (true) {
+            try {
+              await ossService.uploadFile(localPath, ossKey, file.fileSize, (fraction) => {
+                const bytesDone = Math.round(file.fileSize * fraction)
+                speedCalc.addSample(bytesDone)
+                broadcastProgress(file.relativePath)
+              }, signal, taskClient)
+              break
+            } catch (uploadErr) {
+              if (uploadErr instanceof DOMException && uploadErr.name === 'AbortError') {
+                throw uploadErr
+              }
+
+              const retriable = this.isRetriableUploadError(uploadErr)
+              if (!retriable || attempt >= this.maxUploadRetries) {
+                throw uploadErr
+              }
+
+              attempt += 1
+              const delayMs = Math.min(5000, 500 * (2 ** (attempt - 1)))
+              log.warn(`任务 ${task.id} 文件重试 ${attempt}/${this.maxUploadRetries}: ${file.relativePath}`)
+              await this.sleep(delayMs)
+            }
+          }
 
           taskRepo.updateFileStatus(file.id, 'completed', ossKey)
           processMarker.files[file.relativePath] = 'completed'
@@ -201,15 +223,56 @@ export class TaskRunnerService {
 
     const finalFailedFiles = taskRepo.listFiles(task.id, 'failed')
     if (finalFailedFiles.length > 0) {
+      const sampleDetails = finalFailedFiles
+        .slice(0, 3)
+        .map((f) => `${f.relativePath}: ${f.errorMessage || 'unknown error'}`)
+
+      const summary = sampleDetails.length > 0
+        ? `${finalFailedFiles.length} 个文件上传失败，例如 ${sampleDetails.join(' | ')}`
+        : `${finalFailedFiles.length} 个文件上传失败`
+
       processMarker.status = 'failed'
-      processMarker.error = `${finalFailedFiles.length} 个文件上传失败`
+      processMarker.error = summary
       writeProcessTask(task.folderPath, processMarker)
-      throw new Error(`${finalFailedFiles.length} 个文件上传失败`)
+      throw new Error(summary)
     }
 
     processMarker.status = 'completed'
     processMarker.lastUpdated = new Date().toISOString()
     writeProcessTask(task.folderPath, processMarker)
+  }
+
+  private isRetriableUploadError(err: unknown): boolean {
+    const e = err as {
+      code?: string
+      status?: number
+      name?: string
+      message?: string
+    }
+
+    if (typeof e.status === 'number' && (e.status === 429 || e.status >= 500)) {
+      return true
+    }
+
+    const transientCodes = new Set([
+      'ECONNRESET',
+      'ETIMEDOUT',
+      'ESOCKETTIMEDOUT',
+      'EAI_AGAIN',
+      'ENOTFOUND',
+      'EPIPE'
+    ])
+
+    if (e.code && transientCodes.has(e.code)) {
+      return true
+    }
+
+    const text = `${e.name || ''} ${e.message || ''}`.toLowerCase()
+    return text.includes('timeout') || text.includes('temporarily unavailable')
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms))
   }
 }
 
