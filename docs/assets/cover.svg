@@ -1,0 +1,86 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="640" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0B1720"/>
+      <stop offset="0.55" stop-color="#102B2E"/>
+      <stop offset="1" stop-color="#123C35"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#173843"/>
+      <stop offset="1" stop-color="#0F252D"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="20" stdDeviation="24" flood-color="#000000" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <path d="M0 520 C160 470 235 560 390 505 C545 450 620 365 800 418 C980 470 1080 390 1280 430 L1280 640 L0 640 Z" fill="#0F766E" opacity="0.18"/>
+  <path d="M0 95 L1280 95" stroke="#FFFFFF" stroke-opacity="0.08"/>
+  <path d="M0 545 L1280 545" stroke="#FFFFFF" stroke-opacity="0.08"/>
+
+  <g transform="translate(86 90)">
+    <rect x="0" y="0" width="1108" height="460" rx="28" fill="#07141B" fill-opacity="0.45" stroke="#D1FAE5" stroke-opacity="0.16"/>
+
+    <g transform="translate(58 58)">
+      <rect x="0" y="0" width="82" height="82" rx="20" fill="#14B8A6"/>
+      <path d="M25 48 C25 37 33 29 44 29 H58" stroke="#ECFEFF" stroke-width="7" stroke-linecap="round"/>
+      <path d="M57 21 L68 29 L57 37" stroke="#ECFEFF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M25 60 H58" stroke="#ECFEFF" stroke-width="7" stroke-linecap="round"/>
+    </g>
+
+    <text x="58" y="205" fill="#F8FAFC" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="62" font-weight="800" letter-spacing="0">
+      Data Collection Uploader
+    </text>
+    <text x="60" y="255" fill="#A7F3D0" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="26" font-weight="600" letter-spacing="0">
+      数据采集上传工具
+    </text>
+    <text x="60" y="306" fill="#CBD5E1" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="22" letter-spacing="0">
+      Folder scanning, resumable task queue, OSS upload, remote sync and annotation export.
+    </text>
+
+    <g transform="translate(60 354)">
+      <rect x="0" y="0" width="132" height="42" rx="21" fill="#ECFEFF" fill-opacity="0.10" stroke="#A7F3D0" stroke-opacity="0.28"/>
+      <text x="23" y="27" fill="#ECFEFF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="700">Electron</text>
+
+      <rect x="150" y="0" width="142" height="42" rx="21" fill="#ECFEFF" fill-opacity="0.10" stroke="#A7F3D0" stroke-opacity="0.28"/>
+      <text x="173" y="27" fill="#ECFEFF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="700">TypeScript</text>
+
+      <rect x="310" y="0" width="112" height="42" rx="21" fill="#ECFEFF" fill-opacity="0.10" stroke="#A7F3D0" stroke-opacity="0.28"/>
+      <text x="337" y="27" fill="#ECFEFF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="700">React</text>
+
+      <rect x="440" y="0" width="126" height="42" rx="21" fill="#ECFEFF" fill-opacity="0.10" stroke="#A7F3D0" stroke-opacity="0.28"/>
+      <text x="467" y="27" fill="#ECFEFF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="15" font-weight="700">Aliyun OSS</text>
+    </g>
+  </g>
+
+  <g transform="translate(720 172)" filter="url(#shadow)">
+    <rect x="0" y="0" width="370" height="300" rx="18" fill="url(#card)" stroke="#99F6E4" stroke-opacity="0.16"/>
+    <rect x="34" y="36" width="110" height="54" rx="12" fill="#0F766E"/>
+    <text x="58" y="69" fill="#ECFEFF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="16" font-weight="800">Scan</text>
+
+    <rect x="226" y="36" width="110" height="54" rx="12" fill="#2563EB"/>
+    <text x="246" y="69" fill="#EFF6FF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="16" font-weight="800">Queue</text>
+
+    <rect x="34" y="210" width="110" height="54" rx="12" fill="#7C3AED"/>
+    <text x="54" y="243" fill="#F5F3FF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="16" font-weight="800">SQLite</text>
+
+    <rect x="226" y="210" width="110" height="54" rx="12" fill="#EA580C"/>
+    <text x="262" y="243" fill="#FFF7ED" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="16" font-weight="800">OSS</text>
+
+    <path d="M144 63 H226" stroke="#CCFBF1" stroke-width="3" stroke-linecap="round"/>
+    <path d="M213 54 L226 63 L213 72" stroke="#CCFBF1" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <path d="M281 90 V210" stroke="#CCFBF1" stroke-width="3" stroke-linecap="round"/>
+    <path d="M272 197 L281 210 L290 197" stroke="#CCFBF1" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <path d="M226 237 H144" stroke="#CCFBF1" stroke-width="3" stroke-linecap="round"/>
+    <path d="M157 228 L144 237 L157 246" stroke="#CCFBF1" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <path d="M89 210 V90" stroke="#CCFBF1" stroke-width="3" stroke-linecap="round"/>
+    <path d="M80 103 L89 90 L98 103" stroke="#CCFBF1" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <circle cx="185" cy="150" r="34" fill="#14B8A6" fill-opacity="0.18" stroke="#5EEAD4" stroke-opacity="0.45"/>
+    <text x="159" y="156" fill="#E0F2FE" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="14" font-weight="800">IPC</text>
+  </g>
+</svg>
