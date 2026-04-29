@@ -14,7 +14,7 @@
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.7-3178c6?style=flat-square&logo=typescript&logoColor=white" />
   <img alt="React" src="https://img.shields.io/badge/React-18-61dafb?style=flat-square&logo=react&logoColor=111827" />
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-334155?style=flat-square" />
-  <img alt="License" src="https://img.shields.io/badge/license-TBD-lightgrey?style=flat-square" />
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" /></a>
 </p>
 
 <p align="center">
@@ -316,7 +316,6 @@ npm run build:linux
 - 不要提交 `.env`、真实 AK/SK、测试 Bucket 密钥或内部服务器密码
 - 不要提交 `node_modules/`、`dist/`、`out/` 等构建产物
 - 确认 `package.json` 中的 `homepage`、`author` 与实际 GitHub 仓库一致
-- 发布前建议补充 `LICENSE` 文件，例如 MIT 或 Apache-2.0
 - 发布前建议执行：
 
 ```bash
@@ -339,4 +338,4 @@ npm run lint
 
 ## 许可证
 
-当前仓库尚未包含 `LICENSE` 文件。正式开源前请先选择许可证并添加到仓库根目录。
+本项目基于 [MIT License](LICENSE) 开源。

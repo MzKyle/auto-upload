@@ -22,6 +22,12 @@
   - [图片标注窗口](modules/annotation.md)
   - [历史、存储与清理](modules/storage-cleanup.md)
 
+- **代码导读**
+  - [代码导读索引](code/README.md)
+  - [主进程代码](code/main-process.md)
+  - [渲染进程代码](code/renderer-process.md)
+  - [共享契约与 IPC](code/shared-contracts.md)
+
 - **配置指南**
   - [设置总览](configuration/settings.md)
   - [OSS 配置](configuration/oss-config.md)
