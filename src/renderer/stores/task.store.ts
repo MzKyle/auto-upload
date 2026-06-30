@@ -13,6 +13,7 @@ interface TaskStore {
   loading: boolean
   loadTasks: () => Promise<void>
   setProgress: (p: TaskProgress) => void
+  setProgressBatch: (items: TaskProgress[]) => void
   updateTaskStatus: (taskId: string, status: Task['status']) => void
   updateDestinationStatus: (event: TaskDestinationStatusEvent) => void
 }
@@ -36,6 +37,17 @@ export const useTaskStore = create<TaskStore>((set) => ({
     set((state) => ({
       progress: { ...state.progress, [progressKey(p.taskId, p.provider)]: p }
     }))
+  },
+
+  setProgressBatch: (items: TaskProgress[]) => {
+    if (items.length === 0) return
+    set((state) => {
+      const progress = { ...state.progress }
+      for (const item of items) {
+        progress[progressKey(item.taskId, item.provider)] = item
+      }
+      return { progress }
+    })
   },
 
   updateTaskStatus: (taskId: string, status: Task['status']) => {

@@ -4,6 +4,7 @@ import { normalize } from 'path'
 import type {
   CloudProvider,
   Task,
+  TaskDestination,
   TaskFile,
   TaskFileDetail,
   TaskStatus,
@@ -19,7 +20,10 @@ function normalizeFolderPath(p: string): string {
   return normalize(p).replace(/[\\/]+$/, '')
 }
 
-function rowToTask(row: Record<string, unknown>): Task {
+function rowToTask(
+  row: Record<string, unknown>,
+  destinations?: TaskDestination[]
+): Task {
   const profileSnapshot =
     typeof row.profile_snapshot_json === 'string' && row.profile_snapshot_json
       ? safeParseProfile(row.profile_snapshot_json)
@@ -35,7 +39,8 @@ function rowToTask(row: Record<string, unknown>): Task {
     uploadedBytes: row.uploaded_bytes as number,
     ossPrefix: (row.oss_prefix as string) || '',
     uploadTargetMode: (row.upload_target_mode as UploadTargetMode) || 'aliyun',
-    destinations: getTaskDestinationRepo().listByTask(row.id as string),
+    destinations:
+      destinations ?? getTaskDestinationRepo().listByTask(row.id as string),
     dayFolderId: (row.day_folder_id as string) || null,
     uploadRelativePath: (row.upload_relative_path as string | null | undefined) ?? (row.folder_name as string),
     errorMessage: (row.error_message as string) || null,
@@ -80,12 +85,27 @@ function rowToTaskFile(row: Record<string, unknown>): TaskFile {
 }
 
 export class TaskRepo {
+  private rowsToTasks(rows: Record<string, unknown>[]): Task[] {
+    const destinationsByTask = getTaskDestinationRepo().listByTaskIds(
+      rows.map((row) => row.id as string)
+    )
+    return rows.map((row) =>
+      rowToTask(row, destinationsByTask.get(row.id as string) || [])
+    )
+  }
+
   listByStatus(status?: TaskStatus): Task[] {
     const db = getDb()
     if (status) {
-      return (db.prepare('SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC').all(status) as Record<string, unknown>[]).map(rowToTask)
+      const rows = db
+        .prepare('SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC')
+        .all(status) as Record<string, unknown>[]
+      return this.rowsToTasks(rows)
     }
-    return (db.prepare('SELECT * FROM tasks ORDER BY created_at DESC').all() as Record<string, unknown>[]).map(rowToTask)
+    const rows = db
+      .prepare('SELECT * FROM tasks ORDER BY created_at DESC')
+      .all() as Record<string, unknown>[]
+    return this.rowsToTasks(rows)
   }
 
   listContinuouslyMonitored(dateName: string): Task[] {
@@ -99,7 +119,7 @@ export class TaskRepo {
          AND t.status NOT IN ('skipped', 'paused', 'completed')
        ORDER BY t.created_at ASC`
     ).all(dateName) as Record<string, unknown>[]
-    return rows.map(rowToTask)
+    return this.rowsToTasks(rows)
   }
 
   listRunnable(now = new Date().toISOString()): Task[] {
@@ -115,7 +135,7 @@ export class TaskRepo {
          AND tfd.status = 'pending'
        ORDER BY t.created_at ASC`
     ).all(now) as Record<string, unknown>[]
-    return rows.map(rowToTask)
+    return this.rowsToTasks(rows)
   }
 
   getById(id: string): Task | null {
@@ -138,7 +158,10 @@ export class TaskRepo {
   findTaskContainingFile(filePath: string): Task | null {
     const db = getDb()
     const normalized = normalize(filePath)
-    const tasks = (db.prepare('SELECT * FROM tasks ORDER BY length(folder_path) DESC').all() as Record<string, unknown>[]).map(rowToTask)
+    const rows = db
+      .prepare('SELECT * FROM tasks ORDER BY length(folder_path) DESC')
+      .all() as Record<string, unknown>[]
+    const tasks = this.rowsToTasks(rows)
     return tasks.find((t) => {
       const fp = t.folderPath
       return normalized.startsWith(fp + '/') || normalized.startsWith(fp + '\\')
@@ -238,7 +261,7 @@ export class TaskRepo {
     const rows = getDb().prepare(
       'SELECT * FROM tasks WHERE day_folder_id = ? ORDER BY created_at DESC'
     ).all(dayFolderId) as Record<string, unknown>[]
-    return rows.map(rowToTask)
+    return this.rowsToTasks(rows)
   }
 
   updateStatus(id: string, status: TaskStatus, errorMessage?: string): void {
@@ -747,23 +770,25 @@ export class TaskRepo {
 
   getUnfinishedTasks(): Task[] {
     const db = getDb()
-    return (db.prepare(
+    const rows = db.prepare(
       `SELECT * FROM tasks
        WHERE status IN ('pending', 'uploading', 'scanning', 'retrying', 'failed', 'paused')
        ORDER BY created_at ASC`
-    ).all() as Record<string, unknown>[]).map(rowToTask)
+    ).all() as Record<string, unknown>[]
+    return this.rowsToTasks(rows)
   }
 
   getCompletedForCleanup(retentionDays: number): Task[] {
     const db = getDb()
     const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString()
-    return (db.prepare(
+    const rows = db.prepare(
       `SELECT * FROM tasks
        WHERE status = 'completed'
          AND (source_type = 'rsync' OR (source_type = 'local' AND day_folder_id IS NULL))
          AND completed_at IS NOT NULL AND completed_at < ?
        ORDER BY completed_at ASC`
-    ).all(cutoff) as Record<string, unknown>[]).map(rowToTask)
+    ).all(cutoff) as Record<string, unknown>[]
+    return this.rowsToTasks(rows)
   }
 }
 

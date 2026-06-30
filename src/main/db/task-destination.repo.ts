@@ -120,6 +120,35 @@ export class TaskDestinationRepo {
     ).map(rowToDestination)
   }
 
+  listByTaskIds(taskIds: string[]): Map<string, TaskDestination[]> {
+    const result = new Map<string, TaskDestination[]>()
+    const uniqueIds = Array.from(new Set(taskIds)).filter(Boolean)
+    if (uniqueIds.length === 0) return result
+
+    const chunkSize = 500
+    for (let index = 0; index < uniqueIds.length; index += chunkSize) {
+      const chunk = uniqueIds.slice(index, index + chunkSize)
+      const placeholders = chunk.map(() => '?').join(',')
+      const rows = getDb()
+        .prepare(
+          `SELECT *
+           FROM task_destinations
+           WHERE task_id IN (${placeholders})
+           ORDER BY task_id, provider`
+        )
+        .all(...chunk) as Record<string, unknown>[]
+
+      for (const row of rows) {
+        const destination = rowToDestination(row)
+        const destinations = result.get(destination.taskId) || []
+        destinations.push(destination)
+        result.set(destination.taskId, destinations)
+      }
+    }
+
+    return result
+  }
+
   get(taskId: string, provider: CloudProvider): TaskDestination | null {
     const row = getDb()
       .prepare('SELECT * FROM task_destinations WHERE task_id = ? AND provider = ?')
