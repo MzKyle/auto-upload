@@ -84,6 +84,15 @@ function rowToTaskFile(row: Record<string, unknown>): TaskFile {
   }
 }
 
+export interface TaskFileSummary {
+  totalFiles: number
+  totalBytes: number
+  completedFiles: number
+  completedBytes: number
+  failedFiles: number
+  skippedFiles: number
+}
+
 export class TaskRepo {
   private rowsToTasks(rows: Record<string, unknown>[]): Task[] {
     const destinationsByTask = getTaskDestinationRepo().listByTaskIds(
@@ -442,6 +451,28 @@ export class TaskRepo {
       return (db.prepare('SELECT * FROM task_files WHERE task_id = ? AND status = ?').all(taskId, status) as Record<string, unknown>[]).map(rowToTaskFile)
     }
     return (db.prepare('SELECT * FROM task_files WHERE task_id = ?').all(taskId) as Record<string, unknown>[]).map(rowToTaskFile)
+  }
+
+  summarizeFiles(taskId: string): TaskFileSummary {
+    const row = getDb().prepare(
+      `SELECT
+         COUNT(*) AS total_files,
+         COALESCE(SUM(file_size), 0) AS total_bytes,
+         SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
+         COALESCE(SUM(CASE WHEN status = 'completed' THEN file_size ELSE 0 END), 0) AS completed_bytes,
+         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_files,
+         SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped_files
+       FROM task_files
+       WHERE task_id = ?`
+    ).get(taskId) as Record<string, number>
+    return {
+      totalFiles: row.total_files || 0,
+      totalBytes: row.total_bytes || 0,
+      completedFiles: row.completed_files || 0,
+      completedBytes: row.completed_bytes || 0,
+      failedFiles: row.failed_files || 0,
+      skippedFiles: row.skipped_files || 0
+    }
   }
 
   listFileDetails(taskId: string): TaskFileDetail[] {

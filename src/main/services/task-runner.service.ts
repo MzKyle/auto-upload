@@ -41,14 +41,19 @@ interface ProviderRuntime {
   activeUploads: Map<string, number>
   transferredBytes: number
   lastBroadcastAt: number
+  lastProgressPersistAt: number
+  progressDirty: boolean
 }
 
 interface LogicalProgress {
-  completed: Set<string>
+  completedThisRun: Set<string>
+  uploadedFiles: number
   uploadedBytes: number
 }
 
 const RETRY_DELAYS_MS = [1000, 2000, 5000, 15000, 30000]
+const MARKER_WRITE_INTERVAL_MS = 5000
+const PROGRESS_PERSIST_INTERVAL_MS = 1000
 
 export class TaskRunnerService {
   async run(task: Task, signal?: AbortSignal): Promise<TaskStatus> {
@@ -93,13 +98,11 @@ export class TaskRunnerService {
       )
       if (error) throw new Error(error)
     }
-    const completedLogicalFiles = taskRepo.listFiles(task.id, 'completed')
+    const initialLogicalSummary = taskRepo.summarizeFiles(task.id)
     const logicalProgress: LogicalProgress = {
-      completed: new Set(completedLogicalFiles.map((file) => file.id)),
-      uploadedBytes: completedLogicalFiles.reduce(
-        (sum, file) => sum + file.fileSize,
-        0
-      )
+      completedThisRun: new Set(),
+      uploadedFiles: initialLogicalSummary.completedFiles,
+      uploadedBytes: initialLogicalSummary.completedBytes
     }
 
     const providers = Array.from(new Set(jobs.map((job) => job.provider)))
@@ -113,33 +116,25 @@ export class TaskRunnerService {
           settings,
           settings.upload.multipartThreshold
         )
-        const providerTargets = destinationRepo.listFileTargets(task.id, provider)
+        const providerSummary = destinationRepo.summarizeFileTargets(
+          task.id,
+          provider
+        )
         runtimes.set(provider, {
           uploader,
           speed: new SpeedCalculator(),
-          uploadedFiles: providerTargets.filter(
-            (target) => target.status === 'completed'
-          ).length,
-          uploadedBytes: providerTargets
-            .filter((target) => target.status === 'completed')
-            .reduce((sum, target) => sum + target.fileSize, 0),
-          totalFiles: providerTargets.length,
-          totalBytes: providerTargets.reduce(
-            (sum, target) => sum + target.fileSize,
-            0
-          ),
-          queuedFiles: providerTargets.filter(
-            (target) => target.status === 'pending'
-          ).length,
-          failedFiles: providerTargets.filter(
-            (target) => target.status === 'failed'
-          ).length,
-          skippedFiles: providerTargets.filter(
-            (target) => target.status === 'skipped'
-          ).length,
+          uploadedFiles: providerSummary.uploaded,
+          uploadedBytes: providerSummary.uploadedBytes,
+          totalFiles: providerSummary.total,
+          totalBytes: providerSummary.totalBytes,
+          queuedFiles: providerSummary.pending,
+          failedFiles: providerSummary.failed,
+          skippedFiles: providerSummary.skipped,
           activeUploads: new Map(),
           transferredBytes: 0,
-          lastBroadcastAt: 0
+          lastBroadcastAt: 0,
+          lastProgressPersistAt: 0,
+          progressDirty: false
         })
         destinationRepo.updateStatus(task.id, provider, 'uploading')
         this.broadcastDestinationStatus(task.id, provider, 'uploading')
@@ -154,9 +149,10 @@ export class TaskRunnerService {
     }
     signal?.addEventListener('abort', abortUploaders, { once: true })
 
+    const markerDestinations = destinationRepo.listByTask(task.id)
     const marker = this.createCompactMarker(
       { ...task, status: 'uploading' },
-      destinations
+      markerDestinations
     )
     this.writeMarker(task.folderPath, marker)
     const markerTimer = setInterval(() => {
@@ -164,12 +160,9 @@ export class TaskRunnerService {
       if (!currentTask) return
       this.writeMarker(
         task.folderPath,
-        this.createCompactMarker(
-          currentTask,
-          destinationRepo.listByTask(task.id)
-        )
+        this.createCompactMarker(currentTask, currentTask.destinations)
       )
-    }, 2000)
+    }, MARKER_WRITE_INTERVAL_MS)
 
     const semaphore = getUploadSemaphore(
       settings.upload.maxConcurrentUploads || 24
@@ -202,6 +195,9 @@ export class TaskRunnerService {
     } finally {
       clearInterval(markerTimer)
       signal?.removeEventListener('abort', abortUploaders)
+      for (const [provider, runtime] of runtimes) {
+        this.persistProviderProgress(task.id, provider, runtime, true)
+      }
       for (const runtime of runtimes.values()) runtime.uploader.dispose()
     }
 
@@ -215,7 +211,7 @@ export class TaskRunnerService {
     const finalTask = { ...currentTask, status: finalStatus }
     this.writeMarker(
       task.folderPath,
-      this.createCompactMarker(finalTask, destinationRepo.listByTask(task.id))
+      this.createCompactMarker(finalTask, finalTask.destinations)
     )
     return finalStatus
   }
@@ -360,6 +356,7 @@ export class TaskRunnerService {
       destinationRepo.recalculateLogicalFile(target.taskFileId)
       runtime.skippedFiles++
       runtime.queuedFiles = Math.max(0, runtime.queuedFiles - 1)
+      this.persistProviderProgress(task.id, target.provider, runtime)
       this.broadcastProgress(task.id, target.provider, runtime, null, true)
       return
     }
@@ -443,12 +440,13 @@ export class TaskRunnerService {
       )
       if (logicalStatus === 'completed') {
         taskRepo.clearRetry(target.taskFileId)
-        if (!logicalProgress.completed.has(target.taskFileId)) {
-          logicalProgress.completed.add(target.taskFileId)
+        if (!logicalProgress.completedThisRun.has(target.taskFileId)) {
+          logicalProgress.completedThisRun.add(target.taskFileId)
+          logicalProgress.uploadedFiles++
           logicalProgress.uploadedBytes += target.fileSize
           taskRepo.updateProgress(
             task.id,
-            logicalProgress.completed.size,
+            logicalProgress.uploadedFiles,
             logicalProgress.uploadedBytes
           )
         }
@@ -503,14 +501,37 @@ export class TaskRunnerService {
     } finally {
       runtime.activeUploads.delete(target.id)
       if (acquired) semaphore.release()
-      destinationRepo.updateProgress(
-        task.id,
-        target.provider,
-        runtime.uploadedFiles,
-        runtime.uploadedBytes
-      )
+      this.persistProviderProgress(task.id, target.provider, runtime)
       this.broadcastProgress(task.id, target.provider, runtime, null, true)
     }
+  }
+
+  private persistProviderProgress(
+    taskId: string,
+    provider: CloudProvider,
+    runtime: ProviderRuntime,
+    force = false
+  ): void {
+    const now = Date.now()
+    if (
+      !force &&
+      !runtime.progressDirty &&
+      now - runtime.lastProgressPersistAt < PROGRESS_PERSIST_INTERVAL_MS
+    ) {
+      return
+    }
+    if (!force && now - runtime.lastProgressPersistAt < PROGRESS_PERSIST_INTERVAL_MS) {
+      runtime.progressDirty = true
+      return
+    }
+    getTaskDestinationRepo().updateProgress(
+      taskId,
+      provider,
+      runtime.uploadedFiles,
+      runtime.uploadedBytes
+    )
+    runtime.lastProgressPersistAt = now
+    runtime.progressDirty = false
   }
 
   private updateDestinationFinalStates(task: Task): TaskStatus {
@@ -519,39 +540,39 @@ export class TaskRunnerService {
       task.sourceType === 'local' && task.dayFolderId ? 'synced' : 'completed'
 
     for (const destination of repo.listByTask(task.id)) {
-      const targets = repo.listFileTargets(task.id, destination.provider)
-      const failed = targets.filter((target) => target.status === 'failed')
-      const pending = targets.filter((target) => target.status === 'pending')
-      const skipped = targets.filter((target) => target.status === 'skipped')
+      const summary = repo.summarizeFileTargets(task.id, destination.provider)
 
-      if (failed.length > 0) {
-        const summary = `${failed.length} 个文件上传失败，例如 ${failed
-          .slice(0, 3)
+      if (summary.failed > 0) {
+        const examples = repo.listFailedFileTargetExamples(
+          task.id,
+          destination.provider
+        )
+        const message = `${summary.failed} 个文件上传失败，例如 ${examples
           .map(
-            (target) =>
-              `${target.relativePath}: ${target.errorMessage || 'unknown error'}`
+            (example) =>
+              `${example.relativePath}: ${example.errorMessage || 'unknown error'}`
           )
           .join(' | ')}`
-        repo.updateStatus(task.id, destination.provider, 'failed', summary)
+        repo.updateStatus(task.id, destination.provider, 'failed', message)
         this.broadcastDestinationStatus(
           task.id,
           destination.provider,
           'failed',
-          summary
+          message
         )
         taskStatus = 'failed'
-      } else if (pending.length > 0) {
+      } else if (summary.pending > 0) {
         repo.updateStatus(
           task.id,
           destination.provider,
           'retrying',
-          `${pending.length} 个文件等待自动重试或稳定`
+          `${summary.pending} 个文件等待自动重试或稳定`
         )
         this.broadcastDestinationStatus(
           task.id,
           destination.provider,
           'retrying',
-          `${pending.length} 个文件等待自动重试或稳定`
+          `${summary.pending} 个文件等待自动重试或稳定`
         )
         if (taskStatus !== 'failed') taskStatus = 'retrying'
       } else {
@@ -563,16 +584,27 @@ export class TaskRunnerService {
           task.id,
           destination.provider,
           status,
-          skipped.length > 0 ? `${skipped.length} 个源文件已跳过` : undefined
+          summary.skipped > 0 ? `${summary.skipped} 个源文件已跳过` : undefined
         )
         this.broadcastDestinationStatus(
           task.id,
           destination.provider,
           status,
-          skipped.length > 0 ? `${skipped.length} 个源文件已跳过` : undefined
+          summary.skipped > 0 ? `${summary.skipped} 个源文件已跳过` : undefined
         )
       }
-      repo.recalculateProgress(task.id, destination.provider)
+      repo.setTotals(
+        task.id,
+        destination.provider,
+        summary.total,
+        summary.totalBytes
+      )
+      repo.updateProgress(
+        task.id,
+        destination.provider,
+        summary.uploaded,
+        summary.uploadedBytes
+      )
     }
 
     return taskStatus
@@ -583,14 +615,15 @@ export class TaskRunnerService {
     destinations: Task['destinations']
   ): ProcessTaskMarker {
     const destinationRepo = getTaskDestinationRepo()
+    const taskSummary = getTaskRepo().summarizeFiles(task.id)
     return {
       version: 3,
       taskId: task.id,
       status: task.status,
-      totalFiles: task.totalFiles,
-      uploadedFiles: task.uploadedFiles,
-      failedFiles: taskRepoCount(task.id, 'failed'),
-      skippedFiles: taskRepoCount(task.id, 'skipped'),
+      totalFiles: taskSummary.totalFiles,
+      uploadedFiles: taskSummary.completedFiles,
+      failedFiles: taskSummary.failedFiles,
+      skippedFiles: taskSummary.skippedFiles,
       lastUpdated: new Date().toISOString(),
       error:
         task.errorMessage ||
@@ -602,7 +635,7 @@ export class TaskRunnerService {
       uploadTargetMode: task.uploadTargetMode,
       destinations: Object.fromEntries(
         destinations.map((destination) => {
-          const targets = destinationRepo.listFileTargets(
+          const summary = destinationRepo.summarizeFileTargets(
             task.id,
             destination.provider
           )
@@ -613,16 +646,10 @@ export class TaskRunnerService {
               uploadRelativePath: destination.uploadRelativePath,
               pathMode: destination.pathMode,
               objectKeyTemplate: destination.objectKeyTemplate,
-              totalFiles: targets.length,
-              uploadedFiles: targets.filter(
-                (target) => target.status === 'completed'
-              ).length,
-              failedFiles: targets.filter(
-                (target) => target.status === 'failed'
-              ).length,
-              skippedFiles: targets.filter(
-                (target) => target.status === 'skipped'
-              ).length,
+              totalFiles: summary.total,
+              uploadedFiles: summary.uploaded,
+              failedFiles: summary.failed,
+              skippedFiles: summary.skipped,
               error: destination.errorMessage
             }
           ]
@@ -729,10 +756,6 @@ export class TaskRunnerService {
       text.includes('socket hang up')
     )
   }
-}
-
-function taskRepoCount(taskId: string, status: string): number {
-  return getTaskRepo().listFiles(taskId, status).length
 }
 
 let instance: TaskRunnerService | null = null

@@ -25,8 +25,12 @@ export interface FileDestinationUploadTarget extends TaskFileDestination {
 
 export interface FileDestinationSummary {
   total: number
+  totalBytes: number
+  uploaded: number
+  uploadedBytes: number
   failed: number
   pending: number
+  skipped: number
   retryWaiting: number
 }
 
@@ -321,8 +325,12 @@ export class TaskDestinationRepo {
     const row = getDb().prepare(
       `SELECT
          COUNT(*) AS total,
+         COALESCE(SUM(tf.file_size), 0) AS total_bytes,
+         SUM(CASE WHEN tfd.status = 'completed' THEN 1 ELSE 0 END) AS uploaded,
+         COALESCE(SUM(CASE WHEN tfd.status = 'completed' THEN tf.file_size ELSE 0 END), 0) AS uploaded_bytes,
          SUM(CASE WHEN tfd.status = 'failed' THEN 1 ELSE 0 END) AS failed,
          SUM(CASE WHEN tfd.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+         SUM(CASE WHEN tfd.status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
          SUM(CASE
            WHEN tfd.status = 'pending'
             AND tf.next_retry_at IS NOT NULL
@@ -334,10 +342,36 @@ export class TaskDestinationRepo {
     ).get(now, taskId, provider) as Record<string, number>
     return {
       total: row.total || 0,
+      totalBytes: row.total_bytes || 0,
+      uploaded: row.uploaded || 0,
+      uploadedBytes: row.uploaded_bytes || 0,
       failed: row.failed || 0,
       pending: row.pending || 0,
+      skipped: row.skipped || 0,
       retryWaiting: row.retry_waiting || 0
     }
+  }
+
+  listFailedFileTargetExamples(
+    taskId: string,
+    provider: CloudProvider,
+    limit = 3
+  ): Array<{ relativePath: string; errorMessage: string | null }> {
+    const rows = getDb().prepare(
+      `SELECT tf.relative_path, tfd.error_message
+       FROM task_file_destinations tfd
+       INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+       WHERE tf.task_id = ? AND tfd.provider = ? AND tfd.status = 'failed'
+       ORDER BY tf.created_at
+       LIMIT ?`
+    ).all(taskId, provider, Math.max(1, limit)) as Array<{
+      relative_path: string
+      error_message: string | null
+    }>
+    return rows.map((row) => ({
+      relativePath: row.relative_path,
+      errorMessage: row.error_message || null
+    }))
   }
 
   updateFileStatus(
