@@ -217,7 +217,8 @@ export class ScannerService {
           root,
           today,
           profile.scan.workDirNamePattern || scanConfig?.workDirNamePattern,
-          seenChildPaths
+          seenChildPaths,
+          profile
         )
         scannedDirs += result.scanned
         newDirsFound += result.newFound
@@ -259,7 +260,8 @@ export class ScannerService {
     root: ActiveProfileScanRoot,
     today: string,
     workDirNamePattern: string | undefined,
-    seenChildPaths: Set<string>
+    seenChildPaths: Set<string>,
+    profile = getProfileById(getSettingsRepo().getAll(), root.profileId)
   ): Promise<{ scanned: number; newFound: number; existing: number; ignored: number; skipped: number }> {
     let scanned = 0
     let newFound = 0
@@ -274,7 +276,6 @@ export class ScannerService {
         workDirNamePattern
       )
       if (dayDirectory) {
-        const profile = getProfileById(getSettingsRepo().getAll(), root.profileId)
         const result = await this.scanDayDirectory(
           root.directory,
           dayDirectory.folderPath,
@@ -632,11 +633,25 @@ export class ScannerService {
     }
   }
 
-  queueReconcileTask(task: Task): void {
-    if (this.reconcileQueuedIds.has(task.id)) return
-    this.reconcileQueuedIds.add(task.id)
-    this.reconcileQueue.push(task.id)
+  queueReconcileTask(task: Pick<Task, 'id'> | string): void {
+    const taskId = typeof task === 'string' ? task : task.id
+    if (!this.enqueueReconcileTaskId(taskId)) return
     void this.processReconcileQueue()
+  }
+
+  queueReconcileTaskIds(taskIds: string[]): void {
+    let queued = false
+    for (const taskId of taskIds) {
+      queued = this.enqueueReconcileTaskId(taskId) || queued
+    }
+    if (queued) void this.processReconcileQueue()
+  }
+
+  private enqueueReconcileTaskId(taskId: string): boolean {
+    if (this.reconcileQueuedIds.has(taskId)) return false
+    this.reconcileQueuedIds.add(taskId)
+    this.reconcileQueue.push(taskId)
+    return true
   }
 
   private async processReconcileQueue(): Promise<void> {

@@ -809,6 +809,15 @@ export class TaskRepo {
     return this.rowsToTasks(rows)
   }
 
+  listUnfinishedTaskIds(): string[] {
+    const rows = getDb().prepare(
+      `SELECT id FROM tasks
+       WHERE status IN ('pending', 'uploading', 'scanning', 'retrying', 'failed', 'paused')
+       ORDER BY created_at ASC`
+    ).all() as Array<{ id: string }>
+    return rows.map((row) => row.id)
+  }
+
   getCompletedForCleanup(retentionDays: number): Task[] {
     const db = getDb()
     const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString()

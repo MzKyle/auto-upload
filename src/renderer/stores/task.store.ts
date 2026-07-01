@@ -34,19 +34,30 @@ export const useTaskStore = create<TaskStore>((set) => ({
   },
 
   setProgress: (p: TaskProgress) => {
-    set((state) => ({
-      progress: { ...state.progress, [progressKey(p.taskId, p.provider)]: p }
-    }))
+    set((state) => {
+      const key = progressKey(p.taskId, p.provider)
+      const current = state.progress[key]
+      if (current && isSameProgress(current, p)) return state
+      return { progress: { ...state.progress, [key]: p } }
+    })
   },
 
   setProgressBatch: (items: TaskProgress[]) => {
     if (items.length === 0) return
     set((state) => {
-      const progress = { ...state.progress }
+      let progress = state.progress
+      let changed = false
       for (const item of items) {
-        progress[progressKey(item.taskId, item.provider)] = item
+        const key = progressKey(item.taskId, item.provider)
+        const current = progress[key]
+        if (current && isSameProgress(current, item)) continue
+        if (!changed) {
+          progress = { ...state.progress }
+          changed = true
+        }
+        progress[key] = item
       }
-      return { progress }
+      return changed ? { progress } : state
     })
   },
 
@@ -77,3 +88,21 @@ export const useTaskStore = create<TaskStore>((set) => ({
     }))
   }
 }))
+
+function isSameProgress(a: TaskProgress, b: TaskProgress): boolean {
+  return (
+    a.taskId === b.taskId &&
+    a.provider === b.provider &&
+    a.uploadedFiles === b.uploadedFiles &&
+    a.totalFiles === b.totalFiles &&
+    a.uploadedBytes === b.uploadedBytes &&
+    a.totalBytes === b.totalBytes &&
+    a.speed === b.speed &&
+    a.currentFile === b.currentFile &&
+    a.queuedFiles === b.queuedFiles &&
+    a.activeUploads === b.activeUploads &&
+    a.failedFiles === b.failedFiles &&
+    a.skippedFiles === b.skippedFiles &&
+    a.transferredBytes === b.transferredBytes
+  )
+}

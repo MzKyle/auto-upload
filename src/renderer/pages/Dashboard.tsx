@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useMemo, useState } from "react";
+import { memo, useEffect, useCallback, useMemo, useState } from "react";
 import { FolderPlus, RefreshCw, PlayCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TaskCard } from "@/components/TaskCard";
@@ -42,7 +42,9 @@ type DashboardTreeItem =
   | { kind: "task"; task: Task };
 
 export default function Dashboard() {
-  const { tasks, progress, loading, loadTasks } = useTaskStore();
+  const tasks = useTaskStore((state) => state.tasks);
+  const loading = useTaskStore((state) => state.loading);
+  const loadTasks = useTaskStore((state) => state.loadTasks);
   const [dataCollects, setDataCollects] = useState<DataCollectInfo[]>([]);
   const [dayFolders, setDayFolders] = useState<DayFolderSummary[]>([]);
   const [provider, setProvider] = useState<CloudProvider>("aliyun");
@@ -250,18 +252,6 @@ export default function Dashboard() {
     }
     return grouped;
   }, [providerTasks]);
-  const speedByDayFolderId = useMemo(() => {
-    const grouped = new Map<string, number>();
-    for (const task of providerTasks) {
-      if (!task.dayFolderId) continue;
-      const current = grouped.get(task.dayFolderId) ?? 0;
-      grouped.set(
-        task.dayFolderId,
-        current + (progress[progressKey(task.id, provider)]?.speed || 0),
-      );
-    }
-    return grouped;
-  }, [providerTasks, progress, provider]);
   const taskDirectoryTree = useMemo(
     () =>
       buildPathTree<DashboardTreeItem>([
@@ -353,10 +343,10 @@ export default function Dashboard() {
 
                     return (
                       <div key={dayFolder.id}>
-                        <DayFolderCard
+                        <DayFolderCardWithSpeed
                           dayFolder={dayFolder}
                           tasks={childTasks}
-                          speed={speedByDayFolderId.get(dayFolder.id) ?? 0}
+                          provider={provider}
                           onIgnore={handleIgnoreDay}
                           onRestore={handleRestoreDay}
                         />
@@ -374,11 +364,10 @@ export default function Dashboard() {
                     const task = item.value.task;
 
                     return (
-                      <TaskCard
+                      <TaskCardWithProgress
                         key={task.id}
                         task={task}
                         provider={provider}
-                        progress={progress[progressKey(task.id, provider)]}
                         onPause={handlePause}
                         onResume={handleResume}
                         onCancel={handleCancel}
@@ -510,3 +499,77 @@ export default function Dashboard() {
     </div>
   );
 }
+
+const TaskCardWithProgress = memo(function TaskCardWithProgress({
+  task,
+  provider,
+  onPause,
+  onResume,
+  onCancel,
+  onRetry,
+  onRestore,
+}: {
+  task: Task;
+  provider: CloudProvider;
+  onPause: (id: string) => void;
+  onResume: (id: string) => void;
+  onCancel: (id: string) => void;
+  onRetry: (id: string, provider: CloudProvider) => void;
+  onRestore: (id: string) => void;
+}) {
+  const progress = useTaskStore(
+    useCallback(
+      (state) => state.progress[progressKey(task.id, provider)],
+      [provider, task.id],
+    ),
+  );
+
+  return (
+    <TaskCard
+      task={task}
+      provider={provider}
+      progress={progress}
+      onPause={onPause}
+      onResume={onResume}
+      onCancel={onCancel}
+      onRetry={onRetry}
+      onRestore={onRestore}
+    />
+  );
+});
+
+const DayFolderCardWithSpeed = memo(function DayFolderCardWithSpeed({
+  dayFolder,
+  tasks,
+  provider,
+  onIgnore,
+  onRestore,
+}: {
+  dayFolder: DayFolderSummary;
+  tasks: Task[];
+  provider: CloudProvider;
+  onIgnore: (id: string) => void;
+  onRestore: (id: string) => void;
+}) {
+  const speed = useTaskStore(
+    useCallback(
+      (state) =>
+        tasks.reduce(
+          (sum, task) =>
+            sum + (state.progress[progressKey(task.id, provider)]?.speed || 0),
+          0,
+        ),
+      [provider, tasks],
+    ),
+  );
+
+  return (
+    <DayFolderCard
+      dayFolder={dayFolder}
+      tasks={tasks}
+      speed={speed}
+      onIgnore={onIgnore}
+      onRestore={onRestore}
+    />
+  );
+});

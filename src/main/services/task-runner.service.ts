@@ -42,13 +42,13 @@ interface ProviderRuntime {
   transferredBytes: number
   lastBroadcastAt: number
   lastProgressPersistAt: number
-  progressDirty: boolean
 }
 
 interface LogicalProgress {
   completedThisRun: Set<string>
   uploadedFiles: number
   uploadedBytes: number
+  lastPersistAt: number
 }
 
 const RETRY_DELAYS_MS = [1000, 2000, 5000, 15000, 30000]
@@ -102,7 +102,8 @@ export class TaskRunnerService {
     const logicalProgress: LogicalProgress = {
       completedThisRun: new Set(),
       uploadedFiles: initialLogicalSummary.completedFiles,
-      uploadedBytes: initialLogicalSummary.completedBytes
+      uploadedBytes: initialLogicalSummary.completedBytes,
+      lastPersistAt: 0
     }
 
     const providers = Array.from(new Set(jobs.map((job) => job.provider)))
@@ -133,8 +134,7 @@ export class TaskRunnerService {
           activeUploads: new Map(),
           transferredBytes: 0,
           lastBroadcastAt: 0,
-          lastProgressPersistAt: 0,
-          progressDirty: false
+          lastProgressPersistAt: 0
         })
         destinationRepo.updateStatus(task.id, provider, 'uploading')
         this.broadcastDestinationStatus(task.id, provider, 'uploading')
@@ -195,6 +195,7 @@ export class TaskRunnerService {
     } finally {
       clearInterval(markerTimer)
       signal?.removeEventListener('abort', abortUploaders)
+      this.persistLogicalProgress(task.id, logicalProgress, true)
       for (const [provider, runtime] of runtimes) {
         this.persistProviderProgress(task.id, provider, runtime, true)
       }
@@ -444,11 +445,7 @@ export class TaskRunnerService {
           logicalProgress.completedThisRun.add(target.taskFileId)
           logicalProgress.uploadedFiles++
           logicalProgress.uploadedBytes += target.fileSize
-          taskRepo.updateProgress(
-            task.id,
-            logicalProgress.uploadedFiles,
-            logicalProgress.uploadedBytes
-          )
+          this.persistLogicalProgress(task.id, logicalProgress)
         }
       }
       runtime.uploadedFiles++
@@ -515,13 +512,8 @@ export class TaskRunnerService {
     const now = Date.now()
     if (
       !force &&
-      !runtime.progressDirty &&
       now - runtime.lastProgressPersistAt < PROGRESS_PERSIST_INTERVAL_MS
     ) {
-      return
-    }
-    if (!force && now - runtime.lastProgressPersistAt < PROGRESS_PERSIST_INTERVAL_MS) {
-      runtime.progressDirty = true
       return
     }
     getTaskDestinationRepo().updateProgress(
@@ -531,7 +523,26 @@ export class TaskRunnerService {
       runtime.uploadedBytes
     )
     runtime.lastProgressPersistAt = now
-    runtime.progressDirty = false
+  }
+
+  private persistLogicalProgress(
+    taskId: string,
+    logicalProgress: LogicalProgress,
+    force = false
+  ): void {
+    const now = Date.now()
+    if (
+      !force &&
+      now - logicalProgress.lastPersistAt < PROGRESS_PERSIST_INTERVAL_MS
+    ) {
+      return
+    }
+    getTaskRepo().updateProgress(
+      taskId,
+      logicalProgress.uploadedFiles,
+      logicalProgress.uploadedBytes
+    )
+    logicalProgress.lastPersistAt = now
   }
 
   private updateDestinationFinalStates(task: Task): TaskStatus {

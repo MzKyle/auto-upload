@@ -239,9 +239,9 @@ function startServices(): void {
   })
 
   // 恢复未完成的任务
-  const unfinished = taskRepo.getUnfinishedTasks()
-  if (unfinished.length > 0) {
-    log.info(`发现 ${unfinished.length} 个未完成任务，等待后台队列分批恢复`)
+  const unfinishedTaskIds = taskRepo.listUnfinishedTaskIds()
+  if (unfinishedTaskIds.length > 0) {
+    log.info(`发现 ${unfinishedTaskIds.length} 个未完成任务，等待后台队列分批恢复`)
   }
 
   // 启动任务队列
@@ -250,9 +250,7 @@ function startServices(): void {
   // 启动扫描器
   scanner.start()
 
-  for (const task of unfinished) {
-    scanner.queueReconcileTask(task)
-  }
+  scanner.queueReconcileTaskIds(unfinishedTaskIds)
 
   // 启动自动清理服务
   getCleanupService().start()
