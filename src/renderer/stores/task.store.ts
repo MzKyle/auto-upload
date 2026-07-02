@@ -1,11 +1,21 @@
 import { create } from 'zustand'
 import type {
   Task,
+  TaskStatus,
   TaskDestinationStatusEvent,
   TaskProgress
 } from '@shared/types'
 import { fetchTasks } from '@/lib/ipc-client'
 import { progressKey } from '@shared/cloud-upload'
+
+const DASHBOARD_TASK_STATUSES: TaskStatus[] = [
+  'pending',
+  'scanning',
+  'uploading',
+  'retrying',
+  'failed',
+  'paused'
+]
 
 interface TaskStore {
   tasks: Task[]
@@ -26,7 +36,7 @@ export const useTaskStore = create<TaskStore>((set) => ({
   loadTasks: async () => {
     set({ loading: true })
     try {
-      const tasks = await fetchTasks()
+      const tasks = await fetchTasks({ statuses: DASHBOARD_TASK_STATUSES })
       set({ tasks })
     } finally {
       set({ loading: false })

@@ -5,7 +5,14 @@ import { getSettingsRepo } from '../db/settings.repo'
 import { getCleanupService } from './cleanup.service'
 import { getDayFolderService } from './day-folder.service'
 import { getTaskDestinationRepo } from '../db/task-destination.repo'
-import type { Task, TaskStatus, UploadConfig } from '@shared/types'
+import type {
+  Task,
+  TaskStatus,
+  UploadConfig,
+  UploadQueueStartInput,
+  UploadQueueStatus,
+  UploadQueueStopInput
+} from '@shared/types'
 
 /**
  * 任务队列服务
@@ -16,6 +23,10 @@ export class TaskQueueService extends EventEmitter {
   private runningTasks: Map<string, { cancel: () => void }> = new Map()
   private processTimer: ReturnType<typeof setInterval> | null = null
   private initialProcessTimer: ReturnType<typeof setTimeout> | null = null
+  private uploadGateOpen = false
+  private priorityTaskIds = new Set<string>()
+  private priorityActive = false
+  private priorityOverrideWindow = false
   private taskRunner:
     | ((task: Task, signal: AbortSignal) => Promise<TaskStatus>)
     | null = null
@@ -50,6 +61,64 @@ export class TaskQueueService extends EventEmitter {
     log.info('任务队列已停止')
   }
 
+  getStatus(): UploadQueueStatus {
+    const uploadConfig = getSettingsRepo().get<UploadConfig>('upload')
+    this.syncPriorityState(false)
+    return {
+      gateOpen: this.uploadGateOpen,
+      priorityActive: this.priorityActive,
+      priorityTaskIds: Array.from(this.priorityTaskIds),
+      priorityRemaining: this.priorityTaskIds.size,
+      runningTaskIds: Array.from(this.runningTasks.keys()),
+      overrideWindow: this.priorityOverrideWindow,
+      withinUploadWindow: this.isWithinUploadWindow(
+        uploadConfig?.startAfterTime,
+        uploadConfig?.endBeforeTime
+      ),
+      uploadWindow: {
+        startAfterTime: uploadConfig?.startAfterTime ?? null,
+        endBeforeTime: uploadConfig?.endBeforeTime ?? null
+      }
+    }
+  }
+
+  startUploading(input: UploadQueueStartInput): UploadQueueStatus {
+    const taskRepo = getTaskRepo()
+    const taskIds = this.resolveStartTaskIds(input)
+    taskRepo.resumeManyForUpload(taskIds)
+
+    this.uploadGateOpen = true
+    this.priorityTaskIds = new Set(taskIds)
+    this.priorityActive = this.priorityTaskIds.size > 0
+    this.priorityOverrideWindow =
+      Boolean(input.overrideWindow) && this.priorityActive
+    this.syncPriorityState(false)
+    this.emitQueueStatus()
+    void this.processQueue()
+    log.info(
+      `上传队列已放行，优先任务 ${this.priorityTaskIds.size} 个，` +
+        `overrideWindow=${this.priorityOverrideWindow}`
+    )
+    return this.getStatus()
+  }
+
+  stopUploading(input: UploadQueueStopInput): UploadQueueStatus {
+    this.uploadGateOpen = false
+    this.priorityTaskIds.clear()
+    this.priorityActive = false
+    this.priorityOverrideWindow = false
+
+    if (input.mode === 'pause-running') {
+      for (const taskId of Array.from(this.runningTasks.keys())) {
+        this.pauseRunningTask(taskId)
+      }
+    }
+
+    this.emitQueueStatus()
+    log.info('上传队列已停止:', input.mode)
+    return this.getStatus()
+  }
+
   getRunningCount(): number {
     return this.runningTasks.size
   }
@@ -63,15 +132,24 @@ export class TaskQueueService extends EventEmitter {
     if (running) {
       running.cancel()
       this.runningTasks.delete(taskId)
+      this.emitQueueStatus()
     }
   }
 
   private async processQueue(): Promise<void> {
     if (!this.taskRunner) return
+    if (!this.uploadGateOpen) return
+    this.syncPriorityState()
 
     const settings = getSettingsRepo()
     const uploadConfig = settings.get<UploadConfig>('upload')
-    if (!this.isWithinUploadWindow(uploadConfig?.startAfterTime, uploadConfig?.endBeforeTime)) return
+    const withinUploadWindow = this.isWithinUploadWindow(
+      uploadConfig?.startAfterTime,
+      uploadConfig?.endBeforeTime
+    )
+    const canOverrideWindow =
+      this.priorityActive && this.priorityOverrideWindow
+    if (!withinUploadWindow && !canOverrideWindow) return
 
     const maxConcurrent = uploadConfig?.maxConcurrentTasks || 4
 
@@ -80,8 +158,15 @@ export class TaskQueueService extends EventEmitter {
     if (availableSlots <= 0) return
 
     const pendingTasks = taskRepo.listRunnable()
-    const eligibleTasks = pendingTasks.filter((task) =>
-      this.isTaskEligibleForCurrentStartCycle(task, uploadConfig?.startAfterTime)
+    const prioritizedTasks = this.priorityActive
+      ? pendingTasks.filter((task) => this.priorityTaskIds.has(task.id))
+      : pendingTasks
+    const eligibleTasks = prioritizedTasks.filter((task) =>
+      canOverrideWindow ||
+      this.isTaskEligibleForCurrentStartCycle(
+        task,
+        uploadConfig?.startAfterTime
+      )
     )
     // 每轮只启动一个新任务，避免多个大目录在主进程中同时做首次校准。
     const toRun = eligibleTasks.slice(0, Math.min(availableSlots, 1))
@@ -99,6 +184,7 @@ export class TaskQueueService extends EventEmitter {
 
     try {
       taskRepo.updateStatus(task.id, 'uploading')
+      this.emitQueueStatus()
       this.emit('task:status-change', {
         taskId: task.id,
         oldStatus: task.status,
@@ -139,7 +225,77 @@ export class TaskQueueService extends EventEmitter {
       }
     } finally {
       this.runningTasks.delete(task.id)
+      this.syncPriorityState()
+      this.emitQueueStatus()
+      void this.processQueue()
     }
+  }
+
+  private resolveStartTaskIds(input: UploadQueueStartInput): string[] {
+    const taskRepo = getTaskRepo()
+    if (input.scope === 'all-pending') {
+      return taskRepo.listPendingUploadTaskIds()
+    }
+
+    const ids = new Set<string>()
+    for (const taskId of input.taskIds || []) {
+      if (taskId) ids.add(taskId)
+    }
+    const dayFolderTaskIds = taskRepo.listPendingUploadTaskIdsByDayFolderIds(
+      input.dayFolderIds || []
+    )
+    for (const taskId of dayFolderTaskIds) ids.add(taskId)
+    return Array.from(ids)
+  }
+
+  private syncPriorityState(emit = true): void {
+    if (!this.priorityActive && this.priorityTaskIds.size === 0) return
+
+    let changed = false
+    for (const taskId of Array.from(this.priorityTaskIds)) {
+      const task = getTaskRepo().getById(taskId)
+      if (!task || this.isPriorityTerminalStatus(task.status)) {
+        this.priorityTaskIds.delete(taskId)
+        changed = true
+      }
+    }
+
+    if (this.priorityTaskIds.size === 0 && this.priorityActive) {
+      this.priorityActive = false
+      this.priorityOverrideWindow = false
+      changed = true
+    }
+
+    if (changed && emit) this.emitQueueStatus()
+  }
+
+  private pauseRunningTask(taskId: string): void {
+    const running = this.runningTasks.get(taskId)
+    if (!running) return
+    running.cancel()
+    this.runningTasks.delete(taskId)
+    getTaskRepo().updateStatus(taskId, 'paused')
+    getTaskDestinationRepo().updateIncompleteStatuses(taskId, 'paused')
+    getDayFolderService().refreshForTask(taskId)
+    this.emit('task:status-change', {
+      taskId,
+      oldStatus: 'uploading',
+      newStatus: 'paused'
+    })
+  }
+
+  private isPriorityTerminalStatus(status: TaskStatus): boolean {
+    return (
+      status === 'completed' ||
+      status === 'synced' ||
+      status === 'skipped' ||
+      status === 'failed' ||
+      status === 'paused'
+    )
+  }
+
+  private emitQueueStatus(): void {
+    this.emit('upload-queue:event', this.getStatus())
   }
 
   private isWithinUploadWindow(startAfterTime?: string | null, endBeforeTime?: string | null): boolean {

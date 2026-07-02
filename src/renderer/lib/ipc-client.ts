@@ -3,15 +3,20 @@ import type {
   Task, TaskStatus, AppSettings, HistoryQuery, HistoryResult,
   SSHMachine, SSHMachineInput, ScannerStatus, DataCollectInfo, DiskUsageInfo,
   DayFolderSummary, DayFolderListQuery, CloudProvider, MultiCloudOperationResult,
-  TaskDetail
+  TaskDetail, TaskListQuery, UploadQueueStartInput, UploadQueueStatus,
+  UploadQueueStopInput
 } from '@shared/types'
 import type { UploadPathPreview } from '@shared/upload-profile'
 
 const api = window.api
 
 // ---- 任务 ----
-export async function fetchTasks(status?: TaskStatus): Promise<Task[]> {
-  return (await api.invoke(IPC.TASK_LIST, status ? { status } : undefined)) as Task[]
+export async function fetchTasks(query?: TaskStatus | TaskListQuery): Promise<Task[]> {
+  const args =
+    typeof query === 'string'
+      ? { status: query }
+      : query
+  return (await api.invoke(IPC.TASK_LIST, args)) as Task[]
 }
 
 export async function fetchTask(taskId: string): Promise<Task> {
@@ -48,6 +53,19 @@ export async function restoreTask(taskId: string): Promise<void> {
 
 export async function retryTask(taskId: string, provider?: CloudProvider): Promise<void> {
   await api.invoke(IPC.TASK_RETRY, { taskId, provider })
+}
+
+// ---- 上传队列 ----
+export async function fetchUploadQueueStatus(): Promise<UploadQueueStatus> {
+  return (await api.invoke(IPC.UPLOAD_QUEUE_STATUS)) as UploadQueueStatus
+}
+
+export async function startUploadQueue(input: UploadQueueStartInput): Promise<UploadQueueStatus> {
+  return (await api.invoke(IPC.UPLOAD_QUEUE_START, input)) as UploadQueueStatus
+}
+
+export async function stopUploadQueue(input: UploadQueueStopInput): Promise<UploadQueueStatus> {
+  return (await api.invoke(IPC.UPLOAD_QUEUE_STOP, input)) as UploadQueueStatus
 }
 
 // ---- 日期目录汇总 ----

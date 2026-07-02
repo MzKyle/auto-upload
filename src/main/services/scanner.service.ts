@@ -730,10 +730,9 @@ export class ScannerService {
     const normalizedRoots = watchedDirectories.map((directory) =>
       directory.replace(/[\\/]+$/, '')
     )
-    const tasks = getTaskRepo().listByStatus()
+    const tasks = getTaskRepo().listMonitorableLocalUnfinishedTasks()
     for (let index = 0; index < tasks.length; index++) {
       const task = tasks[index]
-      if (task.sourceType !== 'local' || !task.dayFolderId) continue
       if (
         !normalizedRoots.some(
           (root) =>

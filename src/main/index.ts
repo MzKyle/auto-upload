@@ -20,6 +20,7 @@ import { getWebhookService } from './services/webhook.service'
 import { getCleanupService } from './services/cleanup.service'
 import { getTaskRepo } from './db/task.repo'
 import { initLogger } from './utils/logger'
+import { IPC } from '@shared/ipc-channels'
 import type { WebhookConfig, LogConfig } from '@shared/types'
 import log from 'electron-log'
 
@@ -234,7 +235,13 @@ function startServices(): void {
 
     // 广播状态变更到渲染进程
     for (const win of BrowserWindow.getAllWindows()) {
-      win.webContents.send('task:status-change', event)
+      win.webContents.send(IPC.TASK_STATUS_CHANGE, event)
+    }
+  })
+
+  taskQueue.on('upload-queue:event', (status) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send(IPC.UPLOAD_QUEUE_EVENT, status)
     }
   })
 

@@ -147,6 +147,39 @@ export interface TaskDestinationStatusEvent {
   errorMessage?: string
 }
 
+export type UploadQueueStartScope = 'selected' | 'all-pending'
+export type UploadQueueStopMode = 'after-current' | 'pause-running'
+
+export interface TaskListQuery {
+  status?: TaskStatus
+  statuses?: TaskStatus[]
+}
+
+export interface UploadQueueStartInput {
+  scope: UploadQueueStartScope
+  taskIds?: string[]
+  dayFolderIds?: string[]
+  overrideWindow?: boolean
+}
+
+export interface UploadQueueStopInput {
+  mode: UploadQueueStopMode
+}
+
+export interface UploadQueueStatus {
+  gateOpen: boolean
+  priorityActive: boolean
+  priorityTaskIds: string[]
+  priorityRemaining: number
+  runningTaskIds: string[]
+  overrideWindow: boolean
+  withinUploadWindow: boolean
+  uploadWindow: {
+    startAfterTime: string | null
+    endBeforeTime: string | null
+  }
+}
+
 export interface DayFolderSummary {
   id: string
   folderPath: string

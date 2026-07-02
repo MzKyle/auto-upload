@@ -16,7 +16,7 @@ import { getDb } from '../db/database'
 import { getDataCollectService } from '../services/data-collect.service'
 import { getTaskDestinationRepo } from '../db/task-destination.repo'
 import { v4 as uuid } from 'uuid'
-import type { AppSettings, CloudProvider, HistoryQuery, TaskStatus, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, DayFolderListQuery, UploadPathMode, UploadProfile } from '@shared/types'
+import type { AppSettings, CloudProvider, HistoryQuery, TaskListQuery, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, DayFolderListQuery, UploadPathMode, UploadProfile, UploadQueueStartInput, UploadQueueStopInput } from '@shared/types'
 import { basename, dirname, normalize } from 'path'
 import { isDateFolderName } from '@shared/day-folder'
 import { shouldRestartScannerAfterSettingsSave } from '@shared/settings-effects'
@@ -64,8 +64,8 @@ export function registerAllIpc(): void {
   }
 
   // ---- 任务管理 ----
-  ipcMain.handle(IPC.TASK_LIST, (_event, args?: { status?: TaskStatus }) => {
-    return getTaskRepo().listByStatus(args?.status)
+  ipcMain.handle(IPC.TASK_LIST, (_event, args?: TaskListQuery) => {
+    return getTaskRepo().listByQuery(args)
   })
 
   ipcMain.handle(IPC.TASK_GET, (_event, args: { taskId: string }) => {
@@ -152,6 +152,19 @@ export function registerAllIpc(): void {
     getTaskRepo().retry(args.taskId, args.provider)
     getDayFolderService().refreshForTask(args.taskId)
     broadcastStatusChange(args.taskId, 'pending')
+  })
+
+  // ---- 上传队列 ----
+  ipcMain.handle(IPC.UPLOAD_QUEUE_STATUS, () => {
+    return getTaskQueueService().getStatus()
+  })
+
+  ipcMain.handle(IPC.UPLOAD_QUEUE_START, (_event, args: UploadQueueStartInput) => {
+    return getTaskQueueService().startUploading(args)
+  })
+
+  ipcMain.handle(IPC.UPLOAD_QUEUE_STOP, (_event, args: UploadQueueStopInput) => {
+    return getTaskQueueService().stopUploading(args)
   })
 
   // ---- 扫描器 ----

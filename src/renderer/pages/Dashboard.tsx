@@ -1,5 +1,11 @@
 import { memo, useEffect, useCallback, useMemo, useState } from "react";
-import { FolderPlus, RefreshCw, PlayCircle } from "lucide-react";
+import {
+  CheckSquare,
+  FolderPlus,
+  PauseCircle,
+  RefreshCw,
+  PlayCircle,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TaskCard } from "@/components/TaskCard";
 import { DataCollectCard } from "@/components/DataCollectCard";
@@ -25,7 +31,10 @@ import {
   ignoreDayFolder,
   restoreDayFolder,
   fetchSettings,
+  fetchUploadQueueStatus,
   previewUploadPath,
+  startUploadQueue,
+  stopUploadQueue,
 } from "@/lib/ipc-client";
 import { IPC } from "@shared/ipc-channels";
 import type {
@@ -33,6 +42,7 @@ import type {
   DataCollectInfo,
   DayFolderSummary,
   Task,
+  UploadQueueStatus,
 } from "@shared/types";
 import type { UploadPathPreview } from "@shared/upload-profile";
 import { progressKey } from "@shared/cloud-upload";
@@ -54,6 +64,14 @@ export default function Dashboard() {
   const [selectedProfileId, setSelectedProfileId] = useState("");
   const [pathPreview, setPathPreview] = useState<UploadPathPreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [selectedTaskIds, setSelectedTaskIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [selectedDayFolderIds, setSelectedDayFolderIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [uploadQueueStatus, setUploadQueueStatus] =
+    useState<UploadQueueStatus | null>(null);
 
   useTaskProgress();
 
@@ -78,8 +96,11 @@ export default function Dashboard() {
     fetchDataCollectList()
       .then(setDataCollects)
       .catch(() => {});
-    fetchDayFolders({ limit: 30, provider })
+    fetchDayFolders({ limit: 30, provider, includeCompleted: false })
       .then(setDayFolders)
+      .catch(() => {});
+    fetchUploadQueueStatus()
+      .then(setUploadQueueStatus)
       .catch(() => {});
   }, [loadTasks, provider, providerReady]);
 
@@ -105,13 +126,23 @@ export default function Dashboard() {
     const off = window.api.on(
       IPC.DAY_FOLDER_EVENT,
       () => {
-        fetchDayFolders({ limit: 30, provider })
+        fetchDayFolders({ limit: 30, provider, includeCompleted: false })
           .then(setDayFolders)
           .catch(() => {});
       }
     );
     return () => off();
   }, [provider]);
+
+  useEffect(() => {
+    const off = window.api.on(
+      IPC.UPLOAD_QUEUE_EVENT,
+      (_event: unknown, data: unknown) => {
+        setUploadQueueStatus(data as UploadQueueStatus);
+      },
+    );
+    return () => off();
+  }, []);
 
   const handleAddFolder = useCallback(async () => {
     const folder = await selectFolder();
@@ -154,14 +185,14 @@ export default function Dashboard() {
     await triggerScan();
     await Promise.all([
       loadTasks(),
-      fetchDayFolders({ limit: 30, provider }).then(setDayFolders),
+      fetchDayFolders({ limit: 30, provider, includeCompleted: false }).then(setDayFolders),
     ]);
   }, [loadTasks, provider]);
 
   const handleRefresh = useCallback(async () => {
     await Promise.all([
       loadTasks(),
-      fetchDayFolders({ limit: 30, provider }).then(setDayFolders),
+      fetchDayFolders({ limit: 30, provider, includeCompleted: false }).then(setDayFolders),
     ]);
   }, [loadTasks, provider]);
 
@@ -207,7 +238,7 @@ export default function Dashboard() {
     await ignoreDayFolder(id);
     await Promise.all([
       loadTasks(),
-      fetchDayFolders({ limit: 30, provider }).then(setDayFolders),
+      fetchDayFolders({ limit: 30, provider, includeCompleted: false }).then(setDayFolders),
     ]);
   }, [loadTasks, provider]);
 
@@ -215,7 +246,7 @@ export default function Dashboard() {
     await restoreDayFolder(id);
     await Promise.all([
       loadTasks(),
-      fetchDayFolders({ limit: 30, provider }).then(setDayFolders),
+      fetchDayFolders({ limit: 30, provider, includeCompleted: false }).then(setDayFolders),
     ]);
   }, [loadTasks, provider]);
 
@@ -230,6 +261,80 @@ export default function Dashboard() {
       showToast(`重试失败: ${err}`, "error");
     }
   }, []);
+
+  const refreshDashboard = useCallback(async () => {
+    await Promise.all([
+      loadTasks(),
+      fetchDayFolders({ limit: 30, provider, includeCompleted: false }).then(setDayFolders),
+      fetchUploadQueueStatus().then(setUploadQueueStatus),
+    ]);
+  }, [loadTasks, provider]);
+
+  const toggleTaskSelection = useCallback((taskId: string) => {
+    setSelectedTaskIds((current) => {
+      const next = new Set(current);
+      if (next.has(taskId)) next.delete(taskId);
+      else next.add(taskId);
+      return next;
+    });
+  }, []);
+
+  const toggleDaySelection = useCallback((dayFolderId: string) => {
+    setSelectedDayFolderIds((current) => {
+      const next = new Set(current);
+      if (next.has(dayFolderId)) next.delete(dayFolderId);
+      else next.add(dayFolderId);
+      return next;
+    });
+  }, []);
+
+  const handleStartUpload = useCallback(async (
+    scope: "selected" | "all-pending",
+  ) => {
+    const latestStatus = await fetchUploadQueueStatus();
+    let overrideWindow = false;
+    if (!latestStatus.withinUploadWindow) {
+      overrideWindow = window.confirm(
+        "当前不在上传时间窗口内。\n\n确定：立即上传本次优先任务。\n取消：等待时间窗口后再上传。",
+      );
+    }
+
+    const status = await startUploadQueue({
+      scope,
+      taskIds: scope === "selected" ? Array.from(selectedTaskIds) : [],
+      dayFolderIds:
+        scope === "selected" ? Array.from(selectedDayFolderIds) : [],
+      overrideWindow,
+    });
+    setUploadQueueStatus(status);
+    setSelectedTaskIds(new Set());
+    setSelectedDayFolderIds(new Set());
+    await refreshDashboard();
+    showToast(
+      status.priorityRemaining > 0
+        ? `已开始上传，优先任务 ${status.priorityRemaining} 个`
+        : "已开启上传队列",
+      "success",
+    );
+  }, [refreshDashboard, selectedDayFolderIds, selectedTaskIds]);
+
+  const handleStopUpload = useCallback(async () => {
+    const latestStatus = await fetchUploadQueueStatus();
+    const mode =
+      latestStatus.runningTaskIds.length > 0 &&
+      window.confirm(
+        "当前有任务正在上传。\n\n确定：立即暂停正在上传的任务。\n取消：当前任务跑完后停止启动新任务。",
+      )
+        ? "pause-running"
+        : "after-current";
+    const status = await stopUploadQueue({ mode });
+    setUploadQueueStatus(status);
+    await refreshDashboard();
+    showToast(
+      mode === "pause-running" ? "上传已暂停" : "已停止启动新上传",
+      "warning",
+    );
+  }, [refreshDashboard]);
 
   const providerTasks = useMemo(
     () =>
@@ -269,13 +374,68 @@ export default function Dashboard() {
     [dayFolders, providerTasks],
   );
   const hasTaskDirectories = taskDirectoryTree.length > 0;
+  const selectedCount = selectedTaskIds.size + selectedDayFolderIds.size;
+  const queueRunningCount = uploadQueueStatus?.runningTaskIds.length ?? 0;
+  const queueStatusText = uploadQueueStatus?.gateOpen
+    ? uploadQueueStatus.priorityActive
+      ? `优先任务剩余 ${uploadQueueStatus.priorityRemaining}`
+      : "上传队列已开启"
+    : "上传队列已停止";
+
+  useEffect(() => {
+    const visibleTaskIds = new Set(providerTasks.map((task) => task.id));
+    setSelectedTaskIds((current) => {
+      const next = new Set(
+        Array.from(current).filter((taskId) => visibleTaskIds.has(taskId)),
+      );
+      return next.size === current.size ? current : next;
+    });
+  }, [providerTasks]);
+
+  useEffect(() => {
+    const visibleDayFolderIds = new Set(dayFolders.map((item) => item.id));
+    setSelectedDayFolderIds((current) => {
+      const next = new Set(
+        Array.from(current).filter((id) => visibleDayFolderIds.has(id)),
+      );
+      return next.size === current.size ? current : next;
+    });
+  }, [dayFolders]);
 
   return (
     <div className="p-6 space-y-6">
       {/* 顶栏 */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-xl font-bold">任务面板</h1>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="mr-1 text-xs text-muted-foreground">
+            {queueStatusText}
+            {queueRunningCount > 0 && ` · 运行中 ${queueRunningCount}`}
+            {uploadQueueStatus && !uploadQueueStatus.withinUploadWindow && (
+              <span> · 时间窗外</span>
+            )}
+          </div>
+          <Button
+            variant="default"
+            size="sm"
+            onClick={() => handleStartUpload("selected")}
+            disabled={selectedCount === 0}
+          >
+            <PlayCircle className="h-4 w-4 mr-1" />
+            开始选中 ({selectedCount})
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => handleStartUpload("all-pending")}
+          >
+            <CheckSquare className="h-4 w-4 mr-1" />
+            开始全部待处理
+          </Button>
+          <Button variant="outline" size="sm" onClick={handleStopUpload}>
+            <PauseCircle className="h-4 w-4 mr-1" />
+            停止上传
+          </Button>
           <Button variant="outline" size="sm" onClick={handleScan}>
             <PlayCircle className="h-4 w-4 mr-1" />
             触发扫描
@@ -342,19 +502,28 @@ export default function Dashboard() {
                     const childTasks = tasksByDayFolderId.get(dayFolder.id) ?? [];
 
                     return (
-                      <div key={dayFolder.id}>
-                        <DayFolderCardWithSpeed
-                          dayFolder={dayFolder}
-                          tasks={childTasks}
-                          provider={provider}
-                          onIgnore={handleIgnoreDay}
-                          onRestore={handleRestoreDay}
+                      <div key={dayFolder.id} className="flex gap-3">
+                        <input
+                          type="checkbox"
+                          checked={selectedDayFolderIds.has(dayFolder.id)}
+                          onChange={() => toggleDaySelection(dayFolder.id)}
+                          className="mt-5 h-4 w-4 shrink-0 rounded"
+                          aria-label={`选择日期 ${dayFolder.date}`}
                         />
+                        <div className="min-w-0 flex-1">
+                          <DayFolderCardWithSpeed
+                            dayFolder={dayFolder}
+                            tasks={childTasks}
+                            provider={provider}
+                            onIgnore={handleIgnoreDay}
+                            onRestore={handleRestoreDay}
+                          />
                         {childTasks.length === 0 && (
                           <div className="ml-5 border-l pl-4 text-xs text-muted-foreground py-2">
                             尚未发现工作次
                           </div>
                         )}
+                        </div>
                       </div>
                     );
                   })}
@@ -364,16 +533,26 @@ export default function Dashboard() {
                     const task = item.value.task;
 
                     return (
-                      <TaskCardWithProgress
-                        key={task.id}
-                        task={task}
-                        provider={provider}
-                        onPause={handlePause}
-                        onResume={handleResume}
-                        onCancel={handleCancel}
-                        onRetry={handleRetry}
-                        onRestore={handleRestore}
-                      />
+                      <div key={task.id} className="flex gap-3">
+                        <input
+                          type="checkbox"
+                          checked={selectedTaskIds.has(task.id)}
+                          onChange={() => toggleTaskSelection(task.id)}
+                          className="mt-5 h-4 w-4 shrink-0 rounded"
+                          aria-label={`选择任务 ${task.folderName}`}
+                        />
+                        <div className="min-w-0 flex-1">
+                          <TaskCardWithProgress
+                            task={task}
+                            provider={provider}
+                            onPause={handlePause}
+                            onResume={handleResume}
+                            onCancel={handleCancel}
+                            onRetry={handleRetry}
+                            onRestore={handleRestore}
+                          />
+                        </div>
+                      </div>
                     );
                   })}
                 </div>

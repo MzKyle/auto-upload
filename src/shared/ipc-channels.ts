@@ -18,6 +18,12 @@ export const IPC = {
   TASK_STATUS_CHANGE: 'task:status-change', // push from main
   TASK_DESTINATION_CHANGE: 'task:destination-change',
 
+  // 上传队列
+  UPLOAD_QUEUE_STATUS: 'upload-queue:status',
+  UPLOAD_QUEUE_START: 'upload-queue:start',
+  UPLOAD_QUEUE_STOP: 'upload-queue:stop',
+  UPLOAD_QUEUE_EVENT: 'upload-queue:event',
+
   // 日期目录汇总
   DAY_FOLDER_LIST: 'day-folder:list',
   DAY_FOLDER_DELETE: 'day-folder:delete',

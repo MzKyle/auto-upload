@@ -3,6 +3,7 @@ import { v4 as uuid } from 'uuid'
 import { normalize } from 'path'
 import type {
   CloudProvider,
+  TaskListQuery,
   Task,
   TaskDestination,
   TaskFile,
@@ -63,6 +64,15 @@ function safeParseProfile(value: string): UploadProfile | null {
   }
 }
 
+const UPLOAD_QUEUE_CANDIDATE_STATUSES: TaskStatus[] = [
+  'pending',
+  'scanning',
+  'uploading',
+  'retrying',
+  'failed',
+  'paused'
+]
+
 function rowToTaskFile(row: Record<string, unknown>): TaskFile {
   return {
     id: row.id as string,
@@ -104,11 +114,27 @@ export class TaskRepo {
   }
 
   listByStatus(status?: TaskStatus): Task[] {
+    return this.listByQuery(status ? { status } : undefined)
+  }
+
+  listByQuery(query?: TaskListQuery): Task[] {
     const db = getDb()
-    if (status) {
+    if (query?.statuses?.length) {
+      const statuses = Array.from(new Set(query.statuses))
+      const placeholders = statuses.map(() => '?').join(',')
+      const rows = db
+        .prepare(
+          `SELECT * FROM tasks
+           WHERE status IN (${placeholders})
+           ORDER BY created_at DESC`
+        )
+        .all(...statuses) as Record<string, unknown>[]
+      return this.rowsToTasks(rows)
+    }
+    if (query?.status) {
       const rows = db
         .prepare('SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC')
-        .all(status) as Record<string, unknown>[]
+        .all(query.status) as Record<string, unknown>[]
       return this.rowsToTasks(rows)
     }
     const rows = db
@@ -300,6 +326,24 @@ export class TaskRepo {
        WHERE task_id = ?`
     ).run(new Date().toISOString(), id)
     this.updateStatus(id, 'pending')
+  }
+
+  resumeForUpload(id: string): void {
+    const task = this.getById(id)
+    if (!task) return
+    if (
+      task.status === 'failed' ||
+      task.status === 'paused' ||
+      task.status === 'retrying'
+    ) {
+      this.retry(id)
+    }
+  }
+
+  resumeManyForUpload(ids: string[]): void {
+    for (const id of Array.from(new Set(ids))) {
+      this.resumeForUpload(id)
+    }
   }
 
   skip(id: string, reason = '用户跳过'): void {
@@ -804,6 +848,41 @@ export class TaskRepo {
     const rows = db.prepare(
       `SELECT * FROM tasks
        WHERE status IN ('pending', 'uploading', 'scanning', 'retrying', 'failed', 'paused')
+       ORDER BY created_at ASC`
+    ).all() as Record<string, unknown>[]
+    return this.rowsToTasks(rows)
+  }
+
+  listPendingUploadTaskIds(): string[] {
+    const placeholders = UPLOAD_QUEUE_CANDIDATE_STATUSES.map(() => '?').join(',')
+    const rows = getDb().prepare(
+      `SELECT id FROM tasks
+       WHERE status IN (${placeholders})
+       ORDER BY created_at ASC`
+    ).all(...UPLOAD_QUEUE_CANDIDATE_STATUSES) as Array<{ id: string }>
+    return rows.map((row) => row.id)
+  }
+
+  listPendingUploadTaskIdsByDayFolderIds(dayFolderIds: string[]): string[] {
+    const uniqueIds = Array.from(new Set(dayFolderIds)).filter(Boolean)
+    if (uniqueIds.length === 0) return []
+    const folderPlaceholders = uniqueIds.map(() => '?').join(',')
+    const statusPlaceholders = UPLOAD_QUEUE_CANDIDATE_STATUSES.map(() => '?').join(',')
+    const rows = getDb().prepare(
+      `SELECT id FROM tasks
+       WHERE day_folder_id IN (${folderPlaceholders})
+         AND status IN (${statusPlaceholders})
+       ORDER BY created_at ASC`
+    ).all(...uniqueIds, ...UPLOAD_QUEUE_CANDIDATE_STATUSES) as Array<{ id: string }>
+    return rows.map((row) => row.id)
+  }
+
+  listMonitorableLocalUnfinishedTasks(): Task[] {
+    const rows = getDb().prepare(
+      `SELECT * FROM tasks
+       WHERE source_type = 'local'
+         AND day_folder_id IS NOT NULL
+         AND status NOT IN ('completed', 'synced', 'skipped')
        ORDER BY created_at ASC`
     ).all() as Record<string, unknown>[]
     return this.rowsToTasks(rows)

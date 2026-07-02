@@ -147,6 +147,11 @@ const IPC = {
   TASK_STATUS_CHANGE: "task:status-change",
   // push from main
   TASK_DESTINATION_CHANGE: "task:destination-change",
+  // 上传队列
+  UPLOAD_QUEUE_STATUS: "upload-queue:status",
+  UPLOAD_QUEUE_START: "upload-queue:start",
+  UPLOAD_QUEUE_STOP: "upload-queue:stop",
+  UPLOAD_QUEUE_EVENT: "upload-queue:event",
   // 日期目录汇总
   DAY_FOLDER_LIST: "day-folder:list",
   DAY_FOLDER_DELETE: "day-folder:delete",
@@ -265,6 +270,8 @@ function buildOssKey(prefix, uploadRelativePath, fileRelativePath) {
   return joinOssPath(prefix, uploadRelativePath, fileRelativePath);
 }
 let db = null;
+const DATA_MIGRATION_DATE_PATHS = "data-migration:date-upload-paths:v1";
+const DATA_MIGRATION_DESTINATIONS = "data-migration:task-destinations:v1";
 function getDb() {
   if (!db) {
     throw new Error("数据库未初始化");
@@ -419,6 +426,12 @@ function runMigrations(db2) {
       value TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS app_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
   const taskColumns = db2.pragma("table_info(tasks)");
   if (!taskColumns.some((c) => c.name === "day_folder_id")) {
@@ -487,38 +500,50 @@ function runMigrations(db2) {
     CREATE INDEX IF NOT EXISTS idx_task_files_retry
     ON task_files(status, next_retry_at)
   `);
-  const incompleteTasks = db2.prepare(
-    `SELECT id, folder_path, source_type, source_machine_id, upload_relative_path
-     FROM tasks
-     WHERE status != 'completed'`
-  ).all();
-  const findRemoteDirectory = db2.prepare(
-    "SELECT remote_dir FROM ssh_machines WHERE id = ?"
-  );
-  const updateUploadRelativePath = db2.prepare(
-    `UPDATE tasks
-     SET upload_relative_path = ?, updated_at = ?
-     WHERE id = ?`
-  );
-  let migratedDatePaths = 0;
-  for (const task of incompleteTasks) {
-    let uploadRelativePath = null;
-    if (task.source_type === "rsync" && task.source_machine_id) {
-      const machine = findRemoteDirectory.get(task.source_machine_id);
-      uploadRelativePath = machine ? deriveDateScopedUploadRelativePath(machine.remote_dir) : null;
+  db2.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`);
+  db2.exec(`
+    CREATE INDEX IF NOT EXISTS idx_task_files_task_status
+    ON task_files(task_id, status, source_status)
+  `);
+  db2.exec(`
+    CREATE INDEX IF NOT EXISTS idx_task_file_destinations_status_file
+    ON task_file_destinations(status, task_file_id)
+  `);
+  if (!isDataMigrationDone(db2, DATA_MIGRATION_DATE_PATHS)) {
+    const incompleteTasks = db2.prepare(
+      `SELECT id, folder_path, source_type, source_machine_id, upload_relative_path
+       FROM tasks
+       WHERE status != 'completed'`
+    ).all();
+    const findRemoteDirectory = db2.prepare(
+      "SELECT remote_dir FROM ssh_machines WHERE id = ?"
+    );
+    const updateUploadRelativePath = db2.prepare(
+      `UPDATE tasks
+       SET upload_relative_path = ?, updated_at = ?
+       WHERE id = ?`
+    );
+    let migratedDatePaths = 0;
+    for (const task of incompleteTasks) {
+      let uploadRelativePath = null;
+      if (task.source_type === "rsync" && task.source_machine_id) {
+        const machine = findRemoteDirectory.get(task.source_machine_id);
+        uploadRelativePath = machine ? deriveDateScopedUploadRelativePath(machine.remote_dir) : null;
+      }
+      uploadRelativePath ||= deriveDateScopedUploadRelativePath(task.folder_path);
+      if (uploadRelativePath && task.upload_relative_path !== uploadRelativePath) {
+        updateUploadRelativePath.run(
+          uploadRelativePath,
+          (/* @__PURE__ */ new Date()).toISOString(),
+          task.id
+        );
+        migratedDatePaths++;
+      }
     }
-    uploadRelativePath ||= deriveDateScopedUploadRelativePath(task.folder_path);
-    if (uploadRelativePath && task.upload_relative_path !== uploadRelativePath) {
-      updateUploadRelativePath.run(
-        uploadRelativePath,
-        (/* @__PURE__ */ new Date()).toISOString(),
-        task.id
-      );
-      migratedDatePaths++;
+    if (migratedDatePaths > 0) {
+      log.info(`日期层路径迁移完成: ${migratedDatePaths} 个未完成任务`);
     }
-  }
-  if (migratedDatePaths > 0) {
-    log.info(`日期层路径迁移完成: ${migratedDatePaths} 个未完成任务`);
+    markDataMigrationDone(db2, DATA_MIGRATION_DATE_PATHS);
   }
   if (addedDestinationUploadPath) {
     db2.exec(`
@@ -531,43 +556,46 @@ function runMigrations(db2) {
     `);
     log.info("迁移: 已回填任务目标上传相对路径");
   }
-  const migratedDestinations = db2.prepare(
-    `INSERT OR IGNORE INTO task_destinations (
-      id, task_id, provider, status, prefix, total_files, uploaded_files,
-      total_bytes, uploaded_bytes, error_message, created_at, updated_at,
-      completed_at, upload_relative_path, path_mode, object_key_template
-    )
-    SELECT lower(hex(randomblob(16))), id, 'aliyun', status, COALESCE(oss_prefix, ''),
-      total_files, uploaded_files, total_bytes, uploaded_bytes, error_message,
-      created_at, updated_at, completed_at, COALESCE(upload_relative_path, ''),
-      'target-root', NULL
-    FROM tasks t
-    WHERE NOT EXISTS (
-      SELECT 1 FROM task_destinations existing WHERE existing.task_id = t.id
-    )`
-  ).run().changes;
-  const migratedFileDestinations = db2.prepare(
-    `INSERT OR IGNORE INTO task_file_destinations (
-      id, task_file_id, task_destination_id, provider, status, object_key,
-      upload_id, error_message, created_at, updated_at
-    )
-    SELECT lower(hex(randomblob(16))), tf.id, td.id, 'aliyun', tf.status,
-      tf.oss_key, tf.upload_id, tf.error_message, tf.created_at, tf.updated_at
-    FROM tasks t
-    INNER JOIN task_files tf ON tf.task_id = t.id
-    INNER JOIN task_destinations td
-      ON td.task_id = t.id AND td.provider = 'aliyun'
-    WHERE t.status != 'completed'
-      AND NOT EXISTS (
-      SELECT 1
-      FROM task_file_destinations existing
-      WHERE existing.task_file_id = tf.id
-    )`
-  ).run().changes;
-  if (migratedDestinations > 0 || migratedFileDestinations > 0) {
-    log.info(
-      `双云任务迁移完成: ${migratedDestinations} 个任务目标, ${migratedFileDestinations} 个文件目标`
-    );
+  if (!isDataMigrationDone(db2, DATA_MIGRATION_DESTINATIONS)) {
+    const migratedDestinations = db2.prepare(
+      `INSERT OR IGNORE INTO task_destinations (
+        id, task_id, provider, status, prefix, total_files, uploaded_files,
+        total_bytes, uploaded_bytes, error_message, created_at, updated_at,
+        completed_at, upload_relative_path, path_mode, object_key_template
+      )
+      SELECT lower(hex(randomblob(16))), id, 'aliyun', status, COALESCE(oss_prefix, ''),
+        total_files, uploaded_files, total_bytes, uploaded_bytes, error_message,
+        created_at, updated_at, completed_at, COALESCE(upload_relative_path, ''),
+        'target-root', NULL
+      FROM tasks t
+      WHERE NOT EXISTS (
+        SELECT 1 FROM task_destinations existing WHERE existing.task_id = t.id
+      )`
+    ).run().changes;
+    const migratedFileDestinations = db2.prepare(
+      `INSERT OR IGNORE INTO task_file_destinations (
+        id, task_file_id, task_destination_id, provider, status, object_key,
+        upload_id, error_message, created_at, updated_at
+      )
+      SELECT lower(hex(randomblob(16))), tf.id, td.id, 'aliyun', tf.status,
+        tf.oss_key, tf.upload_id, tf.error_message, tf.created_at, tf.updated_at
+      FROM tasks t
+      INNER JOIN task_files tf ON tf.task_id = t.id
+      INNER JOIN task_destinations td
+        ON td.task_id = t.id AND td.provider = 'aliyun'
+      WHERE t.status != 'completed'
+        AND NOT EXISTS (
+        SELECT 1
+        FROM task_file_destinations existing
+        WHERE existing.task_file_id = tf.id
+      )`
+    ).run().changes;
+    if (migratedDestinations > 0 || migratedFileDestinations > 0) {
+      log.info(
+        `双云任务迁移完成: ${migratedDestinations} 个任务目标, ${migratedFileDestinations} 个文件目标`
+      );
+    }
+    markDataMigrationDone(db2, DATA_MIGRATION_DESTINATIONS);
   }
   const columns = db2.pragma("table_info(ssh_machines)");
   const hasTransferMode = columns.some((c) => c.name === "transfer_mode");
@@ -580,6 +608,18 @@ function runMigrations(db2) {
     db2.exec(`ALTER TABLE ssh_machines ADD COLUMN profile_id TEXT`);
     log.info("迁移: ssh_machines 表添加 profile_id 列");
   }
+}
+function isDataMigrationDone(db2, key) {
+  const row = db2.prepare("SELECT value FROM app_meta WHERE key = ?").get(key);
+  return row?.value === "done";
+}
+function markDataMigrationDone(db2, key) {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  db2.prepare(
+    `INSERT INTO app_meta (key, value, updated_at)
+     VALUES (?, 'done', ?)
+     ON CONFLICT(key) DO UPDATE SET value = 'done', updated_at = ?`
+  ).run(key, now, now);
 }
 function ensureUniqueTaskFilePathIndex(db2) {
   const existing = db2.prepare(
@@ -630,15 +670,17 @@ function reconcileStartupState(db2) {
      SET status = 'pending', updated_at = ?
      WHERE status = 'uploading'`
   ).run(now);
-  const unfinished = db2.prepare(
-    `SELECT id, folder_path, source_type, status
+  const monitorableTasks = db2.prepare(
+    `SELECT id, folder_path
      FROM tasks
-     WHERE status NOT IN ('completed', 'synced', 'skipped')`
+     WHERE source_type IN ('local', 'rsync')
+       AND status NOT IN ('completed', 'synced', 'skipped')`
   ).all();
-  const resetTask = db2.prepare(
+  const resetTasks = db2.prepare(
     `UPDATE tasks
-     SET status = 'pending', error_message = NULL, completed_at = NULL, updated_at = ?
-     WHERE id = ?`
+     SET status = 'pending', error_message = NULL,
+         completed_at = NULL, updated_at = ?
+     WHERE status NOT IN ('completed', 'synced', 'skipped')`
   );
   const resetDestinations = db2.prepare(
     `UPDATE task_destinations
@@ -653,24 +695,31 @@ function reconcileStartupState(db2) {
            ELSE NULL
          END,
          updated_at = ?
-     WHERE task_id = ?`
+     WHERE task_id IN (
+       SELECT id FROM tasks WHERE status NOT IN ('completed', 'synced', 'skipped')
+     )`
   );
-  const resetActiveFiles = db2.prepare(
+  const resetAllActiveFiles = db2.prepare(
     `UPDATE task_files
      SET status = 'pending',
          error_message = NULL, retry_count = 0, next_retry_at = NULL,
          updated_at = ?
-     WHERE task_id = ?
-       AND source_status = 'present'
-       AND status IN ('uploading', 'failed')`
+     WHERE source_status = 'present'
+       AND status IN ('uploading', 'failed')
+       AND task_id IN (
+         SELECT id FROM tasks WHERE status NOT IN ('completed', 'synced', 'skipped')
+       )`
   );
-  const resetActiveFileDestinations = db2.prepare(
+  const resetAllActiveFileDestinations = db2.prepare(
     `UPDATE task_file_destinations
      SET status = 'pending', error_message = NULL, updated_at = ?
      WHERE status IN ('uploading', 'failed')
        AND task_file_id IN (
-         SELECT id FROM task_files
-         WHERE task_id = ? AND source_status = 'present'
+         SELECT tf.id
+         FROM task_files tf
+         INNER JOIN tasks t ON t.id = tf.task_id
+         WHERE tf.source_status = 'present'
+           AND t.status NOT IN ('completed', 'synced', 'skipped')
        )`
   );
   const skipTask = db2.prepare(
@@ -693,18 +742,16 @@ function reconcileStartupState(db2) {
      WHERE task_id = ?`
   );
   const transaction = db2.transaction(() => {
-    for (const task of unfinished) {
-      const monitorable = task.source_type === "local" || task.source_type === "rsync";
-      if (monitorable && !fs.existsSync(task.folder_path)) {
+    for (const task of monitorableTasks) {
+      if (!fs.existsSync(task.folder_path)) {
         skipTask.run(now, now, task.id);
         skipDestinations.run(now, now, task.id);
-        continue;
       }
-      resetTask.run(now, task.id);
-      resetDestinations.run(now, task.id);
-      resetActiveFiles.run(now, task.id);
-      resetActiveFileDestinations.run(now, task.id);
     }
+    resetTasks.run(now);
+    resetDestinations.run(now);
+    resetAllActiveFiles.run(now);
+    resetAllActiveFileDestinations.run(now);
   });
   transaction();
 }
@@ -916,6 +963,29 @@ class TaskDestinationRepo {
   listByTask(taskId) {
     return getDb().prepare("SELECT * FROM task_destinations WHERE task_id = ? ORDER BY provider").all(taskId).map(rowToDestination);
   }
+  listByTaskIds(taskIds) {
+    const result = /* @__PURE__ */ new Map();
+    const uniqueIds = Array.from(new Set(taskIds)).filter(Boolean);
+    if (uniqueIds.length === 0) return result;
+    const chunkSize = 500;
+    for (let index = 0; index < uniqueIds.length; index += chunkSize) {
+      const chunk = uniqueIds.slice(index, index + chunkSize);
+      const placeholders = chunk.map(() => "?").join(",");
+      const rows = getDb().prepare(
+        `SELECT *
+           FROM task_destinations
+           WHERE task_id IN (${placeholders})
+           ORDER BY task_id, provider`
+      ).all(...chunk);
+      for (const row of rows) {
+        const destination = rowToDestination(row);
+        const destinations = result.get(destination.taskId) || [];
+        destinations.push(destination);
+        result.set(destination.taskId, destinations);
+      }
+    }
+    return result;
+  }
   get(taskId, provider) {
     const row = getDb().prepare("SELECT * FROM task_destinations WHERE task_id = ? AND provider = ?").get(taskId, provider);
     return row ? rowToDestination(row) : null;
@@ -1027,8 +1097,12 @@ class TaskDestinationRepo {
     const row = getDb().prepare(
       `SELECT
          COUNT(*) AS total,
+         COALESCE(SUM(tf.file_size), 0) AS total_bytes,
+         SUM(CASE WHEN tfd.status = 'completed' THEN 1 ELSE 0 END) AS uploaded,
+         COALESCE(SUM(CASE WHEN tfd.status = 'completed' THEN tf.file_size ELSE 0 END), 0) AS uploaded_bytes,
          SUM(CASE WHEN tfd.status = 'failed' THEN 1 ELSE 0 END) AS failed,
          SUM(CASE WHEN tfd.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+         SUM(CASE WHEN tfd.status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
          SUM(CASE
            WHEN tfd.status = 'pending'
             AND tf.next_retry_at IS NOT NULL
@@ -1040,10 +1114,28 @@ class TaskDestinationRepo {
     ).get(now, taskId, provider);
     return {
       total: row.total || 0,
+      totalBytes: row.total_bytes || 0,
+      uploaded: row.uploaded || 0,
+      uploadedBytes: row.uploaded_bytes || 0,
       failed: row.failed || 0,
       pending: row.pending || 0,
+      skipped: row.skipped || 0,
       retryWaiting: row.retry_waiting || 0
     };
+  }
+  listFailedFileTargetExamples(taskId, provider, limit = 3) {
+    const rows = getDb().prepare(
+      `SELECT tf.relative_path, tfd.error_message
+       FROM task_file_destinations tfd
+       INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+       WHERE tf.task_id = ? AND tfd.provider = ? AND tfd.status = 'failed'
+       ORDER BY tf.created_at
+       LIMIT ?`
+    ).all(taskId, provider, Math.max(1, limit));
+    return rows.map((row) => ({
+      relativePath: row.relative_path,
+      errorMessage: row.error_message || null
+    }));
   }
   updateFileStatus(id, status, objectKey, uploadId, errorMessage) {
     const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -1128,7 +1220,7 @@ function getTaskDestinationRepo() {
 function normalizeFolderPath$1(p) {
   return path.normalize(p).replace(/[\\/]+$/, "");
 }
-function rowToTask(row) {
+function rowToTask(row, destinations) {
   const profileSnapshot = typeof row.profile_snapshot_json === "string" && row.profile_snapshot_json ? safeParseProfile(row.profile_snapshot_json) : null;
   return {
     id: row.id,
@@ -1141,7 +1233,7 @@ function rowToTask(row) {
     uploadedBytes: row.uploaded_bytes,
     ossPrefix: row.oss_prefix || "",
     uploadTargetMode: row.upload_target_mode || "aliyun",
-    destinations: getTaskDestinationRepo().listByTask(row.id),
+    destinations: destinations ?? getTaskDestinationRepo().listByTask(row.id),
     dayFolderId: row.day_folder_id || null,
     uploadRelativePath: row.upload_relative_path ?? row.folder_name,
     errorMessage: row.error_message || null,
@@ -1162,6 +1254,14 @@ function safeParseProfile(value) {
     return null;
   }
 }
+const UPLOAD_QUEUE_CANDIDATE_STATUSES = [
+  "pending",
+  "scanning",
+  "uploading",
+  "retrying",
+  "failed",
+  "paused"
+];
 function rowToTaskFile(row) {
   return {
     id: row.id,
@@ -1183,12 +1283,35 @@ function rowToTaskFile(row) {
   };
 }
 class TaskRepo {
+  rowsToTasks(rows) {
+    const destinationsByTask = getTaskDestinationRepo().listByTaskIds(
+      rows.map((row) => row.id)
+    );
+    return rows.map(
+      (row) => rowToTask(row, destinationsByTask.get(row.id) || [])
+    );
+  }
   listByStatus(status) {
+    return this.listByQuery(status ? { status } : void 0);
+  }
+  listByQuery(query) {
     const db2 = getDb();
-    if (status) {
-      return db2.prepare("SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC").all(status).map(rowToTask);
+    if (query?.statuses?.length) {
+      const statuses = Array.from(new Set(query.statuses));
+      const placeholders = statuses.map(() => "?").join(",");
+      const rows2 = db2.prepare(
+        `SELECT * FROM tasks
+           WHERE status IN (${placeholders})
+           ORDER BY created_at DESC`
+      ).all(...statuses);
+      return this.rowsToTasks(rows2);
     }
-    return db2.prepare("SELECT * FROM tasks ORDER BY created_at DESC").all().map(rowToTask);
+    if (query?.status) {
+      const rows2 = db2.prepare("SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC").all(query.status);
+      return this.rowsToTasks(rows2);
+    }
+    const rows = db2.prepare("SELECT * FROM tasks ORDER BY created_at DESC").all();
+    return this.rowsToTasks(rows);
   }
   listContinuouslyMonitored(dateName) {
     const rows = getDb().prepare(
@@ -1201,7 +1324,7 @@ class TaskRepo {
          AND t.status NOT IN ('skipped', 'paused', 'completed')
        ORDER BY t.created_at ASC`
     ).all(dateName);
-    return rows.map(rowToTask);
+    return this.rowsToTasks(rows);
   }
   listRunnable(now = (/* @__PURE__ */ new Date()).toISOString()) {
     const rows = getDb().prepare(
@@ -1216,7 +1339,7 @@ class TaskRepo {
          AND tfd.status = 'pending'
        ORDER BY t.created_at ASC`
     ).all(now);
-    return rows.map(rowToTask);
+    return this.rowsToTasks(rows);
   }
   getById(id) {
     const db2 = getDb();
@@ -1236,7 +1359,8 @@ class TaskRepo {
   findTaskContainingFile(filePath) {
     const db2 = getDb();
     const normalized = path.normalize(filePath);
-    const tasks = db2.prepare("SELECT * FROM tasks ORDER BY length(folder_path) DESC").all().map(rowToTask);
+    const rows = db2.prepare("SELECT * FROM tasks ORDER BY length(folder_path) DESC").all();
+    const tasks = this.rowsToTasks(rows);
     return tasks.find((t) => {
       const fp = t.folderPath;
       return normalized.startsWith(fp + "/") || normalized.startsWith(fp + "\\");
@@ -1313,7 +1437,7 @@ class TaskRepo {
     const rows = getDb().prepare(
       "SELECT * FROM tasks WHERE day_folder_id = ? ORDER BY created_at DESC"
     ).all(dayFolderId);
-    return rows.map(rowToTask);
+    return this.rowsToTasks(rows);
   }
   updateStatus(id, status, errorMessage) {
     const db2 = getDb();
@@ -1336,6 +1460,18 @@ class TaskRepo {
        WHERE task_id = ?`
     ).run((/* @__PURE__ */ new Date()).toISOString(), id);
     this.updateStatus(id, "pending");
+  }
+  resumeForUpload(id) {
+    const task = this.getById(id);
+    if (!task) return;
+    if (task.status === "failed" || task.status === "paused" || task.status === "retrying") {
+      this.retry(id);
+    }
+  }
+  resumeManyForUpload(ids) {
+    for (const id of Array.from(new Set(ids))) {
+      this.resumeForUpload(id);
+    }
   }
   skip(id, reason = "用户跳过") {
     const db2 = getDb();
@@ -1472,6 +1608,27 @@ class TaskRepo {
       return db2.prepare("SELECT * FROM task_files WHERE task_id = ? AND status = ?").all(taskId, status).map(rowToTaskFile);
     }
     return db2.prepare("SELECT * FROM task_files WHERE task_id = ?").all(taskId).map(rowToTaskFile);
+  }
+  summarizeFiles(taskId) {
+    const row = getDb().prepare(
+      `SELECT
+         COUNT(*) AS total_files,
+         COALESCE(SUM(file_size), 0) AS total_bytes,
+         SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
+         COALESCE(SUM(CASE WHEN status = 'completed' THEN file_size ELSE 0 END), 0) AS completed_bytes,
+         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_files,
+         SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped_files
+       FROM task_files
+       WHERE task_id = ?`
+    ).get(taskId);
+    return {
+      totalFiles: row.total_files || 0,
+      totalBytes: row.total_bytes || 0,
+      completedFiles: row.completed_files || 0,
+      completedBytes: row.completed_bytes || 0,
+      failedFiles: row.failed_files || 0,
+      skippedFiles: row.skipped_files || 0
+    };
   }
   listFileDetails(taskId) {
     const files = this.listFiles(taskId);
@@ -1763,22 +1920,64 @@ class TaskRepo {
   }
   getUnfinishedTasks() {
     const db2 = getDb();
-    return db2.prepare(
+    const rows = db2.prepare(
       `SELECT * FROM tasks
        WHERE status IN ('pending', 'uploading', 'scanning', 'retrying', 'failed', 'paused')
        ORDER BY created_at ASC`
-    ).all().map(rowToTask);
+    ).all();
+    return this.rowsToTasks(rows);
+  }
+  listPendingUploadTaskIds() {
+    const placeholders = UPLOAD_QUEUE_CANDIDATE_STATUSES.map(() => "?").join(",");
+    const rows = getDb().prepare(
+      `SELECT id FROM tasks
+       WHERE status IN (${placeholders})
+       ORDER BY created_at ASC`
+    ).all(...UPLOAD_QUEUE_CANDIDATE_STATUSES);
+    return rows.map((row) => row.id);
+  }
+  listPendingUploadTaskIdsByDayFolderIds(dayFolderIds) {
+    const uniqueIds = Array.from(new Set(dayFolderIds)).filter(Boolean);
+    if (uniqueIds.length === 0) return [];
+    const folderPlaceholders = uniqueIds.map(() => "?").join(",");
+    const statusPlaceholders = UPLOAD_QUEUE_CANDIDATE_STATUSES.map(() => "?").join(",");
+    const rows = getDb().prepare(
+      `SELECT id FROM tasks
+       WHERE day_folder_id IN (${folderPlaceholders})
+         AND status IN (${statusPlaceholders})
+       ORDER BY created_at ASC`
+    ).all(...uniqueIds, ...UPLOAD_QUEUE_CANDIDATE_STATUSES);
+    return rows.map((row) => row.id);
+  }
+  listMonitorableLocalUnfinishedTasks() {
+    const rows = getDb().prepare(
+      `SELECT * FROM tasks
+       WHERE source_type = 'local'
+         AND day_folder_id IS NOT NULL
+         AND status NOT IN ('completed', 'synced', 'skipped')
+       ORDER BY created_at ASC`
+    ).all();
+    return this.rowsToTasks(rows);
+  }
+  listUnfinishedTaskIds() {
+    const rows = getDb().prepare(
+      `SELECT id FROM tasks
+       WHERE status IN ('pending', 'uploading', 'scanning', 'retrying', 'failed', 'paused')
+       ORDER BY created_at ASC`
+    ).all();
+    return rows.map((row) => row.id);
   }
   getCompletedForCleanup(retentionDays) {
     const db2 = getDb();
     const cutoff = new Date(Date.now() - retentionDays * 864e5).toISOString();
-    return db2.prepare(
+    const rows = db2.prepare(
       `SELECT * FROM tasks
        WHERE status = 'completed'
          AND (source_type = 'rsync' OR (source_type = 'local' AND day_folder_id IS NULL))
          AND completed_at IS NOT NULL AND completed_at < ?
        ORDER BY completed_at ASC`
-    ).all(cutoff).map(rowToTask);
+    ).all(cutoff);
+    return this.rowsToTasks(rows);
   }
 }
 let instance$f = null;
@@ -2331,12 +2530,35 @@ function normalizeSuffixes(suffixes) {
   return unique;
 }
 class SettingsRepo {
-  get(key) {
+  static valueCache = /* @__PURE__ */ new Map();
+  static allCache = null;
+  static dbIdentity = null;
+  db() {
     const db2 = getDb();
+    if (SettingsRepo.dbIdentity !== db2) {
+      SettingsRepo.valueCache.clear();
+      SettingsRepo.allCache = null;
+      SettingsRepo.dbIdentity = db2;
+    }
+    return db2;
+  }
+  get(key) {
+    const db2 = this.db();
+    if (SettingsRepo.valueCache.has(key)) {
+      return SettingsRepo.valueCache.get(key);
+    }
     const row = db2.prepare("SELECT value FROM settings WHERE key = ?").get(key);
-    if (!row) return null;
+    if (!row) {
+      SettingsRepo.valueCache.set(key, null);
+      return null;
+    }
+    const value = this.decodeValue(key, row.value);
+    SettingsRepo.valueCache.set(key, value);
+    return value;
+  }
+  decodeValue(key, value) {
     try {
-      const parsed = JSON.parse(row.value);
+      const parsed = JSON.parse(value);
       if (key === "filter" && typeof parsed === "object" && parsed !== null && "suffixes" in parsed && Array.isArray(parsed.suffixes)) {
         const filter = parsed;
         filter.suffixes = normalizeSuffixes(filter.suffixes);
@@ -2357,11 +2579,11 @@ class SettingsRepo {
       }
       return parsed;
     } catch {
-      return row.value;
+      return value;
     }
   }
   set(key, value) {
-    const db2 = getDb();
+    const db2 = this.db();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     let persistedValue = value;
     if (key === "filter" && typeof value === "object" && value !== null && "suffixes" in value && Array.isArray(value.suffixes)) {
@@ -2394,8 +2616,12 @@ class SettingsRepo {
     db2.prepare(
       "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?"
     ).run(key, serialized, now, serialized, now);
+    SettingsRepo.valueCache.delete(key);
+    SettingsRepo.allCache = null;
   }
   getAll() {
+    const db2 = this.db();
+    if (SettingsRepo.allCache) return SettingsRepo.allCache;
     const settings = { ...DEFAULT_SETTINGS, profiles: [] };
     const settingsRecord = settings;
     const keys = [
@@ -2413,8 +2639,14 @@ class SettingsRepo {
       { section: "dataCollect", key: "dataCollect" },
       { section: "cleanup", key: "cleanup" }
     ];
+    const rows = db2.prepare("SELECT key, value FROM settings").all();
+    const stored = new Map(rows.map((row) => [row.key, row.value]));
     for (const { section, key } of keys) {
-      const val = this.get(key);
+      const serialized = stored.get(key);
+      const val = serialized === void 0 ? null : this.decodeValue(key, serialized);
+      if (serialized !== void 0) {
+        SettingsRepo.valueCache.set(key, val);
+      }
       if (val !== null) {
         const defaultSection = settingsRecord[section];
         if (typeof defaultSection === "object" && defaultSection !== null && typeof val === "object" && val !== null && !Array.isArray(defaultSection) && !Array.isArray(val)) {
@@ -2427,8 +2659,12 @@ class SettingsRepo {
         }
       }
     }
-    const hotkey = this.get("hotkey");
-    if (hotkey) settings.hotkey = hotkey;
+    const hotkeySerialized = stored.get("hotkey");
+    const hotkey = hotkeySerialized === void 0 ? null : this.decodeValue("hotkey", hotkeySerialized);
+    if (hotkeySerialized !== void 0) {
+      SettingsRepo.valueCache.set("hotkey", hotkey);
+    }
+    if (typeof hotkey === "string" && hotkey) settings.hotkey = hotkey;
     if (settings.filter && Array.isArray(settings.filter.suffixes)) {
       settings.filter.suffixes = normalizeSuffixes(settings.filter.suffixes);
     }
@@ -2445,10 +2681,11 @@ class SettingsRepo {
     const normalizedProfiles = normalizeProfiles(settings);
     settings.profiles = normalizedProfiles.profiles;
     settings.activeProfileId = normalizedProfiles.activeProfileId;
+    SettingsRepo.allCache = settings;
     return settings;
   }
   saveAll(partial) {
-    const db2 = getDb();
+    const db2 = this.db();
     const transaction = db2.transaction(() => {
       for (const [key, value] of Object.entries(partial)) {
         if (value !== void 0) {
@@ -3291,6 +3528,10 @@ class TaskQueueService extends events.EventEmitter {
   runningTasks = /* @__PURE__ */ new Map();
   processTimer = null;
   initialProcessTimer = null;
+  uploadGateOpen = false;
+  priorityTaskIds = /* @__PURE__ */ new Set();
+  priorityActive = false;
+  priorityOverrideWindow = false;
   taskRunner = null;
   setTaskRunner(runner) {
     this.taskRunner = runner;
@@ -3315,6 +3556,56 @@ class TaskQueueService extends events.EventEmitter {
     }
     log.info("任务队列已停止");
   }
+  getStatus() {
+    const uploadConfig = getSettingsRepo().get("upload");
+    this.syncPriorityState(false);
+    return {
+      gateOpen: this.uploadGateOpen,
+      priorityActive: this.priorityActive,
+      priorityTaskIds: Array.from(this.priorityTaskIds),
+      priorityRemaining: this.priorityTaskIds.size,
+      runningTaskIds: Array.from(this.runningTasks.keys()),
+      overrideWindow: this.priorityOverrideWindow,
+      withinUploadWindow: this.isWithinUploadWindow(
+        uploadConfig?.startAfterTime,
+        uploadConfig?.endBeforeTime
+      ),
+      uploadWindow: {
+        startAfterTime: uploadConfig?.startAfterTime ?? null,
+        endBeforeTime: uploadConfig?.endBeforeTime ?? null
+      }
+    };
+  }
+  startUploading(input) {
+    const taskRepo = getTaskRepo();
+    const taskIds = this.resolveStartTaskIds(input);
+    taskRepo.resumeManyForUpload(taskIds);
+    this.uploadGateOpen = true;
+    this.priorityTaskIds = new Set(taskIds);
+    this.priorityActive = this.priorityTaskIds.size > 0;
+    this.priorityOverrideWindow = Boolean(input.overrideWindow) && this.priorityActive;
+    this.syncPriorityState(false);
+    this.emitQueueStatus();
+    void this.processQueue();
+    log.info(
+      `上传队列已放行，优先任务 ${this.priorityTaskIds.size} 个，overrideWindow=${this.priorityOverrideWindow}`
+    );
+    return this.getStatus();
+  }
+  stopUploading(input) {
+    this.uploadGateOpen = false;
+    this.priorityTaskIds.clear();
+    this.priorityActive = false;
+    this.priorityOverrideWindow = false;
+    if (input.mode === "pause-running") {
+      for (const taskId of Array.from(this.runningTasks.keys())) {
+        this.pauseRunningTask(taskId);
+      }
+    }
+    this.emitQueueStatus();
+    log.info("上传队列已停止:", input.mode);
+    return this.getStatus();
+  }
   getRunningCount() {
     return this.runningTasks.size;
   }
@@ -3326,20 +3617,32 @@ class TaskQueueService extends events.EventEmitter {
     if (running) {
       running.cancel();
       this.runningTasks.delete(taskId);
+      this.emitQueueStatus();
     }
   }
   async processQueue() {
     if (!this.taskRunner) return;
+    if (!this.uploadGateOpen) return;
+    this.syncPriorityState();
     const settings = getSettingsRepo();
     const uploadConfig = settings.get("upload");
-    if (!this.isWithinUploadWindow(uploadConfig?.startAfterTime, uploadConfig?.endBeforeTime)) return;
+    const withinUploadWindow = this.isWithinUploadWindow(
+      uploadConfig?.startAfterTime,
+      uploadConfig?.endBeforeTime
+    );
+    const canOverrideWindow = this.priorityActive && this.priorityOverrideWindow;
+    if (!withinUploadWindow && !canOverrideWindow) return;
     const maxConcurrent = uploadConfig?.maxConcurrentTasks || 4;
     const taskRepo = getTaskRepo();
     const availableSlots = maxConcurrent - this.runningTasks.size;
     if (availableSlots <= 0) return;
     const pendingTasks = taskRepo.listRunnable();
-    const eligibleTasks = pendingTasks.filter(
-      (task) => this.isTaskEligibleForCurrentStartCycle(task, uploadConfig?.startAfterTime)
+    const prioritizedTasks = this.priorityActive ? pendingTasks.filter((task) => this.priorityTaskIds.has(task.id)) : pendingTasks;
+    const eligibleTasks = prioritizedTasks.filter(
+      (task) => canOverrideWindow || this.isTaskEligibleForCurrentStartCycle(
+        task,
+        uploadConfig?.startAfterTime
+      )
     );
     const toRun = eligibleTasks.slice(0, Math.min(availableSlots, 1));
     for (const task of toRun) {
@@ -3352,6 +3655,7 @@ class TaskQueueService extends events.EventEmitter {
     this.runningTasks.set(task.id, { cancel: () => controller.abort() });
     try {
       taskRepo.updateStatus(task.id, "uploading");
+      this.emitQueueStatus();
       this.emit("task:status-change", {
         taskId: task.id,
         oldStatus: task.status,
@@ -3390,7 +3694,62 @@ class TaskQueueService extends events.EventEmitter {
       }
     } finally {
       this.runningTasks.delete(task.id);
+      this.syncPriorityState();
+      this.emitQueueStatus();
+      void this.processQueue();
     }
+  }
+  resolveStartTaskIds(input) {
+    const taskRepo = getTaskRepo();
+    if (input.scope === "all-pending") {
+      return taskRepo.listPendingUploadTaskIds();
+    }
+    const ids = /* @__PURE__ */ new Set();
+    for (const taskId of input.taskIds || []) {
+      if (taskId) ids.add(taskId);
+    }
+    const dayFolderTaskIds = taskRepo.listPendingUploadTaskIdsByDayFolderIds(
+      input.dayFolderIds || []
+    );
+    for (const taskId of dayFolderTaskIds) ids.add(taskId);
+    return Array.from(ids);
+  }
+  syncPriorityState(emit = true) {
+    if (!this.priorityActive && this.priorityTaskIds.size === 0) return;
+    let changed = false;
+    for (const taskId of Array.from(this.priorityTaskIds)) {
+      const task = getTaskRepo().getById(taskId);
+      if (!task || this.isPriorityTerminalStatus(task.status)) {
+        this.priorityTaskIds.delete(taskId);
+        changed = true;
+      }
+    }
+    if (this.priorityTaskIds.size === 0 && this.priorityActive) {
+      this.priorityActive = false;
+      this.priorityOverrideWindow = false;
+      changed = true;
+    }
+    if (changed && emit) this.emitQueueStatus();
+  }
+  pauseRunningTask(taskId) {
+    const running = this.runningTasks.get(taskId);
+    if (!running) return;
+    running.cancel();
+    this.runningTasks.delete(taskId);
+    getTaskRepo().updateStatus(taskId, "paused");
+    getTaskDestinationRepo().updateIncompleteStatuses(taskId, "paused");
+    getDayFolderService().refreshForTask(taskId);
+    this.emit("task:status-change", {
+      taskId,
+      oldStatus: "uploading",
+      newStatus: "paused"
+    });
+  }
+  isPriorityTerminalStatus(status) {
+    return status === "completed" || status === "synced" || status === "skipped" || status === "failed" || status === "paused";
+  }
+  emitQueueStatus() {
+    this.emit("upload-queue:event", this.getStatus());
   }
   isWithinUploadWindow(startAfterTime, endBeforeTime) {
     const startMinutes = this.parseMinutes(startAfterTime);
@@ -3447,11 +3806,17 @@ function getTaskQueueService() {
 }
 class FileFilterService {
   rules;
+  whitelist = [];
+  blacklist = [];
+  regexExcludes = [];
+  suffixes = /* @__PURE__ */ new Set();
   constructor(rules) {
     this.rules = rules;
+    this.compileRules();
   }
   updateRules(rules) {
     this.rules = rules;
+    this.compileRules();
   }
   /**
    * 判断单个文件是否应该被包含
@@ -3461,33 +3826,29 @@ class FileFilterService {
   shouldInclude(relativePath) {
     const fileName = path.basename(relativePath);
     const ext = path.extname(relativePath).toLowerCase();
-    if (this.rules.whitelist.length > 0) {
-      for (const pattern of this.rules.whitelist) {
-        if (this.matchPattern(fileName, relativePath, pattern)) {
+    if (this.whitelist.length > 0) {
+      for (const matcher of this.whitelist) {
+        if (this.matchPattern(fileName, relativePath, ext, matcher)) {
           return true;
         }
       }
     }
-    if (this.rules.blacklist.length > 0) {
-      for (const pattern of this.rules.blacklist) {
-        if (this.matchPattern(fileName, relativePath, pattern)) {
+    if (this.blacklist.length > 0) {
+      for (const matcher of this.blacklist) {
+        if (this.matchPattern(fileName, relativePath, ext, matcher)) {
           return false;
         }
       }
     }
-    if (this.rules.regex.length > 0) {
-      for (const pattern of this.rules.regex) {
-        try {
-          const re = new RegExp(pattern);
-          if (re.test(relativePath) || re.test(fileName)) {
-            return false;
-          }
-        } catch {
+    if (this.regexExcludes.length > 0) {
+      for (const re of this.regexExcludes) {
+        if (re.test(relativePath) || re.test(fileName)) {
+          return false;
         }
       }
     }
-    if (this.rules.suffixes.length > 0) {
-      return this.rules.suffixes.some((suffix) => ext === this.normalizeSuffix(suffix));
+    if (this.suffixes.size > 0) {
+      return this.suffixes.has(ext);
     }
     return true;
   }
@@ -3550,16 +3911,40 @@ class FileFilterService {
       }
     }
   }
-  matchPattern(fileName, relativePath, pattern) {
-    if (fileName === pattern) return true;
-    if (pattern.startsWith(".") && path.extname(fileName).toLowerCase() === pattern.toLowerCase()) return true;
+  compileRules() {
+    this.whitelist = this.rules.whitelist.map((pattern) => this.compilePattern(pattern)).filter((matcher) => Boolean(matcher));
+    this.blacklist = this.rules.blacklist.map((pattern) => this.compilePattern(pattern)).filter((matcher) => Boolean(matcher));
+    this.regexExcludes = [];
+    for (const pattern of this.rules.regex) {
+      try {
+        this.regexExcludes.push(new RegExp(pattern));
+      } catch {
+      }
+    }
+    this.suffixes = new Set(
+      this.rules.suffixes.map((suffix) => this.normalizeSuffix(suffix)).filter(Boolean)
+    );
+  }
+  compilePattern(pattern) {
+    if (!pattern) return null;
     if (pattern.includes("*")) {
       const regexStr = "^" + pattern.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$";
       try {
-        const re = new RegExp(regexStr, "i");
-        if (re.test(fileName) || re.test(relativePath)) return true;
+        return { wildcard: new RegExp(regexStr, "i") };
       } catch {
+        return null;
       }
+    }
+    if (pattern.startsWith(".")) {
+      return { suffix: this.normalizeSuffix(pattern) };
+    }
+    return { exactName: pattern };
+  }
+  matchPattern(fileName, relativePath, ext, matcher) {
+    if (matcher.exactName && fileName === matcher.exactName) return true;
+    if (matcher.suffix && ext === matcher.suffix) return true;
+    if (matcher.wildcard) {
+      return matcher.wildcard.test(fileName) || matcher.wildcard.test(relativePath);
     }
     return false;
   }
@@ -3733,7 +4118,8 @@ class ScannerService {
           root,
           today,
           profile.scan.workDirNamePattern || scanConfig?.workDirNamePattern,
-          seenChildPaths
+          seenChildPaths,
+          profile
         );
         scannedDirs += result.scanned;
         newDirsFound += result.newFound;
@@ -3767,7 +4153,7 @@ class ScannerService {
       }
     }
   }
-  async scanRootDirectory(root, today, workDirNamePattern, seenChildPaths) {
+  async scanRootDirectory(root, today, workDirNamePattern, seenChildPaths, profile = getProfileById(getSettingsRepo().getAll(), root.profileId)) {
     let scanned = 0;
     let newFound = 0;
     let existing = 0;
@@ -3780,7 +4166,6 @@ class ScannerService {
         workDirNamePattern
       );
       if (dayDirectory) {
-        const profile = getProfileById(getSettingsRepo().getAll(), root.profileId);
         const result = await this.scanDayDirectory(
           root.directory,
           dayDirectory.folderPath,
@@ -4075,10 +4460,22 @@ class ScannerService {
     }
   }
   queueReconcileTask(task) {
-    if (this.reconcileQueuedIds.has(task.id)) return;
-    this.reconcileQueuedIds.add(task.id);
-    this.reconcileQueue.push(task.id);
+    const taskId = typeof task === "string" ? task : task.id;
+    if (!this.enqueueReconcileTaskId(taskId)) return;
     void this.processReconcileQueue();
+  }
+  queueReconcileTaskIds(taskIds) {
+    let queued = false;
+    for (const taskId of taskIds) {
+      queued = this.enqueueReconcileTaskId(taskId) || queued;
+    }
+    if (queued) void this.processReconcileQueue();
+  }
+  enqueueReconcileTaskId(taskId) {
+    if (this.reconcileQueuedIds.has(taskId)) return false;
+    this.reconcileQueuedIds.add(taskId);
+    this.reconcileQueue.push(taskId);
+    return true;
   }
   async processReconcileQueue() {
     if (this.reconcileInProgress) return;
@@ -4143,10 +4540,9 @@ class ScannerService {
     const normalizedRoots = watchedDirectories.map(
       (directory) => directory.replace(/[\\/]+$/, "")
     );
-    const tasks = getTaskRepo().listByStatus();
+    const tasks = getTaskRepo().listMonitorableLocalUnfinishedTasks();
     for (let index = 0; index < tasks.length; index++) {
       const task = tasks[index];
-      if (task.sourceType !== "local" || !task.dayFolderId) continue;
       if (!normalizedRoots.some(
         (root) => task.folderPath === root || task.folderPath.startsWith(`${root}/`) || task.folderPath.startsWith(`${root}\\`)
       )) {
@@ -4667,16 +5063,13 @@ class TencentS3UploadService {
     return null;
   }
   createClient(config, requestTimeout = 3e5) {
-    const requestHandler = config.allowInsecureTls ? new nodeHttpHandler.NodeHttpHandler({
+    const requestHandler = new nodeHttpHandler.NodeHttpHandler({
       connectionTimeout: 3e4,
       requestTimeout,
       httpsAgent: new https.Agent({
         keepAlive: true,
-        rejectUnauthorized: false
+        rejectUnauthorized: !config.allowInsecureTls
       })
-    }) : new nodeHttpHandler.NodeHttpHandler({
-      connectionTimeout: 3e4,
-      requestTimeout
     });
     return new clientS3.S3Client({
       endpoint: config.endpoint,
@@ -5097,7 +5490,7 @@ function registerAllIpc() {
     }
   }
   electron.ipcMain.handle(IPC.TASK_LIST, (_event, args) => {
-    return getTaskRepo().listByStatus(args?.status);
+    return getTaskRepo().listByQuery(args);
   });
   electron.ipcMain.handle(IPC.TASK_GET, (_event, args) => {
     return getTaskRepo().getById(args.taskId);
@@ -5175,6 +5568,15 @@ function registerAllIpc() {
     getTaskRepo().retry(args.taskId, args.provider);
     getDayFolderService().refreshForTask(args.taskId);
     broadcastStatusChange(args.taskId, "pending");
+  });
+  electron.ipcMain.handle(IPC.UPLOAD_QUEUE_STATUS, () => {
+    return getTaskQueueService().getStatus();
+  });
+  electron.ipcMain.handle(IPC.UPLOAD_QUEUE_START, (_event, args) => {
+    return getTaskQueueService().startUploading(args);
+  });
+  electron.ipcMain.handle(IPC.UPLOAD_QUEUE_STOP, (_event, args) => {
+    return getTaskQueueService().stopUploading(args);
   });
   electron.ipcMain.handle(IPC.SCANNER_STATUS, () => {
     return getScannerService().getStatus();
@@ -5655,6 +6057,8 @@ function getUploadSemaphore(max) {
   return instance$2;
 }
 const RETRY_DELAYS_MS = [1e3, 2e3, 5e3, 15e3, 3e4];
+const MARKER_WRITE_INTERVAL_MS = 5e3;
+const PROGRESS_PERSIST_INTERVAL_MS = 1e3;
 class TaskRunnerService {
   async run(task, signal) {
     const taskRepo = getTaskRepo();
@@ -5692,13 +6096,12 @@ class TaskRunnerService {
       );
       if (error) throw new Error(error);
     }
-    const completedLogicalFiles = taskRepo.listFiles(task.id, "completed");
+    const initialLogicalSummary = taskRepo.summarizeFiles(task.id);
     const logicalProgress = {
-      completed: new Set(completedLogicalFiles.map((file) => file.id)),
-      uploadedBytes: completedLogicalFiles.reduce(
-        (sum, file) => sum + file.fileSize,
-        0
-      )
+      completedThisRun: /* @__PURE__ */ new Set(),
+      uploadedFiles: initialLogicalSummary.completedFiles,
+      uploadedBytes: initialLogicalSummary.completedBytes,
+      lastPersistAt: 0
     };
     const providers = Array.from(new Set(jobs.map((job) => job.provider)));
     const runtimes = /* @__PURE__ */ new Map();
@@ -5711,31 +6114,24 @@ class TaskRunnerService {
           settings,
           settings.upload.multipartThreshold
         );
-        const providerTargets = destinationRepo.listFileTargets(task.id, provider);
+        const providerSummary = destinationRepo.summarizeFileTargets(
+          task.id,
+          provider
+        );
         runtimes.set(provider, {
           uploader,
           speed: new SpeedCalculator(),
-          uploadedFiles: providerTargets.filter(
-            (target) => target.status === "completed"
-          ).length,
-          uploadedBytes: providerTargets.filter((target) => target.status === "completed").reduce((sum, target) => sum + target.fileSize, 0),
-          totalFiles: providerTargets.length,
-          totalBytes: providerTargets.reduce(
-            (sum, target) => sum + target.fileSize,
-            0
-          ),
-          queuedFiles: providerTargets.filter(
-            (target) => target.status === "pending"
-          ).length,
-          failedFiles: providerTargets.filter(
-            (target) => target.status === "failed"
-          ).length,
-          skippedFiles: providerTargets.filter(
-            (target) => target.status === "skipped"
-          ).length,
+          uploadedFiles: providerSummary.uploaded,
+          uploadedBytes: providerSummary.uploadedBytes,
+          totalFiles: providerSummary.total,
+          totalBytes: providerSummary.totalBytes,
+          queuedFiles: providerSummary.pending,
+          failedFiles: providerSummary.failed,
+          skippedFiles: providerSummary.skipped,
           activeUploads: /* @__PURE__ */ new Map(),
           transferredBytes: 0,
-          lastBroadcastAt: 0
+          lastBroadcastAt: 0,
+          lastProgressPersistAt: 0
         });
         destinationRepo.updateStatus(task.id, provider, "uploading");
         this.broadcastDestinationStatus(task.id, provider, "uploading");
@@ -5748,9 +6144,10 @@ class TaskRunnerService {
       for (const runtime of runtimes.values()) runtime.uploader.abort();
     };
     signal?.addEventListener("abort", abortUploaders, { once: true });
+    const markerDestinations = destinationRepo.listByTask(task.id);
     const marker = this.createCompactMarker(
       { ...task, status: "uploading" },
-      destinations
+      markerDestinations
     );
     this.writeMarker(task.folderPath, marker);
     const markerTimer = setInterval(() => {
@@ -5758,12 +6155,9 @@ class TaskRunnerService {
       if (!currentTask2) return;
       this.writeMarker(
         task.folderPath,
-        this.createCompactMarker(
-          currentTask2,
-          destinationRepo.listByTask(task.id)
-        )
+        this.createCompactMarker(currentTask2, currentTask2.destinations)
       );
-    }, 2e3);
+    }, MARKER_WRITE_INTERVAL_MS);
     const semaphore = getUploadSemaphore(
       settings.upload.maxConcurrentUploads || 24
     );
@@ -5793,6 +6187,10 @@ class TaskRunnerService {
     } finally {
       clearInterval(markerTimer);
       signal?.removeEventListener("abort", abortUploaders);
+      this.persistLogicalProgress(task.id, logicalProgress, true);
+      for (const [provider, runtime] of runtimes) {
+        this.persistProviderProgress(task.id, provider, runtime, true);
+      }
       for (const runtime of runtimes.values()) runtime.uploader.dispose();
     }
     if (signal?.aborted) {
@@ -5804,7 +6202,7 @@ class TaskRunnerService {
     const finalTask = { ...currentTask, status: finalStatus };
     this.writeMarker(
       task.folderPath,
-      this.createCompactMarker(finalTask, destinationRepo.listByTask(task.id))
+      this.createCompactMarker(finalTask, finalTask.destinations)
     );
     return finalStatus;
   }
@@ -5912,6 +6310,7 @@ class TaskRunnerService {
       destinationRepo.recalculateLogicalFile(target.taskFileId);
       runtime.skippedFiles++;
       runtime.queuedFiles = Math.max(0, runtime.queuedFiles - 1);
+      this.persistProviderProgress(task.id, target.provider, runtime);
       this.broadcastProgress(task.id, target.provider, runtime, null, true);
       return;
     }
@@ -5984,14 +6383,11 @@ class TaskRunnerService {
       );
       if (logicalStatus === "completed") {
         taskRepo.clearRetry(target.taskFileId);
-        if (!logicalProgress.completed.has(target.taskFileId)) {
-          logicalProgress.completed.add(target.taskFileId);
+        if (!logicalProgress.completedThisRun.has(target.taskFileId)) {
+          logicalProgress.completedThisRun.add(target.taskFileId);
+          logicalProgress.uploadedFiles++;
           logicalProgress.uploadedBytes += target.fileSize;
-          taskRepo.updateProgress(
-            task.id,
-            logicalProgress.completed.size,
-            logicalProgress.uploadedBytes
-          );
+          this.persistLogicalProgress(task.id, logicalProgress);
         }
       }
       runtime.uploadedFiles++;
@@ -6040,47 +6436,68 @@ class TaskRunnerService {
     } finally {
       runtime.activeUploads.delete(target.id);
       if (acquired) semaphore.release();
-      destinationRepo.updateProgress(
-        task.id,
-        target.provider,
-        runtime.uploadedFiles,
-        runtime.uploadedBytes
-      );
+      this.persistProviderProgress(task.id, target.provider, runtime);
       this.broadcastProgress(task.id, target.provider, runtime, null, true);
     }
+  }
+  persistProviderProgress(taskId, provider, runtime, force = false) {
+    const now = Date.now();
+    if (!force && now - runtime.lastProgressPersistAt < PROGRESS_PERSIST_INTERVAL_MS) {
+      return;
+    }
+    getTaskDestinationRepo().updateProgress(
+      taskId,
+      provider,
+      runtime.uploadedFiles,
+      runtime.uploadedBytes
+    );
+    runtime.lastProgressPersistAt = now;
+  }
+  persistLogicalProgress(taskId, logicalProgress, force = false) {
+    const now = Date.now();
+    if (!force && now - logicalProgress.lastPersistAt < PROGRESS_PERSIST_INTERVAL_MS) {
+      return;
+    }
+    getTaskRepo().updateProgress(
+      taskId,
+      logicalProgress.uploadedFiles,
+      logicalProgress.uploadedBytes
+    );
+    logicalProgress.lastPersistAt = now;
   }
   updateDestinationFinalStates(task) {
     const repo = getTaskDestinationRepo();
     let taskStatus = task.sourceType === "local" && task.dayFolderId ? "synced" : "completed";
     for (const destination of repo.listByTask(task.id)) {
-      const targets = repo.listFileTargets(task.id, destination.provider);
-      const failed = targets.filter((target) => target.status === "failed");
-      const pending = targets.filter((target) => target.status === "pending");
-      const skipped = targets.filter((target) => target.status === "skipped");
-      if (failed.length > 0) {
-        const summary = `${failed.length} 个文件上传失败，例如 ${failed.slice(0, 3).map(
-          (target) => `${target.relativePath}: ${target.errorMessage || "unknown error"}`
+      const summary = repo.summarizeFileTargets(task.id, destination.provider);
+      if (summary.failed > 0) {
+        const examples = repo.listFailedFileTargetExamples(
+          task.id,
+          destination.provider
+        );
+        const message = `${summary.failed} 个文件上传失败，例如 ${examples.map(
+          (example) => `${example.relativePath}: ${example.errorMessage || "unknown error"}`
         ).join(" | ")}`;
-        repo.updateStatus(task.id, destination.provider, "failed", summary);
+        repo.updateStatus(task.id, destination.provider, "failed", message);
         this.broadcastDestinationStatus(
           task.id,
           destination.provider,
           "failed",
-          summary
+          message
         );
         taskStatus = "failed";
-      } else if (pending.length > 0) {
+      } else if (summary.pending > 0) {
         repo.updateStatus(
           task.id,
           destination.provider,
           "retrying",
-          `${pending.length} 个文件等待自动重试或稳定`
+          `${summary.pending} 个文件等待自动重试或稳定`
         );
         this.broadcastDestinationStatus(
           task.id,
           destination.provider,
           "retrying",
-          `${pending.length} 个文件等待自动重试或稳定`
+          `${summary.pending} 个文件等待自动重试或稳定`
         );
         if (taskStatus !== "failed") taskStatus = "retrying";
       } else {
@@ -6089,35 +6506,47 @@ class TaskRunnerService {
           task.id,
           destination.provider,
           status,
-          skipped.length > 0 ? `${skipped.length} 个源文件已跳过` : void 0
+          summary.skipped > 0 ? `${summary.skipped} 个源文件已跳过` : void 0
         );
         this.broadcastDestinationStatus(
           task.id,
           destination.provider,
           status,
-          skipped.length > 0 ? `${skipped.length} 个源文件已跳过` : void 0
+          summary.skipped > 0 ? `${summary.skipped} 个源文件已跳过` : void 0
         );
       }
-      repo.recalculateProgress(task.id, destination.provider);
+      repo.setTotals(
+        task.id,
+        destination.provider,
+        summary.total,
+        summary.totalBytes
+      );
+      repo.updateProgress(
+        task.id,
+        destination.provider,
+        summary.uploaded,
+        summary.uploadedBytes
+      );
     }
     return taskStatus;
   }
   createCompactMarker(task, destinations) {
     const destinationRepo = getTaskDestinationRepo();
+    const taskSummary = getTaskRepo().summarizeFiles(task.id);
     return {
       version: 3,
       taskId: task.id,
       status: task.status,
-      totalFiles: task.totalFiles,
-      uploadedFiles: task.uploadedFiles,
-      failedFiles: taskRepoCount(task.id, "failed"),
-      skippedFiles: taskRepoCount(task.id, "skipped"),
+      totalFiles: taskSummary.totalFiles,
+      uploadedFiles: taskSummary.completedFiles,
+      failedFiles: taskSummary.failedFiles,
+      skippedFiles: taskSummary.skippedFiles,
       lastUpdated: (/* @__PURE__ */ new Date()).toISOString(),
       error: task.errorMessage || destinations.map((destination) => destination.errorMessage).filter(Boolean).join(" || ") || null,
       uploadTargetMode: task.uploadTargetMode,
       destinations: Object.fromEntries(
         destinations.map((destination) => {
-          const targets = destinationRepo.listFileTargets(
+          const summary = destinationRepo.summarizeFileTargets(
             task.id,
             destination.provider
           );
@@ -6128,16 +6557,10 @@ class TaskRunnerService {
               uploadRelativePath: destination.uploadRelativePath,
               pathMode: destination.pathMode,
               objectKeyTemplate: destination.objectKeyTemplate,
-              totalFiles: targets.length,
-              uploadedFiles: targets.filter(
-                (target) => target.status === "completed"
-              ).length,
-              failedFiles: targets.filter(
-                (target) => target.status === "failed"
-              ).length,
-              skippedFiles: targets.filter(
-                (target) => target.status === "skipped"
-              ).length,
+              totalFiles: summary.total,
+              uploadedFiles: summary.uploaded,
+              failedFiles: summary.failed,
+              skippedFiles: summary.skipped,
               error: destination.errorMessage
             }
           ];
@@ -6217,9 +6640,6 @@ class TaskRunnerService {
     const text = `${error.name || ""} ${error.message || ""}`.toLowerCase();
     return text.includes("timeout") || text.includes("temporarily unavailable") || text.includes("socket hang up");
   }
-}
-function taskRepoCount(taskId, status) {
-  return getTaskRepo().listFiles(taskId, status).length;
 }
 let instance$1 = null;
 function getTaskRunnerService() {
@@ -6539,18 +6959,21 @@ function startServices() {
       }
     }
     for (const win of electron.BrowserWindow.getAllWindows()) {
-      win.webContents.send("task:status-change", event);
+      win.webContents.send(IPC.TASK_STATUS_CHANGE, event);
     }
   });
-  const unfinished = taskRepo.getUnfinishedTasks();
-  if (unfinished.length > 0) {
-    log.info(`发现 ${unfinished.length} 个未完成任务，等待后台队列分批恢复`);
+  taskQueue.on("upload-queue:event", (status) => {
+    for (const win of electron.BrowserWindow.getAllWindows()) {
+      win.webContents.send(IPC.UPLOAD_QUEUE_EVENT, status);
+    }
+  });
+  const unfinishedTaskIds = taskRepo.listUnfinishedTaskIds();
+  if (unfinishedTaskIds.length > 0) {
+    log.info(`发现 ${unfinishedTaskIds.length} 个未完成任务，等待后台队列分批恢复`);
   }
   taskQueue.start();
   scanner.start();
-  for (const task of unfinished) {
-    scanner.queueReconcileTask(task);
-  }
+  scanner.queueReconcileTaskIds(unfinishedTaskIds);
   getCleanupService().start();
   log.info("所有服务已启动");
 }
