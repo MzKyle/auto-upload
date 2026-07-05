@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Plug, RefreshCw, Settings } from 'lucide-react'
+import { ExternalLink, Plug, Power, PowerOff, RefreshCw, Settings } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { fetchProjectCapabilityStatus, fetchSettings } from '@/lib/ipc-client'
+import { showToast } from '@/components/ui/toast'
+import { fetchProjectCapabilityStatus, fetchSettings, saveSettings } from '@/lib/ipc-client'
+import { providersForMode } from '@shared/cloud-upload'
+import { DEFAULT_PROFILE_EXTENSIONS, EXTENSION_IDS } from '@shared/plugins'
 import type { AppSettings, ProjectCapabilityStatus } from '@shared/types'
 
 function formatTime(value: string | null): string {
@@ -28,19 +31,41 @@ function statusVariant(status?: string): 'success' | 'warning' | 'destructive' |
   return 'secondary'
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function ossConfigComplete(settings: AppSettings | null): boolean {
+  return Boolean(
+    settings?.oss.region &&
+    settings.oss.bucket &&
+    settings.oss.accessKeyId &&
+    settings.oss.accessKeySecret
+  )
+}
+
 export default function Plugins() {
   const navigate = useNavigate()
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [profileId, setProfileId] = useState('')
   const [status, setStatus] = useState<ProjectCapabilityStatus | null>(null)
   const [loading, setLoading] = useState(false)
+  const [savingExtensionId, setSavingExtensionId] = useState<string | null>(null)
 
   const profiles = useMemo(() => settings?.profiles || [], [settings])
+  const selectedProfile = useMemo(
+    () => profiles.find((profile) => profile.id === profileId) || profiles[0],
+    [profileId, profiles]
+  )
+  const selectedProfileHasAliyun = useMemo(
+    () => selectedProfile ? providersForMode(selectedProfile.targetMode).includes('aliyun') : false,
+    [selectedProfile]
+  )
 
   const load = async (nextProfileId?: string) => {
     setLoading(true)
     try {
-      const loadedSettings = settings || await fetchSettings()
+      const loadedSettings = await fetchSettings()
       setSettings(loadedSettings)
       const id = nextProfileId || profileId || loadedSettings.activeProfileId
       setProfileId(id)
@@ -48,6 +73,81 @@ export default function Plugins() {
     } finally {
       setLoading(false)
     }
+  }
+
+  const updateExtension = async (
+    extensionId: string,
+    enabled: boolean,
+    options?: { activateProfile?: boolean; silent?: boolean }
+  ) => {
+    const targetProfileId = profileId || settings?.activeProfileId
+    if (!targetProfileId) return
+
+    setSavingExtensionId(extensionId)
+    try {
+      const latest = await fetchSettings()
+      const nextProfiles = latest.profiles.map((profile) => {
+        if (profile.id !== targetProfileId) return profile
+        const currentExtensions = profile.extensions || DEFAULT_PROFILE_EXTENSIONS
+        const enabledIds = new Set(currentExtensions.enabledIds || [])
+        if (enabled) enabledIds.add(extensionId)
+        else enabledIds.delete(extensionId)
+        const currentConfig = isRecord(currentExtensions.configs?.[extensionId])
+          ? currentExtensions.configs[extensionId] as Record<string, unknown>
+          : {}
+        const nextProfile = {
+          ...profile,
+          extensions: {
+            enabledIds: Array.from(enabledIds),
+            configs: {
+              ...DEFAULT_PROFILE_EXTENSIONS.configs,
+              ...(currentExtensions.configs || {}),
+              [extensionId]: {
+                ...currentConfig,
+                enabled
+              }
+            }
+          },
+          plugins: undefined
+        }
+        return nextProfile
+      })
+
+      await saveSettings({
+        profiles: nextProfiles,
+        activeProfileId: options?.activateProfile ? targetProfileId : latest.activeProfileId
+      })
+      await load(targetProfileId)
+      if (!options?.silent) {
+        showToast(enabled ? '扩展插件已启用' : '扩展插件已停用', 'success')
+      }
+    } catch (error) {
+      showToast(`扩展插件更新失败: ${error}`, 'error')
+      throw error
+    } finally {
+      setSavingExtensionId(null)
+    }
+  }
+
+  const openOssBrowser = async () => {
+    if (!selectedProfileHasAliyun) {
+      showToast('OSS 浏览需要当前 Profile 包含阿里云目标', 'warning')
+      return
+    }
+    if (!ossConfigComplete(settings)) {
+      showToast('请先完善阿里云 OSS 连接配置', 'warning')
+      navigate('/settings')
+      return
+    }
+
+    const ossStatus = status?.extensions.find((item) => item.manifest.id === EXTENSION_IDS.OSS_BROWSER)
+    if (!ossStatus?.enabled || settings?.activeProfileId !== profileId) {
+      await updateExtension(EXTENSION_IDS.OSS_BROWSER, true, {
+        activateProfile: true,
+        silent: true
+      })
+    }
+    navigate('/oss-browser')
   }
 
   useEffect(() => {
@@ -168,6 +268,38 @@ export default function Plugins() {
                 <div>结束时间: {formatTime(item.lastRun?.completedAt || null)}</div>
                 {item.lastRun?.errorMessage && (
                   <div className="text-destructive break-all">{item.lastRun.errorMessage}</div>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-2 pt-1">
+                <Button
+                  size="sm"
+                  variant={item.enabled ? 'outline' : 'default'}
+                  disabled={savingExtensionId === item.manifest.id}
+                  onClick={() => updateExtension(item.manifest.id, !item.enabled).catch(() => {})}
+                >
+                  {item.enabled ? (
+                    <PowerOff className="h-4 w-4 mr-1" />
+                  ) : (
+                    <Power className="h-4 w-4 mr-1" />
+                  )}
+                  {item.enabled ? '停用' : '启用'}
+                </Button>
+                {item.manifest.id === EXTENSION_IDS.OSS_BROWSER && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={savingExtensionId === item.manifest.id || !selectedProfileHasAliyun}
+                    onClick={() => openOssBrowser().catch(() => {})}
+                  >
+                    <ExternalLink className="h-4 w-4 mr-1" />
+                    {item.enabled ? '打开 OSS 浏览' : '启用并打开'}
+                  </Button>
+                )}
+                {item.manifest.id === EXTENSION_IDS.WEBHOOK_NOTIFIER && (
+                  <Button size="sm" variant="outline" onClick={() => navigate('/settings')}>
+                    <Settings className="h-4 w-4 mr-1" />
+                    配置通知
+                  </Button>
                 )}
               </div>
             </CardContent>

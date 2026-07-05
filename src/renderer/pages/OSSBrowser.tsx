@@ -1,5 +1,6 @@
 import { useMemo } from 'react'
-import { ArrowDownAZ, ArrowUpAZ, CornerUpLeft, File, FileImage, Folder, RefreshCw } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
+import { ArrowDownAZ, ArrowUpAZ, CornerUpLeft, File, FileImage, Folder, Plug, RefreshCw, Settings } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -16,6 +17,7 @@ function formatTime(value: string): string {
 }
 
 export default function OSSBrowser() {
+  const navigate = useNavigate()
   const {
     state,
     breadcrumbs,
@@ -102,8 +104,22 @@ export default function OSSBrowser() {
       </Card>
 
       {state.error && (
-        <div className="text-sm text-destructive border border-destructive/40 rounded-md px-3 py-2 bg-destructive/10">
-          {state.error}
+        <div className="text-sm border border-destructive/40 rounded-md px-3 py-3 bg-destructive/10 space-y-3">
+          <div className="text-destructive break-all">{state.error}</div>
+          <div className="flex flex-wrap gap-2">
+            {state.error.includes('未启用') && (
+              <Button size="sm" variant="outline" onClick={() => navigate('/plugins')}>
+                <Plug className="h-4 w-4 mr-1" />
+                项目能力
+              </Button>
+            )}
+            {state.error.includes('配置不完整') && (
+              <Button size="sm" variant="outline" onClick={() => navigate('/settings')}>
+                <Settings className="h-4 w-4 mr-1" />
+                设置
+              </Button>
+            )}
+          </div>
         </div>
       )}
 
