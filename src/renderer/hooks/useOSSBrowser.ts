@@ -4,6 +4,10 @@ import { listOSSObjects } from '@/lib/ipc-client'
 
 export type OSSSortBy = 'name' | 'size' | 'lastModified'
 
+export type OSSSelectedItem =
+  | { kind: 'prefix'; item: OSSPrefixItem }
+  | { kind: 'object'; item: OSSObjectItem }
+
 export interface OSSBrowserState {
   loading: boolean
   loadingMore: boolean
@@ -30,6 +34,7 @@ export function useOSSBrowser(): {
   state: OSSBrowserState
   breadcrumbs: Array<{ label: string; prefix: string }>
   filteredObjects: OSSObjectItem[]
+  selectedItem: OSSSelectedItem | null
   setSearchText: (value: string) => void
   setSortBy: (value: OSSSortBy) => void
   toggleSortDirection: () => void
@@ -142,6 +147,17 @@ export function useOSSBrowser(): {
     return sortAsc ? sorted : sorted.reverse()
   }, [objects, searchText, sortAsc, sortBy])
 
+  const selectedItem = useMemo<OSSSelectedItem | null>(() => {
+    if (!selectedKey) return null
+    if (selectedKey.startsWith('dir:')) {
+      const prefixValue = selectedKey.slice(4)
+      const prefix = prefixes.find((item) => item.prefix === prefixValue)
+      return prefix ? { kind: 'prefix', item: prefix } : null
+    }
+    const object = objects.find((item) => item.key === selectedKey)
+    return object ? { kind: 'object', item: object } : null
+  }, [objects, prefixes, selectedKey])
+
   return {
     state: {
       loading,
@@ -158,6 +174,7 @@ export function useOSSBrowser(): {
     },
     breadcrumbs,
     filteredObjects,
+    selectedItem,
     setSearchText,
     setSortBy,
     toggleSortDirection: () => setSortAsc((v) => !v),

@@ -1,10 +1,12 @@
 import { useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowDownAZ, ArrowUpAZ, CornerUpLeft, File, FileImage, Folder, Plug, RefreshCw, Settings } from 'lucide-react'
+import { ArrowDownAZ, ArrowUpAZ, CornerUpLeft, Eye, File, FileImage, Folder, Plug, RefreshCw, Settings } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
+import { PageHeader } from '@/components/ui/page-header'
 import { showToast } from '@/components/ui/toast'
 import { openOSSPreviewWindow } from '@/lib/ipc-client'
 import { formatBytes } from '@/lib/utils'
@@ -22,6 +24,7 @@ export default function OSSBrowser() {
     state,
     breadcrumbs,
     filteredObjects,
+    selectedItem,
     setSearchText,
     setSortBy,
     toggleSortDirection,
@@ -38,17 +41,21 @@ export default function OSSBrowser() {
     return '名称'
   }, [state.sortBy])
 
+  const openPreview = async (key: string) => {
+    try {
+      await openOSSPreviewWindow(key)
+    } catch (err) {
+      showToast(`打开预览失败: ${err}`, 'error')
+    }
+  }
+
   return (
     <div className="p-6 space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="space-y-1">
-          <h1 className="text-xl font-bold">OSS 浏览</h1>
-          <div className="text-sm text-muted-foreground break-all">
-            当前路径: {state.currentPrefix || '/'}
-          </div>
-        </div>
-        <Badge variant="outline">只读</Badge>
-      </div>
+      <PageHeader
+        title="OSS 浏览"
+        description={`当前路径: ${state.currentPrefix || '/'}`}
+        actions={<Badge variant="outline">只读</Badge>}
+      />
 
       <Card>
         <CardHeader className="pb-3">
@@ -133,16 +140,19 @@ export default function OSSBrowser() {
           ) : (
             <>
               {state.prefixes.length === 0 && filteredObjects.length === 0 ? (
-                <div className="text-sm text-muted-foreground py-10 text-center border rounded-md border-dashed">
-                  当前目录为空
-                </div>
+                <EmptyState
+                  icon={<Folder className="h-5 w-5" />}
+                  title="当前目录为空"
+                  description="切换到其他路径或刷新后再查看。"
+                />
               ) : (
                 <div className="border rounded-md overflow-hidden">
                   <div className="grid grid-cols-12 gap-2 px-3 py-2 text-xs text-muted-foreground bg-muted/40 border-b">
-                    <div className="col-span-6">名称</div>
+                    <div className="col-span-5">名称</div>
                     <div className="col-span-2">类型</div>
                     <div className="col-span-2 text-right">大小</div>
                     <div className="col-span-2 text-right">修改时间</div>
+                    <div className="col-span-1 text-right">操作</div>
                   </div>
 
                   <div className="divide-y">
@@ -150,8 +160,10 @@ export default function OSSBrowser() {
                       const rowKey = `dir:${prefix.prefix}`
                       const selected = state.selectedKey === rowKey
                       return (
-                        <button
+                        <div
                           key={prefix.prefix}
+                          role="button"
+                          tabIndex={0}
                           className={`w-full grid grid-cols-12 gap-2 items-center px-3 py-2 text-left hover:bg-accent ${selected ? 'bg-accent/80' : ''}`}
                           onClick={() => selectObject({
                             key: rowKey,
@@ -160,35 +172,50 @@ export default function OSSBrowser() {
                             lastModified: '',
                             isImage: false
                           })}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') openPrefix(prefix.prefix)
+                          }}
                           onDoubleClick={() => openPrefix(prefix.prefix)}
                         >
-                          <div className="col-span-6 flex items-center gap-2 min-w-0">
+                          <div className="col-span-5 flex items-center gap-2 min-w-0">
                             <Folder className="h-4 w-4 text-primary" />
                             <span className="text-sm truncate">{prefix.name}/</span>
                           </div>
                           <div className="col-span-2 text-xs text-muted-foreground">文件夹</div>
                           <div className="col-span-2 text-xs text-muted-foreground text-right">-</div>
                           <div className="col-span-2 text-xs text-muted-foreground text-right">-</div>
-                        </button>
+                          <div className="col-span-1 text-right">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 px-2"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                openPrefix(prefix.prefix)
+                              }}
+                            >
+                              打开
+                            </Button>
+                          </div>
+                        </div>
                       )
                     })}
 
                     {filteredObjects.map((obj) => {
                       const selected = state.selectedKey === obj.key
                       return (
-                        <button
+                        <div
                           key={obj.key}
+                          role="button"
+                          tabIndex={0}
                           className={`w-full grid grid-cols-12 gap-2 items-center px-3 py-2 text-left hover:bg-accent ${selected ? 'bg-accent/80' : ''}`}
                           onClick={() => selectObject(obj)}
-                          onDoubleClick={async () => {
-                            try {
-                              await openOSSPreviewWindow(obj.key)
-                            } catch (err) {
-                              showToast(`打开预览失败: ${err}`, 'error')
-                            }
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') openPreview(obj.key)
                           }}
+                          onDoubleClick={() => openPreview(obj.key)}
                         >
-                          <div className="col-span-6 flex items-center gap-2 min-w-0">
+                          <div className="col-span-5 flex items-center gap-2 min-w-0">
                             {obj.isImage ? <FileImage className="h-4 w-4 text-primary" /> : <File className="h-4 w-4" />}
                             <span className="text-sm truncate">{obj.name}</span>
                           </div>
@@ -197,7 +224,20 @@ export default function OSSBrowser() {
                           <div className="col-span-2 text-xs text-muted-foreground text-right truncate" title={formatTime(obj.lastModified)}>
                             {formatTime(obj.lastModified)}
                           </div>
-                        </button>
+                          <div className="col-span-1 text-right">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 px-2"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                openPreview(obj.key)
+                              }}
+                            >
+                              预览
+                            </Button>
+                          </div>
+                        </div>
                       )
                     })}
                   </div>
@@ -209,6 +249,40 @@ export default function OSSBrowser() {
                   <Button variant="outline" size="sm" onClick={loadMore} disabled={state.loadingMore}>
                     {state.loadingMore ? '加载中...' : '加载更多'}
                   </Button>
+                </div>
+              )}
+
+              {selectedItem && (
+                <div className="rounded-md border bg-muted/20 p-3 text-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="min-w-0 space-y-1">
+                      <div className="font-medium truncate">
+                        {selectedItem.kind === 'prefix'
+                          ? `${selectedItem.item.name}/`
+                          : selectedItem.item.name}
+                      </div>
+                      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                        <span>{selectedItem.kind === 'prefix' ? '文件夹' : selectedItem.item.isImage ? '图片' : '文件'}</span>
+                        {selectedItem.kind === 'object' && (
+                          <>
+                            <span>{formatBytes(selectedItem.item.size)}</span>
+                            <span>{formatTime(selectedItem.item.lastModified)}</span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    {selectedItem.kind === 'prefix' ? (
+                      <Button size="sm" variant="outline" onClick={() => openPrefix(selectedItem.item.prefix)}>
+                        <Folder className="h-4 w-4 mr-1" />
+                        打开
+                      </Button>
+                    ) : (
+                      <Button size="sm" variant="outline" onClick={() => openPreview(selectedItem.item.key)}>
+                        <Eye className="h-4 w-4 mr-1" />
+                        预览
+                      </Button>
+                    )}
+                  </div>
                 </div>
               )}
             </>

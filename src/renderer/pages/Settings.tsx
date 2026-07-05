@@ -1,10 +1,25 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
-import { TestTube, Plus, X, FolderOpen, Copy, Trash2 } from "lucide-react";
+import {
+  Cloud,
+  FolderOpen,
+  Globe,
+  Plus,
+  Settings as SettingsIcon,
+  TestTube,
+  Trash2,
+  X,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { PageHeader } from "@/components/ui/page-header";
+import { AutoSaveStatusBadge } from "@/components/settings/AutoSaveStatusBadge";
+import { InlineFieldError } from "@/components/settings/InlineFieldError";
+import { SettingsNav } from "@/components/settings/SettingsNav";
+import { SettingsSectionCard } from "@/components/settings/SettingsSectionCard";
 import { PathTree } from "@/components/PathTree";
 import { useSettingsStore } from "@/stores/settings.store";
 import { testOSS, testTencentS3, selectFolder, previewUploadPath } from "@/lib/ipc-client";
@@ -21,6 +36,12 @@ import type { AppSettings, CloudProvider, UploadPathMode, UploadProfile } from "
 import type { UploadPathPreview } from "@shared/upload-profile";
 
 type SettingsSection = "global" | "profiles" | CloudProvider;
+type ProfileSection =
+  | "basic"
+  | "directories"
+  | "paths"
+  | "capabilities"
+  | "preview";
 
 const uploadPathModeOptions: Array<{ value: UploadPathMode; label: string }> = [
   { value: "target-root", label: "上传到目标路径" },
@@ -68,11 +89,15 @@ export default function Settings() {
   const [suffixInput, setSuffixInput] = useState("");
   const [activeSection, setActiveSection] =
     useState<SettingsSection>("global");
+  const [activeProfileSection, setActiveProfileSection] =
+    useState<ProfileSection>("basic");
   const [editingProfileId, setEditingProfileId] = useState(settings.activeProfileId);
+  const [deleteProfileId, setDeleteProfileId] = useState<string | null>(null);
   const [profilePreviewSource, setProfilePreviewSource] = useState("");
   const [profilePreview, setProfilePreview] = useState<UploadPathPreview | null>(null);
   const [profilePreviewLoading, setProfilePreviewLoading] = useState(false);
   const [webhookHeaderDrafts, setWebhookHeaderDrafts] = useState<Record<string, string>>({});
+  const [webhookHeaderErrors, setWebhookHeaderErrors] = useState<Record<string, string>>({});
   const scanDirectoryTrees = useMemo(
     () => ({
       aliyun: buildPathTreeFromPaths(
@@ -290,7 +315,7 @@ export default function Settings() {
     setEditingProfileId(id);
   }, [editingProfile, local.profiles]);
 
-  const handleDeleteProfile = useCallback((profileId: string) => {
+  const performDeleteProfile = useCallback((profileId: string) => {
     setLocal((prev) => {
       if (prev.profiles.length <= 1) return prev;
       const profiles = prev.profiles.filter((profile) => profile.id !== profileId);
@@ -299,6 +324,7 @@ export default function Settings() {
       setEditingProfileId(activeProfileId);
       return { ...prev, profiles, activeProfileId };
     });
+    setDeleteProfileId(null);
   }, []);
 
   const updateProfileProvider = useCallback((
@@ -519,13 +545,9 @@ export default function Settings() {
     const directories = local.scan.providerDirectories?.[provider] ?? [];
 
     return (
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">
-            {CLOUD_PROVIDER_LABELS[provider]}监控目录 ({directories.length})
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
+      <SettingsSectionCard
+        title={`${CLOUD_PROVIDER_LABELS[provider]}监控目录 (${directories.length})`}
+      >
           <p className="text-xs text-muted-foreground">
             根目录下仅自动扫描当天 YYYY-MM-DD 日期目录；旧日期需要手动添加具体工作次目录
           </p>
@@ -562,8 +584,7 @@ export default function Settings() {
               添加目录
             </Button>
           </div>
-        </CardContent>
-      </Card>
+      </SettingsSectionCard>
     );
   };
 
@@ -820,12 +841,18 @@ export default function Settings() {
           <textarea
             value={webhookHeadersText}
             disabled={!webhookEnabled}
-            onChange={(event) =>
+            onChange={(event) => {
               setWebhookHeaderDrafts((prev) => ({
                 ...prev,
                 [profile.id]: event.target.value,
-              }))
-            }
+              }));
+              setWebhookHeaderErrors((prev) => {
+                if (!prev[profile.id]) return prev;
+                const next = { ...prev };
+                delete next[profile.id];
+                return next;
+              });
+            }}
             onBlur={() => {
               try {
                 const headers = parseWebhookHeaders(webhookHeadersText);
@@ -842,16 +869,23 @@ export default function Settings() {
                   delete next[profile.id];
                   return next;
                 });
+                setWebhookHeaderErrors((prev) => {
+                  const next = { ...prev };
+                  delete next[profile.id];
+                  return next;
+                });
               } catch (error) {
-                showToast(
-                  error instanceof Error ? error.message : String(error),
-                  "error",
-                );
+                setWebhookHeaderErrors((prev) => ({
+                  ...prev,
+                  [profile.id]:
+                    error instanceof Error ? error.message : String(error),
+                }));
               }
             }}
             className="mt-1 min-h-20 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono disabled:cursor-not-allowed disabled:opacity-50"
             placeholder='{"Authorization":"Bearer ..."}'
           />
+          <InlineFieldError message={webhookHeaderErrors[profile.id]} />
         </div>
       </div>
     );
@@ -898,6 +932,27 @@ export default function Settings() {
           </div>
 
           <div className="space-y-4">
+            <div className="flex flex-wrap gap-1 rounded-md border bg-muted/30 p-1">
+              {[
+                { id: "basic" as const, label: "基础信息" },
+                { id: "directories" as const, label: "扫描目录" },
+                { id: "paths" as const, label: "上传路径" },
+                { id: "capabilities" as const, label: "项目能力" },
+                { id: "preview" as const, label: "模板预览" },
+              ].map((item) => (
+                <Button
+                  key={item.id}
+                  variant={activeProfileSection === item.id ? "default" : "ghost"}
+                  size="sm"
+                  onClick={() => setActiveProfileSection(item.id)}
+                >
+                  {item.label}
+                </Button>
+              ))}
+            </div>
+
+            {activeProfileSection === "basic" && (
+              <>
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <Label>Profile 名称</Label>
@@ -956,13 +1011,13 @@ export default function Settings() {
                   }))
                 }
               >
-                <Copy className="h-3.5 w-3.5 mr-1" />
+                <SettingsIcon className="h-3.5 w-3.5 mr-1" />
                 设为默认
               </Button>
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => handleDeleteProfile(editingProfile.id)}
+                onClick={() => setDeleteProfileId(editingProfile.id)}
                 disabled={local.profiles.length <= 1}
               >
                 <Trash2 className="h-3.5 w-3.5 mr-1" />
@@ -990,19 +1045,27 @@ export default function Settings() {
                 placeholder=".jpg, .csv, .json"
               />
             </div>
+              </>
+            )}
 
+            {activeProfileSection === "directories" && (
             <div className="grid gap-3">
               {renderProfileDirectories(editingProfile, "aliyun")}
               {renderProfileDirectories(editingProfile, "tencent")}
             </div>
+            )}
 
+            {activeProfileSection === "paths" && (
             <div className="grid gap-3">
               {renderProfileProviderControls(editingProfile, "aliyun")}
               {renderProfileProviderControls(editingProfile, "tencent")}
             </div>
+            )}
 
-            {renderProfileCapabilityControls(editingProfile)}
+            {activeProfileSection === "capabilities" &&
+              renderProfileCapabilityControls(editingProfile)}
 
+            {activeProfileSection === "preview" && (
             <div className="rounded-md border p-3 space-y-3">
               <div>
                 <div className="text-sm font-medium">模板预览</div>
@@ -1046,44 +1109,66 @@ export default function Settings() {
                 </div>
               )}
             </div>
+            )}
           </div>
         </CardContent>
       </Card>
     );
   };
 
+  const settingsNavItems = [
+    {
+      id: "global" as const,
+      label: "全局配置",
+      description: "扫描、上传、过滤和日志",
+      icon: <SettingsIcon className="h-4 w-4" />,
+    },
+    {
+      id: "profiles" as const,
+      label: "项目 Profile",
+      description: "项目目录、路径和能力",
+      icon: <Globe className="h-4 w-4" />,
+    },
+    {
+      id: "aliyun" as const,
+      label: "阿里云",
+      description: "OSS 连接和监控目录",
+      icon: <Cloud className="h-4 w-4" />,
+    },
+    {
+      id: "tencent" as const,
+      label: "腾讯云",
+      description: "TurboS3 连接和监控目录",
+      icon: <Cloud className="h-4 w-4" />,
+    },
+  ];
+  const deleteProfile = local.profiles.find(
+    (profile) => profile.id === deleteProfileId,
+  );
+
   if (loading)
     return <div className="p-6 text-muted-foreground">加载中...</div>;
 
   return (
-    <div className="p-6 space-y-6 max-w-3xl">
-      <div className="flex items-center justify-between">
-        <h1 className="text-xl font-bold">设置</h1>
-        <div className="text-sm text-muted-foreground">
-          {autoSaveState === "saving" && "自动保存中..."}
-          {autoSaveState === "saved" &&
-            (lastSavedAt ? `已自动保存 ${lastSavedAt}` : "已自动保存")}
-          {autoSaveState === "error" && "自动保存失败"}
-        </div>
-      </div>
+    <div className="p-6 space-y-6">
+      <PageHeader
+        title="设置"
+        description="管理扫描、上传目标、项目 Profile 和云端连接。"
+        actions={
+          <AutoSaveStatusBadge
+            state={autoSaveState}
+            lastSavedAt={lastSavedAt}
+          />
+        }
+      />
 
-      <div className="inline-flex rounded-md border p-1 bg-muted/30">
-        {[
-          { id: "global" as const, label: "全局配置" },
-          { id: "profiles" as const, label: "项目 Profile" },
-          { id: "aliyun" as const, label: "阿里云" },
-          { id: "tencent" as const, label: "腾讯云" },
-        ].map((item) => (
-          <Button
-            key={item.id}
-            variant={activeSection === item.id ? "default" : "ghost"}
-            size="sm"
-            onClick={() => setActiveSection(item.id)}
-          >
-            {item.label}
-          </Button>
-        ))}
-      </div>
+      <div className="grid gap-6 lg:grid-cols-[240px,1fr]">
+        <SettingsNav
+          items={settingsNavItems}
+          activeId={activeSection}
+          onChange={setActiveSection}
+        />
+        <div className="min-w-0 space-y-6">
 
       {activeSection === "profiles" && renderProfilesSection()}
 
@@ -1885,6 +1970,27 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
+      )}
+        </div>
+      </div>
+
+      {deleteProfile && (
+        <ConfirmDialog
+          open={Boolean(deleteProfile)}
+          title="删除项目 Profile"
+          description={
+            local.activeProfileId === deleteProfile.id
+              ? `确认删除「${deleteProfile.name}」吗？当前默认 Profile 会自动切换到列表中的第一个 Profile。`
+              : `确认删除「${deleteProfile.name}」吗？已有任务仍保留创建时的 Profile 快照。`
+          }
+          confirmText="删除"
+          cancelText="取消"
+          variant="destructive"
+          onConfirm={() => performDeleteProfile(deleteProfile.id)}
+          onOpenChange={(open) => {
+            if (!open) setDeleteProfileId(null);
+          }}
+        />
       )}
     </div>
   );
