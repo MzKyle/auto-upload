@@ -1,18 +1,26 @@
 import { memo, useEffect, useCallback, useMemo, useState } from "react";
 import {
   CheckSquare,
+  FolderOpen,
   FolderPlus,
   PauseCircle,
   RefreshCw,
   PlayCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { EmptyState } from "@/components/ui/empty-state";
+import { PageHeader } from "@/components/ui/page-header";
+import { Tooltip } from "@/components/ui/tooltip";
+import { BulkActionBar } from "@/components/BulkActionBar";
 import { TaskCard } from "@/components/TaskCard";
+import { TaskDetailDrawer } from "@/components/TaskDetailDrawer";
 import { DataCollectCard } from "@/components/DataCollectCard";
 import { ScanSchedulePanel } from "@/components/ScanSchedulePanel";
 import { DiskUsagePanel } from "@/components/DiskUsagePanel";
 import { DayFolderCard } from "@/components/DayFolderCard";
 import { PathTree } from "@/components/PathTree";
+import { QueueStatusBar } from "@/components/QueueStatusBar";
 import { useTaskStore } from "@/stores/task.store";
 import { useTaskProgress } from "@/hooks/useTaskProgress";
 import { showToast } from "@/components/ui/toast";
@@ -51,6 +59,12 @@ type DashboardTreeItem =
   | { kind: "dayFolder"; dayFolder: DayFolderSummary }
   | { kind: "task"; task: Task };
 
+type ConfirmAction =
+  | { kind: "upload-window"; scope: "selected" | "all-pending" }
+  | { kind: "stop-upload" }
+  | { kind: "ignore-day"; id: string }
+  | { kind: "skip-task"; id: string };
+
 export default function Dashboard() {
   const tasks = useTaskStore((state) => state.tasks);
   const loading = useTaskStore((state) => state.loading);
@@ -72,6 +86,10 @@ export default function Dashboard() {
   );
   const [uploadQueueStatus, setUploadQueueStatus] =
     useState<UploadQueueStatus | null>(null);
+  const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null);
+  const [confirmLoading, setConfirmLoading] = useState(false);
+  const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
+  const [pathPreviewError, setPathPreviewError] = useState<string | null>(null);
 
   useTaskProgress();
 
@@ -148,12 +166,16 @@ export default function Dashboard() {
     const folder = await selectFolder();
     if (folder) {
       const settings = await fetchSettings();
-      setProfiles(settings.profiles.map((profile) => ({
+      const nextProfiles = settings.profiles.map((profile) => ({
         id: profile.id,
         name: profile.name,
         enabled: profile.enabled,
-      })));
-      setSelectedProfileId(settings.activeProfileId);
+      }));
+      const enabledProfile =
+        nextProfiles.find((profile) => profile.id === settings.activeProfileId && profile.enabled) ??
+        nextProfiles.find((profile) => profile.enabled);
+      setProfiles(nextProfiles);
+      setSelectedProfileId(enabledProfile?.id ?? "");
       setPendingFolder(folder);
     }
   }, []);
@@ -161,6 +183,7 @@ export default function Dashboard() {
   useEffect(() => {
     if (!pendingFolder || !selectedProfileId) return;
     setPreviewLoading(true);
+    setPathPreviewError(null);
     previewUploadPath({
       sourcePath: pendingFolder,
       profileId: selectedProfileId,
@@ -168,7 +191,9 @@ export default function Dashboard() {
       .then(setPathPreview)
       .catch((err) => {
         setPathPreview(null);
-        showToast(`路径预览失败: ${err}`, "error");
+        const message = String(err);
+        setPathPreviewError(message);
+        showToast(`路径预览失败: ${message}`, "error");
       })
       .finally(() => setPreviewLoading(false));
   }, [pendingFolder, selectedProfileId]);
@@ -196,6 +221,14 @@ export default function Dashboard() {
     ]);
   }, [loadTasks, provider]);
 
+  const refreshDashboard = useCallback(async () => {
+    await Promise.all([
+      loadTasks(),
+      fetchDayFolders({ limit: 30, provider, includeCompleted: false }).then(setDayFolders),
+      fetchUploadQueueStatus().then(setUploadQueueStatus),
+    ]);
+  }, [loadTasks, provider]);
+
   const handlePause = useCallback(async (taskId: string) => {
     try {
       await pauseTask(taskId);
@@ -214,13 +247,18 @@ export default function Dashboard() {
     }
   }, []);
 
-  const handleCancel = useCallback(async (taskId: string) => {
+  const performCancel = useCallback(async (taskId: string) => {
     try {
       await skipTask(taskId);
+      await refreshDashboard();
       showToast("工作次已跳过", "warning");
     } catch (err) {
       showToast(`跳过失败: ${err}`, "error");
     }
+  }, [refreshDashboard]);
+
+  const handleCancel = useCallback((taskId: string) => {
+    setConfirmAction({ kind: "skip-task", id: taskId });
   }, []);
 
   const handleRestore = useCallback(async (taskId: string) => {
@@ -233,14 +271,17 @@ export default function Dashboard() {
     }
   }, [loadTasks]);
 
-  const handleIgnoreDay = useCallback(async (id: string) => {
-    if (!window.confirm("确认忽略该日期下所有未完成工作次吗？")) return;
+  const performIgnoreDay = useCallback(async (id: string) => {
     await ignoreDayFolder(id);
     await Promise.all([
       loadTasks(),
       fetchDayFolders({ limit: 30, provider, includeCompleted: false }).then(setDayFolders),
     ]);
   }, [loadTasks, provider]);
+
+  const handleIgnoreDay = useCallback((id: string) => {
+    setConfirmAction({ kind: "ignore-day", id });
+  }, []);
 
   const handleRestoreDay = useCallback(async (id: string) => {
     await restoreDayFolder(id);
@@ -262,14 +303,6 @@ export default function Dashboard() {
     }
   }, []);
 
-  const refreshDashboard = useCallback(async () => {
-    await Promise.all([
-      loadTasks(),
-      fetchDayFolders({ limit: 30, provider, includeCompleted: false }).then(setDayFolders),
-      fetchUploadQueueStatus().then(setUploadQueueStatus),
-    ]);
-  }, [loadTasks, provider]);
-
   const toggleTaskSelection = useCallback((taskId: string) => {
     setSelectedTaskIds((current) => {
       const next = new Set(current);
@@ -288,17 +321,10 @@ export default function Dashboard() {
     });
   }, []);
 
-  const handleStartUpload = useCallback(async (
+  const performStartUpload = useCallback(async (
     scope: "selected" | "all-pending",
+    overrideWindow: boolean,
   ) => {
-    const latestStatus = await fetchUploadQueueStatus();
-    let overrideWindow = false;
-    if (!latestStatus.withinUploadWindow) {
-      overrideWindow = window.confirm(
-        "当前不在上传时间窗口内。\n\n确定：立即上传本次优先任务。\n取消：等待时间窗口后再上传。",
-      );
-    }
-
     const status = await startUploadQueue({
       scope,
       taskIds: scope === "selected" ? Array.from(selectedTaskIds) : [],
@@ -318,23 +344,35 @@ export default function Dashboard() {
     );
   }, [refreshDashboard, selectedDayFolderIds, selectedTaskIds]);
 
-  const handleStopUpload = useCallback(async () => {
+  const handleStartUpload = useCallback(async (
+    scope: "selected" | "all-pending",
+  ) => {
+    if (scope === "selected" && selectedTaskIds.size + selectedDayFolderIds.size === 0) {
+      return;
+    }
     const latestStatus = await fetchUploadQueueStatus();
-    const mode =
-      latestStatus.runningTaskIds.length > 0 &&
-      window.confirm(
-        "当前有任务正在上传。\n\n确定：立即暂停正在上传的任务。\n取消：当前任务跑完后停止启动新任务。",
-      )
-        ? "pause-running"
-        : "after-current";
-    const status = await stopUploadQueue({ mode });
+    if (!latestStatus.withinUploadWindow) {
+      setConfirmAction({ kind: "upload-window", scope });
+      return;
+    }
+    await performStartUpload(scope, false);
+  }, [performStartUpload, selectedDayFolderIds.size, selectedTaskIds.size]);
+
+  const performStopUpload = useCallback(async () => {
+    const status = await stopUploadQueue({ mode: "after-current" });
     setUploadQueueStatus(status);
     await refreshDashboard();
-    showToast(
-      mode === "pause-running" ? "上传已暂停" : "已停止启动新上传",
-      "warning",
-    );
+    showToast("已停止启动新上传", "warning");
   }, [refreshDashboard]);
+
+  const handleStopUpload = useCallback(async () => {
+    const latestStatus = await fetchUploadQueueStatus();
+    if (latestStatus.runningTaskIds.length > 0) {
+      setConfirmAction({ kind: "stop-upload" });
+      return;
+    }
+    await performStopUpload();
+  }, [performStopUpload]);
 
   const providerTasks = useMemo(
     () =>
@@ -374,13 +412,124 @@ export default function Dashboard() {
     [dayFolders, providerTasks],
   );
   const hasTaskDirectories = taskDirectoryTree.length > 0;
-  const selectedCount = selectedTaskIds.size + selectedDayFolderIds.size;
-  const queueRunningCount = uploadQueueStatus?.runningTaskIds.length ?? 0;
-  const queueStatusText = uploadQueueStatus?.gateOpen
-    ? uploadQueueStatus.priorityActive
-      ? `优先任务剩余 ${uploadQueueStatus.priorityRemaining}`
-      : "上传队列已开启"
-    : "上传队列已停止";
+  const selectedTaskCount = selectedTaskIds.size;
+  const selectedDayFolderCount = selectedDayFolderIds.size;
+  const selectedCount = selectedTaskCount + selectedDayFolderCount;
+  const enabledProfiles = useMemo(
+    () => profiles.filter((profile) => profile.enabled),
+    [profiles],
+  );
+  const detailTask = useMemo(
+    () => providerTasks.find((task) => task.id === detailTaskId) ?? null,
+    [detailTaskId, providerTasks],
+  );
+  const detailProgress = useTaskStore(
+    useCallback(
+      (state) =>
+        detailTaskId
+          ? state.progress[progressKey(detailTaskId, provider)]
+          : undefined,
+      [detailTaskId, provider],
+    ),
+  );
+
+  const clearSelection = useCallback(() => {
+    setSelectedTaskIds(new Set());
+    setSelectedDayFolderIds(new Set());
+  }, []);
+
+  const openTaskDetail = useCallback((task: Task) => {
+    setDetailTaskId(task.id);
+  }, []);
+
+  const closeAddTaskDialog = useCallback(() => {
+    setPendingFolder(null);
+    setPathPreview(null);
+    setPathPreviewError(null);
+  }, []);
+
+  useEffect(() => {
+    if (!pendingFolder) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeAddTaskDialog();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [closeAddTaskDialog, pendingFolder]);
+
+  const handleConfirmAction = useCallback(async () => {
+    if (!confirmAction) return;
+    setConfirmLoading(true);
+    try {
+      if (confirmAction.kind === "upload-window") {
+        await performStartUpload(confirmAction.scope, true);
+      } else if (confirmAction.kind === "stop-upload") {
+        await performStopUpload();
+      } else if (confirmAction.kind === "ignore-day") {
+        await performIgnoreDay(confirmAction.id);
+      } else if (confirmAction.kind === "skip-task") {
+        await performCancel(confirmAction.id);
+      }
+      setConfirmAction(null);
+    } finally {
+      setConfirmLoading(false);
+    }
+  }, [
+    confirmAction,
+    performCancel,
+    performIgnoreDay,
+    performStartUpload,
+    performStopUpload,
+  ]);
+
+  const confirmDialog = useMemo(() => {
+    if (!confirmAction) return null;
+    if (confirmAction.kind === "upload-window") {
+      return {
+        title: "当前不在上传时间窗内",
+        description:
+          "确认后会立即上传本次任务，并临时覆盖上传时间窗限制。\n取消后不会启动上传。",
+        confirmText: "立即上传",
+        cancelText: "取消",
+        variant: "warning" as const,
+      };
+    }
+    if (confirmAction.kind === "stop-upload") {
+      return {
+        title: "停止上传队列",
+        description:
+          "当前有任务正在上传。确认后将停止启动新的上传任务，正在上传的任务会继续跑完。",
+        confirmText: "停止新上传",
+        cancelText: "取消",
+        variant: "warning" as const,
+      };
+    }
+    if (confirmAction.kind === "ignore-day") {
+      return {
+        title: "忽略该日期目录",
+        description:
+          "确认后，该日期下未完成的工作次会被忽略，不再参与本轮自动上传。之后仍可从日期卡片恢复。",
+        confirmText: "确认忽略",
+        cancelText: "取消",
+        variant: "destructive" as const,
+      };
+    }
+    return {
+      title: "跳过此工作次",
+      description:
+        "确认后，该工作次会从待处理上传中跳过。需要重新监控时可在任务详情中恢复。",
+      confirmText: "确认跳过",
+      cancelText: "取消",
+      variant: "destructive" as const,
+    };
+  }, [confirmAction]);
+  const canCreatePendingTask =
+    Boolean(pendingFolder) &&
+    enabledProfiles.length > 0 &&
+    Boolean(selectedProfileId) &&
+    Boolean(pathPreview) &&
+    !previewLoading &&
+    !pathPreviewError;
 
   useEffect(() => {
     const visibleTaskIds = new Set(providerTasks.map((task) => task.id));
@@ -404,17 +553,11 @@ export default function Dashboard() {
 
   return (
     <div className="p-6 space-y-6">
-      {/* 顶栏 */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="text-xl font-bold">任务面板</h1>
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="mr-1 text-xs text-muted-foreground">
-            {queueStatusText}
-            {queueRunningCount > 0 && ` · 运行中 ${queueRunningCount}`}
-            {uploadQueueStatus && !uploadQueueStatus.withinUploadWindow && (
-              <span> · 时间窗外</span>
-            )}
-          </div>
+      <PageHeader
+        title="任务面板"
+        description="查看上传队列、选择工作次并处理异常任务。"
+        actions={
+          <>
           <Button
             variant="default"
             size="sm"
@@ -424,6 +567,46 @@ export default function Dashboard() {
             <PlayCircle className="h-4 w-4 mr-1" />
             开始选中 ({selectedCount})
           </Button>
+          <Button size="sm" onClick={handleAddFolder}>
+            <FolderPlus className="h-4 w-4 mr-1" />
+            添加文件夹
+          </Button>
+          <Tooltip content="刷新任务和日期目录">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-9 w-9"
+              onClick={handleRefresh}
+              title="刷新任务和日期目录"
+            >
+              <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+            </Button>
+          </Tooltip>
+          </>
+        }
+      />
+
+      <QueueStatusBar
+        status={uploadQueueStatus}
+        provider={provider}
+        taskCount={providerTasks.length}
+        dayFolderCount={dayFolders.length}
+      />
+
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="inline-flex rounded-md border p-1 bg-muted/30">
+          {(["aliyun", "tencent"] as CloudProvider[]).map((item) => (
+            <Button
+              key={item}
+              variant={provider === item ? "default" : "ghost"}
+              size="sm"
+              onClick={() => setProvider(item)}
+            >
+              {item === "aliyun" ? "阿里云" : "腾讯云"}
+            </Button>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
             size="sm"
@@ -440,33 +623,15 @@ export default function Dashboard() {
             <PlayCircle className="h-4 w-4 mr-1" />
             触发扫描
           </Button>
-          <Button size="sm" onClick={handleAddFolder}>
-            <FolderPlus className="h-4 w-4 mr-1" />
-            添加文件夹
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-9 w-9"
-            onClick={handleRefresh}
-          >
-            <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
-          </Button>
         </div>
       </div>
 
-      <div className="inline-flex rounded-md border p-1 bg-muted/30">
-        {(["aliyun", "tencent"] as CloudProvider[]).map((item) => (
-          <Button
-            key={item}
-            variant={provider === item ? "default" : "ghost"}
-            size="sm"
-            onClick={() => setProvider(item)}
-          >
-            {item === "aliyun" ? "阿里云" : "腾讯云"}
-          </Button>
-        ))}
-      </div>
+      <BulkActionBar
+        selectedTaskCount={selectedTaskCount}
+        selectedDayFolderCount={selectedDayFolderCount}
+        onStartSelected={() => handleStartUpload("selected")}
+        onClearSelection={clearSelection}
+      />
 
       {/* 扫描计划面板 */}
       <ScanSchedulePanel />
@@ -550,6 +715,7 @@ export default function Dashboard() {
                             onCancel={handleCancel}
                             onRetry={handleRetry}
                             onRestore={handleRestore}
+                            onOpenDetail={openTaskDetail}
                           />
                         </div>
                       </div>
@@ -565,6 +731,20 @@ export default function Dashboard() {
             </div>
           )}
         </section>
+      )}
+
+      {!hasTaskDirectories && (
+        <EmptyState
+          icon={<FolderOpen className="h-5 w-5" />}
+          title="暂无待处理任务"
+          description="可以手动添加文件夹，或等待扫描器发现当天工作次目录。"
+          action={
+            <Button size="sm" onClick={handleAddFolder}>
+              <FolderPlus className="mr-1 h-4 w-4" />
+              添加文件夹
+            </Button>
+          }
+        />
       )}
 
       {/* 数据采集结果 */}
@@ -585,11 +765,23 @@ export default function Dashboard() {
       )}
 
       {pendingFolder && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
-          <div className="w-full max-w-2xl rounded-lg border bg-background p-5 shadow-lg">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4"
+          role="presentation"
+          onMouseDown={closeAddTaskDialog}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="add-task-dialog-title"
+            className="w-full max-w-2xl rounded-lg border bg-background p-5 shadow-lg"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
             <div className="flex items-start justify-between gap-4">
               <div>
-                <h2 className="text-base font-semibold">添加上传任务</h2>
+                <h2 id="add-task-dialog-title" className="text-base font-semibold">
+                  添加上传任务
+                </h2>
                 <p className="mt-1 text-xs text-muted-foreground break-all">
                   {pendingFolder}
                 </p>
@@ -597,10 +789,7 @@ export default function Dashboard() {
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => {
-                  setPendingFolder(null);
-                  setPathPreview(null);
-                }}
+                onClick={closeAddTaskDialog}
               >
                 取消
               </Button>
@@ -608,19 +797,25 @@ export default function Dashboard() {
 
             <div className="mt-4">
               <label className="text-sm font-medium">项目 Profile</label>
-              <select
-                value={selectedProfileId}
-                onChange={(event) => setSelectedProfileId(event.target.value)}
-                className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-              >
-                {profiles
-                  .filter((profile) => profile.enabled)
-                  .map((profile) => (
+              {enabledProfiles.length === 0 ? (
+                <EmptyState
+                  title="没有可用 Profile"
+                  description="请先在设置中启用至少一个项目 Profile，再创建上传任务。"
+                  className="mt-2 py-8"
+                />
+              ) : (
+                <select
+                  value={selectedProfileId}
+                  onChange={(event) => setSelectedProfileId(event.target.value)}
+                  className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                >
+                  {enabledProfiles.map((profile) => (
                     <option key={profile.id} value={profile.id}>
                       {profile.name}
                     </option>
                   ))}
-              </select>
+                </select>
+              )}
             </div>
 
             <div className="mt-4 rounded-md border bg-muted/20 p-3">
@@ -628,6 +823,19 @@ export default function Dashboard() {
               {previewLoading && (
                 <div className="mt-2 text-xs text-muted-foreground">生成预览中...</div>
               )}
+              {!previewLoading && pathPreviewError && (
+                <div className="mt-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                  {pathPreviewError}
+                </div>
+              )}
+              {!previewLoading &&
+                !pathPreviewError &&
+                enabledProfiles.length > 0 &&
+                !pathPreview && (
+                  <div className="mt-2 text-xs text-muted-foreground">
+                    选择 Profile 后会显示上传对象 Key 预览。
+                  </div>
+                )}
               {!previewLoading && pathPreview && (
                 <div className="mt-3 space-y-3">
                   {pathPreview.providers.map((item) => (
@@ -655,18 +863,12 @@ export default function Dashboard() {
             </div>
 
             <div className="mt-4 flex justify-end gap-2">
-              <Button
-                variant="outline"
-                onClick={() => {
-                  setPendingFolder(null);
-                  setPathPreview(null);
-                }}
-              >
+              <Button variant="outline" onClick={closeAddTaskDialog}>
                 取消
               </Button>
               <Button
                 onClick={handleConfirmAddFolder}
-                disabled={!selectedProfileId || previewLoading}
+                disabled={!canCreatePendingTask}
               >
                 创建任务
               </Button>
@@ -674,6 +876,37 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+
+      {confirmDialog && (
+        <ConfirmDialog
+          open={Boolean(confirmDialog)}
+          title={confirmDialog.title}
+          description={confirmDialog.description}
+          confirmText={confirmDialog.confirmText}
+          cancelText={confirmDialog.cancelText}
+          variant={confirmDialog.variant}
+          loading={confirmLoading}
+          onConfirm={handleConfirmAction}
+          onOpenChange={(open) => {
+            if (!open) setConfirmAction(null);
+          }}
+        />
+      )}
+
+      <TaskDetailDrawer
+        task={detailTask}
+        provider={provider}
+        open={Boolean(detailTask)}
+        progress={detailProgress}
+        onOpenChange={(open) => {
+          if (!open) setDetailTaskId(null);
+        }}
+        onPause={handlePause}
+        onResume={handleResume}
+        onCancel={handleCancel}
+        onRetry={handleRetry}
+        onRestore={handleRestore}
+      />
 
     </div>
   );
@@ -687,6 +920,7 @@ const TaskCardWithProgress = memo(function TaskCardWithProgress({
   onCancel,
   onRetry,
   onRestore,
+  onOpenDetail,
 }: {
   task: Task;
   provider: CloudProvider;
@@ -695,6 +929,7 @@ const TaskCardWithProgress = memo(function TaskCardWithProgress({
   onCancel: (id: string) => void;
   onRetry: (id: string, provider: CloudProvider) => void;
   onRestore: (id: string) => void;
+  onOpenDetail: (task: Task) => void;
 }) {
   const progress = useTaskStore(
     useCallback(
@@ -713,6 +948,7 @@ const TaskCardWithProgress = memo(function TaskCardWithProgress({
       onCancel={onCancel}
       onRetry={onRetry}
       onRestore={onRestore}
+      onOpenDetail={onOpenDetail}
     />
   );
 });
