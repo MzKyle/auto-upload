@@ -4,6 +4,11 @@ import { ExternalLink, Plug, Power, PowerOff, RefreshCw, Settings } from 'lucide
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { EmptyState } from '@/components/ui/empty-state'
+import { LoadingBlock } from '@/components/ui/loading-block'
+import { PageError } from '@/components/ui/page-error'
+import { PageHeader } from '@/components/ui/page-header'
 import { showToast } from '@/components/ui/toast'
 import { fetchProjectCapabilityStatus, fetchSettings, saveSettings } from '@/lib/ipc-client'
 import { providersForMode } from '@shared/cloud-upload'
@@ -51,6 +56,8 @@ export default function Plugins() {
   const [status, setStatus] = useState<ProjectCapabilityStatus | null>(null)
   const [loading, setLoading] = useState(false)
   const [savingExtensionId, setSavingExtensionId] = useState<string | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [confirmOssOpen, setConfirmOssOpen] = useState(false)
 
   const profiles = useMemo(() => settings?.profiles || [], [settings])
   const selectedProfile = useMemo(
@@ -64,12 +71,15 @@ export default function Plugins() {
 
   const load = async (nextProfileId?: string) => {
     setLoading(true)
+    setLoadError(null)
     try {
       const loadedSettings = await fetchSettings()
       setSettings(loadedSettings)
       const id = nextProfileId || profileId || loadedSettings.activeProfileId
       setProfileId(id)
       setStatus(await fetchProjectCapabilityStatus(id))
+    } catch (error) {
+      setLoadError(String(error))
     } finally {
       setLoading(false)
     }
@@ -129,7 +139,7 @@ export default function Plugins() {
     }
   }
 
-  const openOssBrowser = async () => {
+  const openOssBrowser = async (confirmed: boolean = false) => {
     if (!selectedProfileHasAliyun) {
       showToast('OSS 浏览需要当前 Profile 包含阿里云目标', 'warning')
       return
@@ -141,6 +151,10 @@ export default function Plugins() {
     }
 
     const ossStatus = status?.extensions.find((item) => item.manifest.id === EXTENSION_IDS.OSS_BROWSER)
+    if ((!ossStatus?.enabled || settings?.activeProfileId !== profileId) && !confirmed) {
+      setConfirmOssOpen(true)
+      return
+    }
     if (!ossStatus?.enabled || settings?.activeProfileId !== profileId) {
       await updateExtension(EXTENSION_IDS.OSS_BROWSER, true, {
         activateProfile: true,
@@ -156,17 +170,11 @@ export default function Plugins() {
 
   return (
     <div className="p-6 space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="space-y-1">
-          <h1 className="text-xl font-bold flex items-center gap-2">
-            <Plug className="h-5 w-5" />
-            项目能力
-          </h1>
-          <div className="text-sm text-muted-foreground">
-            当前 Profile: {status?.profileName || '-'}
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
+      <PageHeader
+        title="项目能力"
+        description={`当前 Profile: ${status?.profileName || '-'}`}
+        actions={
+          <>
           <select
             className="h-9 rounded-md border bg-background px-3 text-sm"
             value={profileId}
@@ -190,8 +198,43 @@ export default function Plugins() {
             <Settings className="h-4 w-4 mr-1" />
             配置
           </Button>
-        </div>
-      </div>
+          </>
+        }
+      />
+
+      {loadError && (
+        <PageError
+          message={loadError}
+          actions={
+            <Button variant="outline" size="sm" onClick={() => load()}>
+              <RefreshCw className="h-4 w-4 mr-1" />
+              重新加载
+            </Button>
+          }
+        />
+      )}
+
+      {!loadError && selectedProfileHasAliyun && settings && !ossConfigComplete(settings) && (
+        <PageError
+          message="当前 Profile 包含阿里云目标，但阿里云 OSS 连接配置不完整。OSS 浏览工具需要先完善 Region、Bucket 和 AccessKey。"
+          actions={
+            <Button variant="outline" size="sm" onClick={() => navigate('/settings')}>
+              <Settings className="h-4 w-4 mr-1" />
+              去设置
+            </Button>
+          }
+        />
+      )}
+
+      {loading && !status && <LoadingBlock text="正在加载项目能力..." />}
+
+      {!loading && !loadError && !status && (
+        <EmptyState
+          icon={<Plug className="h-5 w-5" />}
+          title="暂无项目能力信息"
+          description="请选择 Profile 或刷新后查看当前项目能力。"
+        />
+      )}
 
       {status?.uploadPipeline && (
         <Card>
@@ -306,6 +349,21 @@ export default function Plugins() {
           </Card>
         ))}
       </div>
+
+      <ConfirmDialog
+        open={confirmOssOpen}
+        title="启用并打开 OSS 浏览"
+        description="将自动启用当前 Profile 的 OSS 浏览工具，并把当前 Profile 设为默认 Profile，然后打开 OSS 浏览页面。"
+        confirmText="启用并打开"
+        cancelText="取消"
+        variant="warning"
+        loading={savingExtensionId === EXTENSION_IDS.OSS_BROWSER}
+        onConfirm={async () => {
+          await openOssBrowser(true)
+          setConfirmOssOpen(false)
+        }}
+        onOpenChange={setConfirmOssOpen}
+      />
     </div>
   )
 }
