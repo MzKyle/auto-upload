@@ -11,6 +11,7 @@ import { testOSS, testTencentS3, selectFolder, previewUploadPath } from "@/lib/i
 import { buildPathTreeFromPaths } from "@/lib/path-tree";
 import { showToast } from "@/components/ui/toast";
 import { CLOUD_PROVIDER_LABELS } from "@shared/constants";
+import { DEFAULT_PROFILE_PLUGINS, PLUGIN_IDS } from "@shared/plugins";
 import type { AppSettings, CloudProvider, UploadPathMode, UploadProfile } from "@shared/types";
 import type { UploadPathPreview } from "@shared/upload-profile";
 
@@ -220,6 +221,7 @@ export default function Settings() {
 
   const handleAddProfile = useCallback(() => {
     const base = editingProfile || local.profiles[0];
+    const basePlugins = base.plugins || DEFAULT_PROFILE_PLUGINS;
     const id = `profile-${Date.now()}`;
     const profile: UploadProfile = {
       ...base,
@@ -242,6 +244,11 @@ export default function Settings() {
       providers: {
         aliyun: { ...base.providers.aliyun },
         tencent: { ...base.providers.tencent },
+      },
+      plugins: {
+        enabledPluginIds: [...basePlugins.enabledPluginIds],
+        order: [...basePlugins.order],
+        configs: JSON.parse(JSON.stringify(basePlugins.configs)),
       },
     };
     setLocal((prev) => ({
@@ -278,6 +285,68 @@ export default function Settings() {
         },
       },
     }));
+  }, [updateProfile]);
+
+  const updateProfilePluginEnabled = useCallback((
+    profileId: string,
+    pluginId: string,
+    enabled: boolean,
+  ) => {
+    updateProfile(profileId, (profile) => {
+      const plugins = profile.plugins || DEFAULT_PROFILE_PLUGINS;
+      const enabledIds = new Set(plugins.enabledPluginIds || []);
+      if (enabled) enabledIds.add(pluginId);
+      else enabledIds.delete(pluginId);
+      const currentConfig =
+        typeof plugins.configs?.[pluginId] === "object" && plugins.configs?.[pluginId] !== null
+          ? plugins.configs[pluginId] as Record<string, unknown>
+          : {};
+
+      return {
+        ...profile,
+        plugins: {
+          enabledPluginIds: Array.from(enabledIds),
+          order: Array.from(new Set([...(plugins.order || []), ...DEFAULT_PROFILE_PLUGINS.order])),
+          configs: {
+            ...DEFAULT_PROFILE_PLUGINS.configs,
+            ...(plugins.configs || {}),
+            [pluginId]: {
+              ...currentConfig,
+              enabled,
+            },
+          },
+        },
+      };
+    });
+  }, [updateProfile]);
+
+  const updateProfilePluginConfig = useCallback((
+    profileId: string,
+    pluginId: string,
+    patch: Record<string, unknown>,
+  ) => {
+    updateProfile(profileId, (profile) => {
+      const plugins = profile.plugins || DEFAULT_PROFILE_PLUGINS;
+      const currentConfig =
+        typeof plugins.configs?.[pluginId] === "object" && plugins.configs?.[pluginId] !== null
+          ? plugins.configs[pluginId] as Record<string, unknown>
+          : {};
+      return {
+        ...profile,
+        plugins: {
+          enabledPluginIds: [...(plugins.enabledPluginIds || [])],
+          order: Array.from(new Set([...(plugins.order || []), ...DEFAULT_PROFILE_PLUGINS.order])),
+          configs: {
+            ...DEFAULT_PROFILE_PLUGINS.configs,
+            ...(plugins.configs || {}),
+            [pluginId]: {
+              ...currentConfig,
+              ...patch,
+            },
+          },
+        },
+      };
+    });
   }, [updateProfile]);
 
   const updateProfileDirectories = useCallback((
@@ -570,6 +639,123 @@ export default function Settings() {
     );
   };
 
+  const renderProfilePluginControls = (profile: UploadProfile) => {
+    const plugins = profile.plugins || DEFAULT_PROFILE_PLUGINS;
+    const enabledIds = new Set(plugins.enabledPluginIds || []);
+    const module1Enabled = enabledIds.has(PLUGIN_IDS.MODULE1_PREUPLOAD);
+    const webhookEnabled = enabledIds.has(PLUGIN_IDS.WEBHOOK_NOTIFIER);
+    const ossBrowserEnabled = enabledIds.has(PLUGIN_IDS.OSS_BROWSER);
+    const module1Config =
+      typeof plugins.configs?.[PLUGIN_IDS.MODULE1_PREUPLOAD] === "object" &&
+      plugins.configs?.[PLUGIN_IDS.MODULE1_PREUPLOAD] !== null
+        ? plugins.configs[PLUGIN_IDS.MODULE1_PREUPLOAD] as Record<string, unknown>
+        : {};
+    const webhookConfig =
+      typeof plugins.configs?.[PLUGIN_IDS.WEBHOOK_NOTIFIER] === "object" &&
+      plugins.configs?.[PLUGIN_IDS.WEBHOOK_NOTIFIER] !== null
+        ? plugins.configs[PLUGIN_IDS.WEBHOOK_NOTIFIER] as Record<string, unknown>
+        : {};
+
+    return (
+      <div className="rounded-md border p-3 space-y-4">
+        <div>
+          <div className="text-sm font-medium">项目插件</div>
+          <div className="text-xs text-muted-foreground mt-1">
+            插件配置随 Profile 保存；任务创建后会冻结当时的插件快照
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <Label>上传模式</Label>
+            <select
+              value={module1Enabled ? "module1" : "generic"}
+              onChange={(event) =>
+                updateProfilePluginEnabled(
+                  profile.id,
+                  PLUGIN_IDS.MODULE1_PREUPLOAD,
+                  event.target.value === "module1",
+                )
+              }
+              className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            >
+              <option value="generic">通用上传</option>
+              <option value="module1">Module1 上传前处理</option>
+            </select>
+          </div>
+          <div>
+            <Label>Module1 Station 前缀</Label>
+            <Input
+              value={String(module1Config.stationPrefix || "station2")}
+              disabled={!module1Enabled}
+              onChange={(event) =>
+                updateProfilePluginConfig(
+                  profile.id,
+                  PLUGIN_IDS.MODULE1_PREUPLOAD,
+                  { stationPrefix: event.target.value },
+                )
+              }
+              className="mt-1"
+            />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={webhookEnabled}
+              onChange={(event) =>
+                updateProfilePluginEnabled(
+                  profile.id,
+                  PLUGIN_IDS.WEBHOOK_NOTIFIER,
+                  event.target.checked,
+                )
+              }
+              className="rounded"
+            />
+            启用 Webhook 通知插件
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={ossBrowserEnabled}
+              onChange={(event) =>
+                updateProfilePluginEnabled(
+                  profile.id,
+                  PLUGIN_IDS.OSS_BROWSER,
+                  event.target.checked,
+                )
+              }
+              className="rounded"
+            />
+            启用 OSS 浏览工具插件
+          </label>
+        </div>
+
+        <div>
+          <Label>Webhook URL</Label>
+          <Input
+            value={String(webhookConfig.url || "")}
+            disabled={!webhookEnabled}
+            onChange={(event) =>
+              updateProfilePluginConfig(
+                profile.id,
+                PLUGIN_IDS.WEBHOOK_NOTIFIER,
+                {
+                  enabled: webhookEnabled,
+                  url: event.target.value,
+                },
+              )
+            }
+            className="mt-1"
+            placeholder="https://example.com/webhook"
+          />
+        </div>
+      </div>
+    );
+  };
+
   const renderProfilesSection = () => {
     if (!editingProfile) return null;
 
@@ -713,6 +899,8 @@ export default function Settings() {
               {renderProfileProviderControls(editingProfile, "aliyun")}
               {renderProfileProviderControls(editingProfile, "tencent")}
             </div>
+
+            {renderProfilePluginControls(editingProfile)}
 
             <div className="rounded-md border p-3 space-y-3">
               <div>

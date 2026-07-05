@@ -63,6 +63,7 @@ function rowToFileDestination(row: Record<string, unknown>): TaskFileDestination
     provider: row.provider as CloudProvider,
     status: row.status as FileStatus,
     objectKey: (row.object_key as string) || null,
+    plannedObjectKey: (row.planned_object_key as string) || null,
     uploadId: (row.upload_id as string) || null,
     errorMessage: (row.error_message as string) || null,
     createdAt: row.created_at as string,
@@ -254,6 +255,33 @@ export class TaskDestinationRepo {
       INNER JOIN task_destinations td ON td.task_id = tf.task_id
       WHERE tf.task_id = ?`
     ).run(now, now, taskId)
+  }
+
+  replacePlannedObjectKeys(
+    taskId: string,
+    plannedKeysByRelativePath: Map<string, string>
+  ): void {
+    const db = getDb()
+    const now = new Date().toISOString()
+    const clear = db.prepare(
+      `UPDATE task_file_destinations
+       SET planned_object_key = NULL, updated_at = ?
+       WHERE task_file_id IN (SELECT id FROM task_files WHERE task_id = ?)`
+    )
+    const update = db.prepare(
+      `UPDATE task_file_destinations
+       SET planned_object_key = ?, updated_at = ?
+       WHERE task_file_id IN (
+         SELECT id FROM task_files WHERE task_id = ? AND relative_path = ?
+       )`
+    )
+    const transaction = db.transaction(() => {
+      clear.run(now, taskId)
+      for (const [relativePath, objectKey] of plannedKeysByRelativePath) {
+        update.run(objectKey, now, taskId, relativePath)
+      }
+    })
+    transaction()
   }
 
   listFileTargets(taskId: string, provider?: CloudProvider): FileDestinationUploadTarget[] {

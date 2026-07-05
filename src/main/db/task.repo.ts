@@ -537,7 +537,7 @@ export class TaskRepo {
 
   reconcileFiles(
     taskId: string,
-    files: Array<{ relativePath: string; size: number; mtimeMs: number }>,
+    files: Array<{ relativePath: string; size: number; mtimeMs: number; plannedObjectKey?: string }>,
     requiredStableChecks: number
   ): {
     changed: boolean
@@ -566,6 +566,7 @@ export class TaskRepo {
       existingRows.map((row) => [row.relative_path as string, rowToTaskFile(row)])
     )
     const seen = new Set<string>()
+    const plannedKeys = new Map<string, string>()
     let changed = false
 
     const insert = db.prepare(
@@ -612,6 +613,9 @@ export class TaskRepo {
     const transaction = db.transaction(() => {
       for (const file of files) {
         seen.add(file.relativePath)
+        if (file.plannedObjectKey) {
+          plannedKeys.set(file.relativePath, file.plannedObjectKey)
+        }
         const current = existing.get(file.relativePath)
         if (!current) {
           insert.run(
@@ -655,6 +659,7 @@ export class TaskRepo {
     })
     transaction()
     getTaskDestinationRepo().ensureForTaskFiles(taskId)
+    getTaskDestinationRepo().replacePlannedObjectKeys(taskId, plannedKeys)
 
     const counts = db.prepare(
       `SELECT

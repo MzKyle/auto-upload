@@ -16,6 +16,7 @@ import {
 import { getSettingsRepo } from '../db/settings.repo'
 import { getCloudUploadService } from './cloud-upload.service'
 import type { CloudTaskUploader } from './cloud-upload.types'
+import { getPluginRuntimeService } from './plugin-runtime.service'
 import { FileFilterService } from './file-filter.service'
 import { writeProcessTask } from '../utils/marker-file'
 import { SpeedCalculator } from '../utils/speed-calculator'
@@ -23,6 +24,7 @@ import { getUploadSemaphore } from '../utils/upload-semaphore'
 import type {
   CloudProvider,
   ProcessTaskMarker,
+  PreUploadResult,
   Task,
   TaskProgress,
   TaskStatus
@@ -74,7 +76,19 @@ export class TaskRunnerService {
       return 'skipped'
     }
 
-    await this.reconcileBeforeUpload(task, stableChecks)
+    const preUploadResult = await getPluginRuntimeService().runPreUploadPlugins(task)
+    const uploadRootPath = preUploadResult?.uploadRootPath || task.folderPath
+    if (!existsSync(uploadRootPath)) {
+      throw new Error('上传工作目录不存在')
+    }
+
+    const requiredStableChecks = preUploadResult ? 1 : stableChecks
+    await this.reconcileBeforeUpload(
+      task,
+      requiredStableChecks,
+      uploadRootPath,
+      preUploadResult
+    )
     const destinations = destinationRepo.listByTask(task.id)
     if (destinations.length === 0) {
       throw new Error('任务没有配置任何上传目标')
@@ -82,7 +96,7 @@ export class TaskRunnerService {
 
     const jobs = destinationRepo.listReadyFileTargets(
       task.id,
-      stableChecks
+      requiredStableChecks
     )
     if (jobs.length === 0) {
       taskRepo.recalculateProgress(task.id)
@@ -183,6 +197,7 @@ export class TaskRunnerService {
           runtimes,
           semaphore,
           logicalProgress,
+          uploadRootPath,
           signal
         )
       }
@@ -219,19 +234,28 @@ export class TaskRunnerService {
 
   private async reconcileBeforeUpload(
     task: Task,
-    stableChecks: number
+    stableChecks: number,
+    uploadRootPath: string,
+    preUploadResult: PreUploadResult | null
   ): Promise<void> {
     const settings = getSettingsRepo().getAll()
-    const files = await new FileFilterService(task.profileSnapshot?.filter || settings.filter).scanFolderAsync(
-      task.folderPath
-    )
-    getTaskRepo().reconcileFiles(
-      task.id,
-      files.map((file) => ({
+    const files = preUploadResult
+      ? preUploadResult.files.map((file) => ({
+        relativePath: file.relativePath,
+        size: file.fileSize,
+        mtimeMs: file.mtimeMs,
+        plannedObjectKey: file.plannedObjectKey
+      }))
+      : (await new FileFilterService(task.profileSnapshot?.filter || settings.filter).scanFolderAsync(
+        uploadRootPath
+      )).map((file) => ({
         relativePath: file.relativePath,
         size: file.size,
         mtimeMs: file.mtimeMs
-      })),
+      }))
+    getTaskRepo().reconcileFiles(
+      task.id,
+      files,
       stableChecks
     )
   }
@@ -250,7 +274,8 @@ export class TaskRunnerService {
       const objectKey = this.renderTaskObjectKey(
         task,
         destination,
-        target.relativePath
+        target.relativePath,
+        target.plannedObjectKey
       )
       const providerKeys = keysByProvider.get(target.provider) || new Map()
       const existing = providerKeys.get(objectKey)
@@ -267,8 +292,10 @@ export class TaskRunnerService {
   private renderTaskObjectKey(
     task: Task,
     destination: Task['destinations'][number],
-    relativePath: string
+    relativePath: string,
+    plannedObjectKey?: string | null
   ): string {
+    if (plannedObjectKey) return plannedObjectKey
     return renderObjectKey(
       {
         provider: destination.provider,
@@ -335,6 +362,7 @@ export class TaskRunnerService {
     runtimes: Map<CloudProvider, ProviderRuntime>,
     semaphore: ReturnType<typeof getUploadSemaphore>,
     logicalProgress: LogicalProgress,
+    uploadRootPath: string,
     signal?: AbortSignal
   ): Promise<void> {
     const taskRepo = getTaskRepo()
@@ -345,7 +373,7 @@ export class TaskRunnerService {
     )
     if (!runtime || !destination) return
 
-    const localPath = join(task.folderPath, target.relativePath)
+    const localPath = join(uploadRootPath, target.relativePath)
     if (!existsSync(localPath)) {
       destinationRepo.updateFileStatus(
         target.id,
@@ -392,7 +420,12 @@ export class TaskRunnerService {
         true
       )
 
-      const objectKey = this.renderTaskObjectKey(task, destination, target.relativePath)
+      const objectKey = this.renderTaskObjectKey(
+        task,
+        destination,
+        target.relativePath,
+        target.plannedObjectKey
+      )
       let previousLoaded = 0
       const result = await runtime.uploader.uploadFile(
         localPath,

@@ -112,6 +112,7 @@ export interface TaskFileDestination {
   provider: CloudProvider
   status: FileStatus
   objectKey: string | null
+  plannedObjectKey: string | null
   uploadId: string | null
   errorMessage: string | null
   createdAt: string
@@ -304,12 +305,72 @@ export interface UploadProfile {
   filter: FilterRules
   scan: UploadProfileScanConfig
   providers: Record<CloudProvider, UploadProfileProviderConfig>
+  plugins?: ProfilePluginConfig
 }
 
 export interface WebhookConfig {
   url: string
   headers: Record<string, string>
   enabled: boolean
+}
+
+export type PluginCategory = 'preUpload' | 'notification' | 'tool'
+export type PluginRunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped'
+
+export interface PluginManifest {
+  id: string
+  name: string
+  version: string
+  category: PluginCategory
+  description: string
+}
+
+export interface ProfilePluginConfig {
+  enabledPluginIds: string[]
+  order: string[]
+  configs: Record<string, unknown>
+}
+
+export interface PreUploadFilePlan {
+  relativePath: string
+  fileSize: number
+  mtimeMs: number
+  plannedObjectKey?: string
+}
+
+export interface PreUploadResult {
+  pluginId: string
+  uploadRootPath: string
+  files: PreUploadFilePlan[]
+  summary?: Record<string, unknown>
+  artifacts?: Record<string, unknown>
+}
+
+export interface TaskPluginRun {
+  id: string
+  taskId: string
+  pluginId: string
+  category: PluginCategory
+  status: PluginRunStatus
+  startedAt: string
+  completedAt: string | null
+  errorMessage: string | null
+  summary: Record<string, unknown> | null
+  stagingPath: string | null
+  artifacts: Record<string, unknown> | null
+}
+
+export interface PluginProfileStatusItem {
+  manifest: PluginManifest
+  enabled: boolean
+  configSummary: string
+  lastRun: TaskPluginRun | null
+}
+
+export interface PluginProfileStatus {
+  profileId: string
+  profileName: string
+  plugins: PluginProfileStatusItem[]
 }
 
 export interface ScanConfig {
@@ -412,6 +473,13 @@ export interface DataCollectInfo {
   controlCmd: { speedRows: number; freqRows: number }
   pointCloudCount: number
   depthImageCount: number
+  annotation: {
+    hasXml: boolean
+    dataType: string | null
+    qualityType: string | null
+    specMin: number | null
+    specMax: number | null
+  }
   totalFileCount: number
   totalSizeBytes: number
   collectedAt: string
@@ -543,4 +611,47 @@ export interface DiskUsageInfo {
   freeBytes: number
   usedBytes: number
   usagePercent: number
+}
+
+// ---- OSS 浏览（只读工具插件） ----
+export interface OSSListQuery {
+  prefix?: string
+  continuationToken?: string
+  maxKeys?: number
+}
+
+export interface OSSPrefixItem {
+  prefix: string
+  name: string
+}
+
+export interface OSSObjectItem {
+  key: string
+  name: string
+  size: number
+  lastModified: string
+  contentType?: string
+  isImage: boolean
+}
+
+export interface OSSListResult {
+  effectivePrefix: string
+  prefixes: OSSPrefixItem[]
+  objects: OSSObjectItem[]
+  nextContinuationToken?: string
+  isTruncated: boolean
+}
+
+export interface OSSObjectHead {
+  key: string
+  size: number
+  lastModified: string
+  contentType?: string
+  etag?: string
+}
+
+export interface OSSImageResult {
+  dataUrl: string
+  contentType: string
+  size: number
 }

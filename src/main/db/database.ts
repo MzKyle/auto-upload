@@ -130,6 +130,7 @@ export function runMigrations(db: Database.Database): void {
       provider TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending',
       object_key TEXT,
+      planned_object_key TEXT,
       upload_id TEXT,
       error_message TEXT,
       created_at TEXT NOT NULL,
@@ -146,6 +147,24 @@ export function runMigrations(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_task_file_destinations_task_file_id ON task_file_destinations(task_file_id);
     CREATE INDEX IF NOT EXISTS idx_task_file_destinations_destination_id ON task_file_destinations(task_destination_id);
     CREATE INDEX IF NOT EXISTS idx_day_folders_status ON day_folders(status);
+
+    CREATE TABLE IF NOT EXISTS task_plugin_runs (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      plugin_id TEXT NOT NULL,
+      category TEXT NOT NULL,
+      status TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      error_message TEXT,
+      summary_json TEXT,
+      staging_path TEXT,
+      artifacts_json TEXT,
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_task_plugin_runs_task_id ON task_plugin_runs(task_id);
+    CREATE INDEX IF NOT EXISTS idx_task_plugin_runs_plugin_status ON task_plugin_runs(plugin_id, status);
 
     CREATE TABLE IF NOT EXISTS ssh_machines (
       id TEXT PRIMARY KEY,
@@ -222,6 +241,12 @@ export function runMigrations(db: Database.Database): void {
   if (!taskDestinationColumns.some((c) => c.name === 'object_key_template')) {
     db.exec(`ALTER TABLE task_destinations ADD COLUMN object_key_template TEXT`)
     log.info('迁移: task_destinations 表添加 object_key_template 列')
+  }
+
+  const taskFileDestinationColumns = db.pragma('table_info(task_file_destinations)') as Array<{ name: string }>
+  if (!taskFileDestinationColumns.some((c) => c.name === 'planned_object_key')) {
+    db.exec(`ALTER TABLE task_file_destinations ADD COLUMN planned_object_key TEXT`)
+    log.info('迁移: task_file_destinations 表添加 planned_object_key 列')
   }
 
   const dayFolderColumns = db.pragma('table_info(day_folders)') as Array<{ name: string }>

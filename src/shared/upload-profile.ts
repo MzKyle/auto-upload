@@ -1,6 +1,7 @@
 import { DEFAULT_SETTINGS, DEFAULT_UPLOAD_PROFILE_ID, DEFAULT_WORK_DIR_NAME_PATTERN } from './constants'
 import { buildOssKey, joinOssPath } from './day-folder'
 import { modeForProviders, providersForMode, type UploadTargetSnapshot } from './cloud-upload'
+import { DEFAULT_PROFILE_PLUGINS, PLUGIN_IDS, isBuiltinPluginId } from './plugins'
 import {
   normalizeProviderDirectories,
   normalizeScanConfig
@@ -15,6 +16,7 @@ import type {
   AppSettings,
   CloudProvider,
   FilterRules,
+  ProfilePluginConfig,
   UploadPathMode,
   UploadProfile,
   UploadProfileProviderConfig,
@@ -324,7 +326,8 @@ function createDefaultProfileFromSettings(settings: Partial<AppSettings>): Uploa
         pathSegmentCount: settings.tencentS3?.pathSegmentCount,
         objectKeyTemplate: DEFAULT_OBJECT_KEY_TEMPLATE
       })
-    }
+    },
+    plugins: normalizeProfilePlugins(undefined, buildDefaultPluginsFromSettings(settings))
   }
 }
 
@@ -365,8 +368,99 @@ function normalizeProfile(rawProfile: unknown, fallback: UploadProfile): UploadP
         isRecord(rawProviders.tencent) ? rawProviders.tencent : {},
         fallback.providers.tencent
       )
+    },
+    plugins: normalizeProfilePlugins(raw.plugins, fallback.plugins)
+  }
+}
+
+export function normalizeProfilePlugins(
+  rawPlugins: unknown,
+  fallback: ProfilePluginConfig = DEFAULT_PROFILE_PLUGINS
+): ProfilePluginConfig {
+  const raw = isRecord(rawPlugins) ? rawPlugins : {}
+  const fallbackEnabled = Array.isArray(fallback.enabledPluginIds)
+    ? fallback.enabledPluginIds
+    : []
+  const rawEnabled = Array.isArray(raw.enabledPluginIds)
+    ? raw.enabledPluginIds
+    : fallbackEnabled
+  const enabledPluginIds = normalizePluginIdArray(rawEnabled)
+
+  const fallbackOrder = Array.isArray(fallback.order)
+    ? fallback.order
+    : DEFAULT_PROFILE_PLUGINS.order
+  const rawOrder = Array.isArray(raw.order) ? raw.order : fallbackOrder
+  const order = normalizePluginIdArray([
+    ...rawOrder,
+    ...DEFAULT_PROFILE_PLUGINS.order,
+    ...enabledPluginIds
+  ])
+
+  const fallbackConfigs = isRecord(fallback.configs)
+    ? fallback.configs
+    : DEFAULT_PROFILE_PLUGINS.configs
+  const rawConfigs = isRecord(raw.configs) ? raw.configs : {}
+
+  return {
+    enabledPluginIds,
+    order,
+    configs: mergePluginConfigs(fallbackConfigs, rawConfigs)
+  }
+}
+
+function buildDefaultPluginsFromSettings(settings: Partial<AppSettings>): ProfilePluginConfig {
+  const plugins = cloneProfilePlugins(DEFAULT_PROFILE_PLUGINS)
+  if (settings.webhook?.enabled) {
+    plugins.enabledPluginIds = normalizePluginIdArray([
+      ...plugins.enabledPluginIds,
+      PLUGIN_IDS.WEBHOOK_NOTIFIER
+    ])
+    plugins.configs[PLUGIN_IDS.WEBHOOK_NOTIFIER] = {
+      ...pluginConfigRecord(plugins.configs[PLUGIN_IDS.WEBHOOK_NOTIFIER]),
+      ...settings.webhook
     }
   }
+  return plugins
+}
+
+function cloneProfilePlugins(value: ProfilePluginConfig): ProfilePluginConfig {
+  return {
+    enabledPluginIds: [...value.enabledPluginIds],
+    order: [...value.order],
+    configs: JSON.parse(JSON.stringify(value.configs)) as Record<string, unknown>
+  }
+}
+
+function normalizePluginIdArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return Array.from(
+    new Set(
+      value
+        .map((item) => String(item).trim())
+        .filter((item) => item && isBuiltinPluginId(item))
+    )
+  )
+}
+
+function mergePluginConfigs(
+  fallbackConfigs: Record<string, unknown>,
+  rawConfigs: Record<string, unknown>
+): Record<string, unknown> {
+  const configs: Record<string, unknown> = JSON.parse(
+    JSON.stringify(DEFAULT_PROFILE_PLUGINS.configs)
+  ) as Record<string, unknown>
+  for (const id of DEFAULT_PROFILE_PLUGINS.order) {
+    configs[id] = {
+      ...pluginConfigRecord(configs[id]),
+      ...pluginConfigRecord(fallbackConfigs[id]),
+      ...pluginConfigRecord(rawConfigs[id])
+    }
+  }
+  return configs
+}
+
+function pluginConfigRecord(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {}
 }
 
 function normalizeProfileProviderConfig(

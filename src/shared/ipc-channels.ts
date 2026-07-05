@@ -50,6 +50,17 @@ export const IPC = {
   SETTINGS_TEST_TENCENT_S3: 'settings:test-tencent-s3',
   UPLOAD_PATH_PREVIEW: 'upload:path-preview',
 
+  // 项目插件
+  PLUGIN_LIST: 'plugin:list',
+  PLUGIN_PROFILE_STATUS: 'plugin:profile-status',
+  PLUGIN_TASK_RUNS: 'plugin:task-runs',
+
+  // OSS 浏览器工具插件
+  OSS_BROWSER_LIST: 'oss-browser:list',
+  OSS_BROWSER_HEAD: 'oss-browser:head',
+  OSS_BROWSER_GET_IMAGE: 'oss-browser:get-image',
+  OSS_BROWSER_OPEN_PREVIEW_WINDOW: 'oss-browser:open-preview-window',
+
   // SSH / rsync
   SSH_LIST_MACHINES: 'ssh:list-machines',
   SSH_ADD_MACHINE: 'ssh:add-machine',

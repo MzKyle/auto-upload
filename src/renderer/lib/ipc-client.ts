@@ -4,7 +4,8 @@ import type {
   SSHMachine, SSHMachineInput, ScannerStatus, DataCollectInfo, DiskUsageInfo,
   DayFolderSummary, DayFolderListQuery, CloudProvider, MultiCloudOperationResult,
   TaskDetail, TaskListQuery, UploadQueueStartInput, UploadQueueStatus,
-  UploadQueueStopInput
+  UploadQueueStopInput, PluginManifest, PluginProfileStatus, TaskPluginRun,
+  OSSListQuery, OSSListResult, OSSObjectHead, OSSImageResult
 } from '@shared/types'
 import type { UploadPathPreview } from '@shared/upload-profile'
 
@@ -126,6 +127,36 @@ export async function previewUploadPath(input: {
   sampleFiles?: string[]
 }): Promise<UploadPathPreview> {
   return (await api.invoke(IPC.UPLOAD_PATH_PREVIEW, input)) as UploadPathPreview
+}
+
+// ---- 项目插件 ----
+export async function fetchPlugins(): Promise<PluginManifest[]> {
+  return (await api.invoke(IPC.PLUGIN_LIST)) as PluginManifest[]
+}
+
+export async function fetchPluginProfileStatus(profileId?: string): Promise<PluginProfileStatus> {
+  return (await api.invoke(IPC.PLUGIN_PROFILE_STATUS, { profileId })) as PluginProfileStatus
+}
+
+export async function fetchTaskPluginRuns(taskId: string): Promise<TaskPluginRun[]> {
+  return (await api.invoke(IPC.PLUGIN_TASK_RUNS, { taskId })) as TaskPluginRun[]
+}
+
+// ---- OSS 浏览（只读工具插件） ----
+export async function listOSSObjects(query: OSSListQuery): Promise<OSSListResult> {
+  return (await api.invoke(IPC.OSS_BROWSER_LIST, query)) as OSSListResult
+}
+
+export async function headOSSObject(key: string): Promise<OSSObjectHead> {
+  return (await api.invoke(IPC.OSS_BROWSER_HEAD, { key })) as OSSObjectHead
+}
+
+export async function getOSSImagePreview(key: string, maxBytes?: number): Promise<OSSImageResult> {
+  return (await api.invoke(IPC.OSS_BROWSER_GET_IMAGE, { key, maxBytes })) as OSSImageResult
+}
+
+export async function openOSSPreviewWindow(key: string): Promise<void> {
+  await api.invoke(IPC.OSS_BROWSER_OPEN_PREVIEW_WINDOW, { key })
 }
 
 // ---- SSH ----

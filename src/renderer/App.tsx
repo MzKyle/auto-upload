@@ -5,16 +5,21 @@ import {
   NavLink,
   Outlet,
 } from "react-router-dom";
-import { LayoutDashboard, Settings, Clock, Server } from "lucide-react";
+import { Cloud, LayoutDashboard, Plug, Settings, Clock, Server } from "lucide-react";
 import { ToastContainer } from "@/components/ui/toast";
 import Dashboard from "@/pages/Dashboard";
 import SettingsPage from "@/pages/Settings";
 import History from "@/pages/History";
 import SSHMachines from "@/pages/SSHMachines";
+import Plugins from "@/pages/Plugins";
+import OSSBrowser from "@/pages/OSSBrowser";
+import OSSPreviewWindow from "@/pages/OSSPreviewWindow";
 
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "任务面板" },
   { to: "/settings", icon: Settings, label: "设置" },
+  { to: "/plugins", icon: Plug, label: "项目插件" },
+  { to: "/oss-browser", icon: Cloud, label: "OSS 浏览" },
   { to: "/history", icon: Clock, label: "历史记录" },
   { to: "/ssh", icon: Server, label: "远程机器" },
 ];
@@ -66,9 +71,12 @@ export default function App() {
         <Route element={<MainLayout />}>
           <Route path="/" element={<Dashboard />} />
           <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/plugins" element={<Plugins />} />
+          <Route path="/oss-browser" element={<OSSBrowser />} />
           <Route path="/history" element={<History />} />
           <Route path="/ssh" element={<SSHMachines />} />
         </Route>
+        <Route path="/oss-preview" element={<OSSPreviewWindow />} />
       </Routes>
     </HashRouter>
   );
