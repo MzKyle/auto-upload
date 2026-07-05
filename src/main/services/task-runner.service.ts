@@ -16,16 +16,15 @@ import {
 import { getSettingsRepo } from '../db/settings.repo'
 import { getCloudUploadService } from './cloud-upload.service'
 import type { CloudTaskUploader } from './cloud-upload.types'
-import { getPluginRuntimeService } from './plugin-runtime.service'
-import { FileFilterService } from './file-filter.service'
+import { getUploadPipelineRuntimeService } from './upload-pipeline-runtime.service'
 import { writeProcessTask } from '../utils/marker-file'
 import { SpeedCalculator } from '../utils/speed-calculator'
 import { getUploadSemaphore } from '../utils/upload-semaphore'
 import type {
   CloudProvider,
   ProcessTaskMarker,
-  PreUploadResult,
   Task,
+  UploadPipelineResult,
   TaskProgress,
   TaskStatus
 } from '@shared/types'
@@ -76,18 +75,20 @@ export class TaskRunnerService {
       return 'skipped'
     }
 
-    const preUploadResult = await getPluginRuntimeService().runPreUploadPlugins(task)
-    const uploadRootPath = preUploadResult?.uploadRootPath || task.folderPath
+    const uploadPlan = await getUploadPipelineRuntimeService().prepareUploadPlan(
+      task,
+      stableChecks
+    )
+    const uploadRootPath = uploadPlan.uploadRootPath
     if (!existsSync(uploadRootPath)) {
       throw new Error('上传工作目录不存在')
     }
 
-    const requiredStableChecks = preUploadResult ? 1 : stableChecks
+    const requiredStableChecks = uploadPlan.requiredStableChecks
     await this.reconcileBeforeUpload(
       task,
       requiredStableChecks,
-      uploadRootPath,
-      preUploadResult
+      uploadPlan
     )
     const destinations = destinationRepo.listByTask(task.id)
     if (destinations.length === 0) {
@@ -235,23 +236,14 @@ export class TaskRunnerService {
   private async reconcileBeforeUpload(
     task: Task,
     stableChecks: number,
-    uploadRootPath: string,
-    preUploadResult: PreUploadResult | null
+    uploadPlan: UploadPipelineResult
   ): Promise<void> {
-    const settings = getSettingsRepo().getAll()
-    const files = preUploadResult
-      ? preUploadResult.files.map((file) => ({
+    const files =
+      uploadPlan.files.map((file) => ({
         relativePath: file.relativePath,
         size: file.fileSize,
         mtimeMs: file.mtimeMs,
         plannedObjectKey: file.plannedObjectKey
-      }))
-      : (await new FileFilterService(task.profileSnapshot?.filter || settings.filter).scanFolderAsync(
-        uploadRootPath
-      )).map((file) => ({
-        relativePath: file.relativePath,
-        size: file.size,
-        mtimeMs: file.mtimeMs
       }))
     getTaskRepo().reconcileFiles(
       task.id,

@@ -4,8 +4,8 @@ import { Plug, RefreshCw, Settings } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { fetchPluginProfileStatus, fetchSettings } from '@/lib/ipc-client'
-import type { AppSettings, PluginProfileStatus } from '@shared/types'
+import { fetchProjectCapabilityStatus, fetchSettings } from '@/lib/ipc-client'
+import type { AppSettings, ProjectCapabilityStatus } from '@shared/types'
 
 function formatTime(value: string | null): string {
   if (!value) return '-'
@@ -15,7 +15,7 @@ function formatTime(value: string | null): string {
 }
 
 function categoryLabel(category: string): string {
-  if (category === 'preUpload') return '上传前处理'
+  if (category === 'pipeline') return '上传流程'
   if (category === 'notification') return '通知'
   if (category === 'tool') return '工具'
   return category
@@ -32,7 +32,7 @@ export default function Plugins() {
   const navigate = useNavigate()
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [profileId, setProfileId] = useState('')
-  const [status, setStatus] = useState<PluginProfileStatus | null>(null)
+  const [status, setStatus] = useState<ProjectCapabilityStatus | null>(null)
   const [loading, setLoading] = useState(false)
 
   const profiles = useMemo(() => settings?.profiles || [], [settings])
@@ -44,7 +44,7 @@ export default function Plugins() {
       setSettings(loadedSettings)
       const id = nextProfileId || profileId || loadedSettings.activeProfileId
       setProfileId(id)
-      setStatus(await fetchPluginProfileStatus(id))
+      setStatus(await fetchProjectCapabilityStatus(id))
     } finally {
       setLoading(false)
     }
@@ -60,7 +60,7 @@ export default function Plugins() {
         <div className="space-y-1">
           <h1 className="text-xl font-bold flex items-center gap-2">
             <Plug className="h-5 w-5" />
-            项目插件
+            项目能力
           </h1>
           <div className="text-sm text-muted-foreground">
             当前 Profile: {status?.profileName || '-'}
@@ -93,8 +93,50 @@ export default function Plugins() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {(status?.plugins || []).map((item) => (
+      {status?.uploadPipeline && (
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex items-start justify-between gap-3">
+              <CardTitle className="text-base leading-6">
+                {status.uploadPipeline.manifest.name}
+              </CardTitle>
+              <Badge variant="success">当前流程</Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm">
+            <div className="flex items-center gap-2">
+              <Badge variant="outline">{categoryLabel(status.uploadPipeline.manifest.category)}</Badge>
+              <span className="text-xs text-muted-foreground">v{status.uploadPipeline.manifest.version}</span>
+            </div>
+            <p className="text-muted-foreground">{status.uploadPipeline.manifest.description}</p>
+            <div className="text-xs border rounded-md px-3 py-2 bg-muted/30">
+              配置摘要: {status.uploadPipeline.configSummary || '-'}
+            </div>
+            <div className="text-xs text-muted-foreground space-y-1">
+              <div>
+                最近运行:{' '}
+                {status.uploadPipeline.lastRun ? (
+                  <Badge variant={statusVariant(status.uploadPipeline.lastRun.status)}>
+                    {status.uploadPipeline.lastRun.status}
+                  </Badge>
+                ) : (
+                  '-'
+                )}
+              </div>
+              <div>开始时间: {formatTime(status.uploadPipeline.lastRun?.startedAt || null)}</div>
+              <div>结束时间: {formatTime(status.uploadPipeline.lastRun?.completedAt || null)}</div>
+              {status.uploadPipeline.lastRun?.errorMessage && (
+                <div className="text-destructive break-all">
+                  {status.uploadPipeline.lastRun.errorMessage}
+                </div>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {(status?.extensions || []).map((item) => (
           <Card key={item.manifest.id}>
             <CardHeader className="pb-3">
               <div className="flex items-start justify-between gap-3">

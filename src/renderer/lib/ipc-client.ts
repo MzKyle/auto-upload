@@ -4,7 +4,8 @@ import type {
   SSHMachine, SSHMachineInput, ScannerStatus, DataCollectInfo, DiskUsageInfo,
   DayFolderSummary, DayFolderListQuery, CloudProvider, MultiCloudOperationResult,
   TaskDetail, TaskListQuery, UploadQueueStartInput, UploadQueueStatus,
-  UploadQueueStopInput, PluginManifest, PluginProfileStatus, TaskPluginRun,
+  UploadQueueStopInput, PluginManifest, PluginProfileStatus, ProjectCapabilityStatus, TaskPluginRun,
+  UploadPipelineManifest,
   OSSListQuery, OSSListResult, OSSObjectHead, OSSImageResult
 } from '@shared/types'
 import type { UploadPathPreview } from '@shared/upload-profile'
@@ -130,6 +131,24 @@ export async function previewUploadPath(input: {
 }
 
 // ---- 项目插件 ----
+export async function fetchCapabilities(): Promise<{
+  uploadPipelines: UploadPipelineManifest[]
+  extensions: PluginManifest[]
+}> {
+  return (await api.invoke(IPC.CAPABILITY_LIST)) as {
+    uploadPipelines: UploadPipelineManifest[]
+    extensions: PluginManifest[]
+  }
+}
+
+export async function fetchProjectCapabilityStatus(profileId?: string): Promise<ProjectCapabilityStatus> {
+  return (await api.invoke(IPC.CAPABILITY_PROFILE_STATUS, { profileId })) as ProjectCapabilityStatus
+}
+
+export async function fetchCapabilityRuns(taskId: string): Promise<TaskPluginRun[]> {
+  return (await api.invoke(IPC.CAPABILITY_TASK_RUNS, { taskId })) as TaskPluginRun[]
+}
+
 export async function fetchPlugins(): Promise<PluginManifest[]> {
   return (await api.invoke(IPC.PLUGIN_LIST)) as PluginManifest[]
 }

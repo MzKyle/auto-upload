@@ -51,6 +51,9 @@ export const IPC = {
   UPLOAD_PATH_PREVIEW: 'upload:path-preview',
 
   // 项目插件
+  CAPABILITY_LIST: 'capability:list',
+  CAPABILITY_PROFILE_STATUS: 'capability:profile-status',
+  CAPABILITY_TASK_RUNS: 'capability:task-runs',
   PLUGIN_LIST: 'plugin:list',
   PLUGIN_PROFILE_STATUS: 'plugin:profile-status',
   PLUGIN_TASK_RUNS: 'plugin:task-runs',

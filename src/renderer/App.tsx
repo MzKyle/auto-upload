@@ -18,7 +18,7 @@ import OSSPreviewWindow from "@/pages/OSSPreviewWindow";
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "任务面板" },
   { to: "/settings", icon: Settings, label: "设置" },
-  { to: "/plugins", icon: Plug, label: "项目插件" },
+  { to: "/plugins", icon: Plug, label: "项目能力" },
   { to: "/oss-browser", icon: Cloud, label: "OSS 浏览" },
   { to: "/history", icon: Clock, label: "历史记录" },
   { to: "/ssh", icon: Server, label: "远程机器" },

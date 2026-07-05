@@ -6,16 +6,25 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import { DEFAULT_SETTINGS } from '../src/shared/constants'
-import { BUILTIN_PLUGINS, DEFAULT_PROFILE_PLUGINS, PLUGIN_IDS } from '../src/shared/plugins'
+import {
+  BUILTIN_EXTENSIONS,
+  BUILTIN_UPLOAD_PIPELINES,
+  DEFAULT_PROFILE_EXTENSIONS,
+  DEFAULT_PROFILE_UPLOAD_PIPELINE,
+  EXTENSION_IDS,
+  PLUGIN_IDS,
+  UPLOAD_PIPELINE_IDS
+} from '../src/shared/plugins'
 import { normalizeProfiles } from '../src/shared/upload-profile'
-import type { AppSettings, ProfilePluginConfig, Task, UploadProfile } from '../src/shared/types'
+import type { AppSettings, ProfileExtensionConfig, ProfilePluginConfig, Task, UploadProfile } from '../src/shared/types'
 import { runMigrations, setDbForTests } from '../src/main/db/database'
 import { TaskRepo } from '../src/main/db/task.repo'
 import { getTaskDestinationRepo } from '../src/main/db/task-destination.repo'
 import { getPluginRunRepo } from '../src/main/db/plugin-run.repo'
 import { SettingsRepo } from '../src/main/db/settings.repo'
 import { Module1PreUploadService } from '../src/main/services/module1-preupload.service'
-import { PluginRuntimeService } from '../src/main/services/plugin-runtime.service'
+import { ExtensionRuntimeService } from '../src/main/services/extension-runtime.service'
+import { UploadPipelineRuntimeService } from '../src/main/services/upload-pipeline-runtime.service'
 import { OSSBrowserService } from '../src/main/services/oss-browser.service'
 import { TaskRunnerService } from '../src/main/services/task-runner.service'
 import { getCloudUploadService } from '../src/main/services/cloud-upload.service'
@@ -37,27 +46,29 @@ function cloneDefaults(): AppSettings {
   return JSON.parse(JSON.stringify(DEFAULT_SETTINGS)) as AppSettings
 }
 
-function clonePluginDefaults(): ProfilePluginConfig {
-  return JSON.parse(JSON.stringify(DEFAULT_PROFILE_PLUGINS)) as ProfilePluginConfig
+function cloneExtensionDefaults(): ProfileExtensionConfig {
+  return JSON.parse(JSON.stringify(DEFAULT_PROFILE_EXTENSIONS)) as ProfileExtensionConfig
 }
 
-function pluginsWith(
-  enabledPluginIds: string[],
+function extensionsWith(
+  enabledIds: string[],
   configs: Record<string, unknown> = {}
-): ProfilePluginConfig {
-  const plugins = clonePluginDefaults()
-  plugins.enabledPluginIds = enabledPluginIds
-  plugins.configs = {
-    ...plugins.configs,
+): ProfileExtensionConfig {
+  const extensions = cloneExtensionDefaults()
+  extensions.enabledIds = enabledIds
+  extensions.configs = {
+    ...extensions.configs,
     ...configs
   }
-  return plugins
+  return extensions
 }
 
 function createProfile(input: {
   id: string
   name?: string
   targetMode?: UploadProfile['targetMode']
+  uploadPipeline?: UploadProfile['uploadPipeline']
+  extensions?: ProfileExtensionConfig
   plugins?: ProfilePluginConfig
 }): UploadProfile {
   const base = cloneDefaults().profiles[0]
@@ -66,7 +77,9 @@ function createProfile(input: {
     id: input.id,
     name: input.name || input.id,
     targetMode: input.targetMode || 'aliyun',
-    plugins: input.plugins || clonePluginDefaults()
+    uploadPipeline: input.uploadPipeline || JSON.parse(JSON.stringify(DEFAULT_PROFILE_UPLOAD_PIPELINE)),
+    extensions: input.extensions || cloneExtensionDefaults(),
+    plugins: input.plugins
   }
 }
 
@@ -133,18 +146,24 @@ async function waitForPluginRun(taskId: string, pluginId: string) {
   throw new Error(`插件运行记录未完成: ${pluginId}`)
 }
 
-test('builtin plugin registry exposes the fixed first-party plugins', () => {
+test('builtin capability registries expose the fixed first-party capabilities', () => {
   assert.deepEqual(
-    BUILTIN_PLUGINS.map((plugin) => plugin.id),
+    BUILTIN_UPLOAD_PIPELINES.map((pipeline) => pipeline.id),
     [
-      PLUGIN_IDS.MODULE1_PREUPLOAD,
-      PLUGIN_IDS.WEBHOOK_NOTIFIER,
-      PLUGIN_IDS.OSS_BROWSER
+      UPLOAD_PIPELINE_IDS.STANDARD_UPLOAD,
+      UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD
+    ]
+  )
+  assert.deepEqual(
+    BUILTIN_EXTENSIONS.map((extension) => extension.id),
+    [
+      EXTENSION_IDS.WEBHOOK_NOTIFIER,
+      EXTENSION_IDS.OSS_BROWSER
     ]
   )
 })
 
-test('profile normalization fills plugin config and preserves legacy webhook enablement', () => {
+test('profile normalization fills pipeline and extension config and preserves legacy webhook enablement', () => {
   const settings = cloneDefaults()
   settings.webhook = {
     enabled: true,
@@ -154,15 +173,43 @@ test('profile normalization fills plugin config and preserves legacy webhook ena
   settings.profiles = [
     {
       ...settings.profiles[0],
+      uploadPipeline: undefined,
+      extensions: undefined,
       plugins: undefined
     }
   ]
 
   const { profiles } = normalizeProfiles(settings)
   const profile = profiles[0]
-  assert.ok(profile.plugins)
-  assert.ok(profile.plugins.enabledPluginIds.includes(PLUGIN_IDS.WEBHOOK_NOTIFIER))
-  assert.deepEqual(profile.plugins.configs[PLUGIN_IDS.WEBHOOK_NOTIFIER], settings.webhook)
+  assert.equal(profile.uploadPipeline?.id, UPLOAD_PIPELINE_IDS.STANDARD_UPLOAD)
+  assert.ok(profile.extensions?.enabledIds.includes(EXTENSION_IDS.WEBHOOK_NOTIFIER))
+  assert.deepEqual(profile.extensions?.configs[EXTENSION_IDS.WEBHOOK_NOTIFIER], settings.webhook)
+  assert.equal(profile.plugins, undefined)
+})
+
+test('profile normalization migrates legacy module1 plugin into the SANY upload pipeline', () => {
+  const settings = cloneDefaults()
+  settings.profiles = [
+    {
+      ...settings.profiles[0],
+      uploadPipeline: undefined,
+      extensions: undefined,
+      plugins: {
+        enabledPluginIds: [PLUGIN_IDS.MODULE1_PREUPLOAD, EXTENSION_IDS.OSS_BROWSER],
+        order: [PLUGIN_IDS.MODULE1_PREUPLOAD, EXTENSION_IDS.OSS_BROWSER],
+        configs: {
+          [PLUGIN_IDS.MODULE1_PREUPLOAD]: { stationPrefix: 'legacyStation' },
+          [EXTENSION_IDS.OSS_BROWSER]: { enabled: true }
+        }
+      }
+    }
+  ]
+
+  const { profiles } = normalizeProfiles(settings)
+  const profile = profiles[0]
+  assert.equal(profile.uploadPipeline?.id, UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD)
+  assert.equal(profile.uploadPipeline?.config.stationPrefix, 'legacyStation')
+  assert.deepEqual(profile.extensions?.enabledIds, [EXTENSION_IDS.OSS_BROWSER])
 })
 
 test('reconcileFiles writes planned object keys onto destination targets', () => {
@@ -211,13 +258,14 @@ test('Module1 pre-upload runs in staging and does not mutate the source director
 
     assert.ok(existsSync(join(sample, 'camera_0', '1.jpg')))
     assert.ok(!existsSync(join(result.uploadRootPath, 'sample', 'camera_0', '1.jpg')))
+    assert.equal(result.pipelineId, UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD)
     assert.ok(result.files.some((file) => file.plannedObjectKey?.startsWith('stationX/teleop/1mm/')))
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
 })
 
-test('plugin runtime records Module1 pre-upload runs and exposes profile status', async () => {
+test('upload pipeline runtime records SANY Module1 runs and exposes capability status', async () => {
   const db = createDatabase()
   const root = mkdtempSync(join(tmpdir(), 'module1-runtime-'))
   try {
@@ -225,11 +273,12 @@ test('plugin runtime records Module1 pre-upload runs and exposes profile status'
     const profile = createProfile({
       id: 'sany-profile',
       name: 'SANY Profile',
-      plugins: pluginsWith([PLUGIN_IDS.MODULE1_PREUPLOAD], {
-        [PLUGIN_IDS.MODULE1_PREUPLOAD]: {
+      uploadPipeline: {
+        id: UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD,
+        config: {
           stationPrefix: 'stationR'
         }
-      })
+      }
     })
     new SettingsRepo().saveAll({
       profiles: [profile],
@@ -246,24 +295,22 @@ test('plugin runtime records Module1 pre-upload runs and exposes profile status'
       profileSnapshot: profile
     })
 
-    const runtime = new PluginRuntimeService()
-    const result = await runtime.runPreUploadPlugins(task)
-    assert.equal(result?.pluginId, PLUGIN_IDS.MODULE1_PREUPLOAD)
+    const runtime = new UploadPipelineRuntimeService()
+    const result = await runtime.prepareUploadPlan(task, 1)
+    assert.equal(result.pipelineId, UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD)
 
-    const runs = runtime.listTaskRuns(task.id)
+    const runs = getPluginRunRepo().listByTask(task.id)
     assert.equal(runs.length, 1)
     assert.equal(runs[0].status, 'completed')
-    assert.equal(runs[0].pluginId, PLUGIN_IDS.MODULE1_PREUPLOAD)
+    assert.equal(runs[0].pluginId, UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD)
+    assert.equal(runs[0].category, 'pipeline')
     assert.ok(runs[0].stagingPath?.includes('/plugin-workspaces/'))
     assert.ok(runs[0].artifacts?.manifestPath)
 
-    const status = runtime.getProfileStatus(profile.id)
-    const module1Status = status.plugins.find(
-      (item) => item.manifest.id === PLUGIN_IDS.MODULE1_PREUPLOAD
-    )
-    assert.equal(module1Status?.enabled, true)
-    assert.equal(module1Status?.lastRun?.id, runs[0].id)
-    assert.match(module1Status?.configSummary || '', /stationPrefix=stationR/)
+    const status = new ExtensionRuntimeService().getProjectCapabilityStatus(profile.id)
+    assert.equal(status.uploadPipeline.manifest.id, UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD)
+    assert.equal(status.uploadPipeline.lastRun?.id, runs[0].id)
+    assert.match(status.uploadPipeline.configSummary, /stationPrefix=stationR/)
   } finally {
     rmSync(root, { recursive: true, force: true })
     closeDatabase(db)
@@ -282,11 +329,12 @@ test('TaskRunner uploads Module1 staging files with plugin planned object keys',
     createModule1Source(root)
     const profile = createProfile({
       id: 'runner-profile',
-      plugins: pluginsWith([PLUGIN_IDS.MODULE1_PREUPLOAD], {
-        [PLUGIN_IDS.MODULE1_PREUPLOAD]: {
+      uploadPipeline: {
+        id: UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD,
+        config: {
           stationPrefix: 'stationUpload'
         }
-      })
+      }
     })
 
     new SettingsRepo().saveAll({
@@ -359,8 +407,8 @@ test('webhook notifier uses profile plugin config and does not block task event 
 
     const profile = createProfile({
       id: 'webhook-profile',
-      plugins: pluginsWith([PLUGIN_IDS.WEBHOOK_NOTIFIER], {
-        [PLUGIN_IDS.WEBHOOK_NOTIFIER]: {
+      extensions: extensionsWith([EXTENSION_IDS.WEBHOOK_NOTIFIER], {
+        [EXTENSION_IDS.WEBHOOK_NOTIFIER]: {
           enabled: true,
           url: 'https://webhook.example.test/task',
           headers: { 'X-Project': 'sany' }
@@ -377,8 +425,8 @@ test('webhook notifier uses profile plugin config and does not block task event 
       profileSnapshot: profile
     })
 
-    new PluginRuntimeService().notifyTaskEvent(task, 'task_completed')
-    const run = await waitForPluginRun(task.id, PLUGIN_IDS.WEBHOOK_NOTIFIER)
+    new ExtensionRuntimeService().notifyTaskEvent(task, 'task_completed')
+    const run = await waitForPluginRun(task.id, EXTENSION_IDS.WEBHOOK_NOTIFIER)
 
     assert.equal(run.status, 'completed')
     assert.equal(run.summary?.event, 'task_completed')
@@ -397,7 +445,7 @@ test('OSS browser plugin rejects unavailable profile configurations before creat
     const disabledProfile = createProfile({
       id: 'oss-disabled',
       targetMode: 'aliyun',
-      plugins: pluginsWith([])
+      extensions: extensionsWith([])
     })
     new SettingsRepo().saveAll({
       profiles: [disabledProfile],
@@ -411,7 +459,7 @@ test('OSS browser plugin rejects unavailable profile configurations before creat
     const tencentOnlyProfile = createProfile({
       id: 'oss-tencent-only',
       targetMode: 'tencent',
-      plugins: pluginsWith([PLUGIN_IDS.OSS_BROWSER])
+      extensions: extensionsWith([EXTENSION_IDS.OSS_BROWSER])
     })
     new SettingsRepo().saveAll({
       profiles: [tencentOnlyProfile],

@@ -1,8 +1,8 @@
 import { extname } from 'path'
 import type { AppSettings, OSSImageResult, OSSListResult, OSSObjectHead, OSSObjectItem } from '@shared/types'
-import { PLUGIN_IDS } from '@shared/plugins'
+import { EXTENSION_IDS } from '@shared/plugins'
 import { providersForMode } from '@shared/cloud-upload'
-import { normalizeProfilePlugins } from '@shared/upload-profile'
+import { normalizeProfileExtensions } from '@shared/upload-profile'
 import { getSettingsRepo } from '../db/settings.repo'
 
 interface OSSBrowseClient {
@@ -74,8 +74,8 @@ export class OSSBrowserService {
     const profile =
       settings.profiles.find((item) => item.id === settings.activeProfileId) ||
       settings.profiles[0]
-    const plugins = normalizeProfilePlugins(profile.plugins)
-    if (!plugins.enabledPluginIds.includes(PLUGIN_IDS.OSS_BROWSER)) {
+    const extensions = normalizeProfileExtensions(profile.extensions, profile.plugins)
+    if (!extensions.enabledIds.includes(EXTENSION_IDS.OSS_BROWSER)) {
       throw new Error('当前 Profile 未启用 OSS 浏览器插件')
     }
     if (!providersForMode(profile.targetMode).includes('aliyun')) {

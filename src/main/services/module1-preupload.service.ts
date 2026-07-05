@@ -4,8 +4,8 @@ import { app } from 'electron'
 import { basename, join } from 'path'
 import { tmpdir } from 'os'
 import log from 'electron-log'
-import { PLUGIN_IDS } from '@shared/plugins'
-import type { PreUploadResult, Task } from '@shared/types'
+import { UPLOAD_PIPELINE_IDS } from '@shared/plugins'
+import type { Task, UploadPipelineResult } from '@shared/types'
 import {
   getModule1ManifestService,
   type Module1FileInfo,
@@ -64,7 +64,7 @@ function getPluginWorkspaceRoot(): string {
 }
 
 export class Module1PreUploadService {
-  async run(task: Task, rawConfig: unknown): Promise<PreUploadResult> {
+  async run(task: Task, rawConfig: unknown): Promise<UploadPipelineResult> {
     if (!existsSync(task.folderPath)) {
       throw new Error('源目录不存在，无法执行 Module1 上传前处理')
     }
@@ -114,8 +114,9 @@ export class Module1PreUploadService {
 
     const totalBytes = manifest.reduce((sum, item) => sum + item.fileSize, 0)
     return {
-      pluginId: PLUGIN_IDS.MODULE1_PREUPLOAD,
+      pipelineId: UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD,
       uploadRootPath: stagingRootPath,
+      requiredStableChecks: 1,
       files: manifest.map((item) => ({
         relativePath: item.localRelativePath,
         fileSize: item.fileSize,

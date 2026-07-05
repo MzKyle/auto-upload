@@ -11,7 +11,12 @@ import { testOSS, testTencentS3, selectFolder, previewUploadPath } from "@/lib/i
 import { buildPathTreeFromPaths } from "@/lib/path-tree";
 import { showToast } from "@/components/ui/toast";
 import { CLOUD_PROVIDER_LABELS } from "@shared/constants";
-import { DEFAULT_PROFILE_PLUGINS, PLUGIN_IDS } from "@shared/plugins";
+import {
+  DEFAULT_PROFILE_EXTENSIONS,
+  DEFAULT_PROFILE_UPLOAD_PIPELINE,
+  EXTENSION_IDS,
+  UPLOAD_PIPELINE_IDS
+} from "@shared/plugins";
 import type { AppSettings, CloudProvider, UploadPathMode, UploadProfile } from "@shared/types";
 import type { UploadPathPreview } from "@shared/upload-profile";
 
@@ -24,6 +29,26 @@ const uploadPathModeOptions: Array<{ value: UploadPathMode; label: string }> = [
   { value: "last-segments", label: "保留末 N 级" },
   { value: "template", label: "对象 Key 模板" },
 ];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringifyWebhookHeaders(value: unknown): string {
+  return JSON.stringify(isRecord(value) ? value : {}, null, 2);
+}
+
+function parseWebhookHeaders(value: string): Record<string, string> {
+  const trimmed = value.trim();
+  if (!trimmed) return {};
+  const parsed = JSON.parse(trimmed) as unknown;
+  if (!isRecord(parsed)) {
+    throw new Error("Webhook Header 必须是 JSON 对象");
+  }
+  return Object.fromEntries(
+    Object.entries(parsed).map(([key, headerValue]) => [key, String(headerValue)]),
+  );
+}
 
 export default function Settings() {
   const { settings, loading, loadSettings, saveSettings } = useSettingsStore();
@@ -47,6 +72,7 @@ export default function Settings() {
   const [profilePreviewSource, setProfilePreviewSource] = useState("");
   const [profilePreview, setProfilePreview] = useState<UploadPathPreview | null>(null);
   const [profilePreviewLoading, setProfilePreviewLoading] = useState(false);
+  const [webhookHeaderDrafts, setWebhookHeaderDrafts] = useState<Record<string, string>>({});
   const scanDirectoryTrees = useMemo(
     () => ({
       aliyun: buildPathTreeFromPaths(
@@ -221,7 +247,8 @@ export default function Settings() {
 
   const handleAddProfile = useCallback(() => {
     const base = editingProfile || local.profiles[0];
-    const basePlugins = base.plugins || DEFAULT_PROFILE_PLUGINS;
+    const baseUploadPipeline = base.uploadPipeline || DEFAULT_PROFILE_UPLOAD_PIPELINE;
+    const baseExtensions = base.extensions || DEFAULT_PROFILE_EXTENSIONS;
     const id = `profile-${Date.now()}`;
     const profile: UploadProfile = {
       ...base,
@@ -245,12 +272,16 @@ export default function Settings() {
         aliyun: { ...base.providers.aliyun },
         tencent: { ...base.providers.tencent },
       },
-      plugins: {
-        enabledPluginIds: [...basePlugins.enabledPluginIds],
-        order: [...basePlugins.order],
-        configs: JSON.parse(JSON.stringify(basePlugins.configs)),
+      uploadPipeline: {
+        id: baseUploadPipeline.id,
+        config: JSON.parse(JSON.stringify(baseUploadPipeline.config)),
+      },
+      extensions: {
+        enabledIds: [...baseExtensions.enabledIds],
+        configs: JSON.parse(JSON.stringify(baseExtensions.configs)),
       },
     };
+    delete profile.plugins;
     setLocal((prev) => ({
       ...prev,
       profiles: [...prev.profiles, profile],
@@ -287,64 +318,95 @@ export default function Settings() {
     }));
   }, [updateProfile]);
 
-  const updateProfilePluginEnabled = useCallback((
+  const updateProfilePipeline = useCallback((
     profileId: string,
-    pluginId: string,
+    pipelineId: NonNullable<UploadProfile["uploadPipeline"]>["id"],
+  ) => {
+    updateProfile(profileId, (profile) => ({
+      ...profile,
+      uploadPipeline: {
+        id: pipelineId,
+        config: profile.uploadPipeline?.config || {},
+      },
+      plugins: undefined,
+    }));
+  }, [updateProfile]);
+
+  const updateProfilePipelineConfig = useCallback((
+    profileId: string,
+    patch: Record<string, unknown>,
+  ) => {
+    updateProfile(profileId, (profile) => ({
+      ...profile,
+      uploadPipeline: {
+        id: profile.uploadPipeline?.id || DEFAULT_PROFILE_UPLOAD_PIPELINE.id,
+        config: {
+          ...(profile.uploadPipeline?.config || {}),
+          ...patch,
+        },
+      },
+      plugins: undefined,
+    }));
+  }, [updateProfile]);
+
+  const updateProfileExtensionEnabled = useCallback((
+    profileId: string,
+    extensionId: string,
     enabled: boolean,
   ) => {
     updateProfile(profileId, (profile) => {
-      const plugins = profile.plugins || DEFAULT_PROFILE_PLUGINS;
-      const enabledIds = new Set(plugins.enabledPluginIds || []);
-      if (enabled) enabledIds.add(pluginId);
-      else enabledIds.delete(pluginId);
+      const extensions = profile.extensions || DEFAULT_PROFILE_EXTENSIONS;
+      const enabledIds = new Set(extensions.enabledIds || []);
+      if (enabled) enabledIds.add(extensionId);
+      else enabledIds.delete(extensionId);
       const currentConfig =
-        typeof plugins.configs?.[pluginId] === "object" && plugins.configs?.[pluginId] !== null
-          ? plugins.configs[pluginId] as Record<string, unknown>
+        typeof extensions.configs?.[extensionId] === "object" && extensions.configs?.[extensionId] !== null
+          ? extensions.configs[extensionId] as Record<string, unknown>
           : {};
 
       return {
         ...profile,
-        plugins: {
-          enabledPluginIds: Array.from(enabledIds),
-          order: Array.from(new Set([...(plugins.order || []), ...DEFAULT_PROFILE_PLUGINS.order])),
+        extensions: {
+          enabledIds: Array.from(enabledIds),
           configs: {
-            ...DEFAULT_PROFILE_PLUGINS.configs,
-            ...(plugins.configs || {}),
-            [pluginId]: {
+            ...DEFAULT_PROFILE_EXTENSIONS.configs,
+            ...(extensions.configs || {}),
+            [extensionId]: {
               ...currentConfig,
               enabled,
             },
           },
         },
+        plugins: undefined,
       };
     });
   }, [updateProfile]);
 
-  const updateProfilePluginConfig = useCallback((
+  const updateProfileExtensionConfig = useCallback((
     profileId: string,
-    pluginId: string,
+    extensionId: string,
     patch: Record<string, unknown>,
   ) => {
     updateProfile(profileId, (profile) => {
-      const plugins = profile.plugins || DEFAULT_PROFILE_PLUGINS;
+      const extensions = profile.extensions || DEFAULT_PROFILE_EXTENSIONS;
       const currentConfig =
-        typeof plugins.configs?.[pluginId] === "object" && plugins.configs?.[pluginId] !== null
-          ? plugins.configs[pluginId] as Record<string, unknown>
+        typeof extensions.configs?.[extensionId] === "object" && extensions.configs?.[extensionId] !== null
+          ? extensions.configs[extensionId] as Record<string, unknown>
           : {};
       return {
         ...profile,
-        plugins: {
-          enabledPluginIds: [...(plugins.enabledPluginIds || [])],
-          order: Array.from(new Set([...(plugins.order || []), ...DEFAULT_PROFILE_PLUGINS.order])),
+        extensions: {
+          enabledIds: [...(extensions.enabledIds || [])],
           configs: {
-            ...DEFAULT_PROFILE_PLUGINS.configs,
-            ...(plugins.configs || {}),
-            [pluginId]: {
+            ...DEFAULT_PROFILE_EXTENSIONS.configs,
+            ...(extensions.configs || {}),
+            [extensionId]: {
               ...currentConfig,
               ...patch,
             },
           },
         },
+        plugins: undefined,
       };
     });
   }, [updateProfile]);
@@ -639,48 +701,50 @@ export default function Settings() {
     );
   };
 
-  const renderProfilePluginControls = (profile: UploadProfile) => {
-    const plugins = profile.plugins || DEFAULT_PROFILE_PLUGINS;
-    const enabledIds = new Set(plugins.enabledPluginIds || []);
-    const module1Enabled = enabledIds.has(PLUGIN_IDS.MODULE1_PREUPLOAD);
-    const webhookEnabled = enabledIds.has(PLUGIN_IDS.WEBHOOK_NOTIFIER);
-    const ossBrowserEnabled = enabledIds.has(PLUGIN_IDS.OSS_BROWSER);
+  const renderProfileCapabilityControls = (profile: UploadProfile) => {
+    const uploadPipeline = profile.uploadPipeline || DEFAULT_PROFILE_UPLOAD_PIPELINE;
+    const extensions = profile.extensions || DEFAULT_PROFILE_EXTENSIONS;
+    const enabledIds = new Set(extensions.enabledIds || []);
+    const module1Enabled = uploadPipeline.id === UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD;
+    const webhookEnabled = enabledIds.has(EXTENSION_IDS.WEBHOOK_NOTIFIER);
+    const ossBrowserEnabled = enabledIds.has(EXTENSION_IDS.OSS_BROWSER);
     const module1Config =
-      typeof plugins.configs?.[PLUGIN_IDS.MODULE1_PREUPLOAD] === "object" &&
-      plugins.configs?.[PLUGIN_IDS.MODULE1_PREUPLOAD] !== null
-        ? plugins.configs[PLUGIN_IDS.MODULE1_PREUPLOAD] as Record<string, unknown>
+      typeof uploadPipeline.config === "object" &&
+      uploadPipeline.config !== null
+        ? uploadPipeline.config as Record<string, unknown>
         : {};
     const webhookConfig =
-      typeof plugins.configs?.[PLUGIN_IDS.WEBHOOK_NOTIFIER] === "object" &&
-      plugins.configs?.[PLUGIN_IDS.WEBHOOK_NOTIFIER] !== null
-        ? plugins.configs[PLUGIN_IDS.WEBHOOK_NOTIFIER] as Record<string, unknown>
+      typeof extensions.configs?.[EXTENSION_IDS.WEBHOOK_NOTIFIER] === "object" &&
+      extensions.configs?.[EXTENSION_IDS.WEBHOOK_NOTIFIER] !== null
+        ? extensions.configs[EXTENSION_IDS.WEBHOOK_NOTIFIER] as Record<string, unknown>
         : {};
+    const webhookHeadersText =
+      webhookHeaderDrafts[profile.id] ?? stringifyWebhookHeaders(webhookConfig.headers);
 
     return (
       <div className="rounded-md border p-3 space-y-4">
         <div>
-          <div className="text-sm font-medium">项目插件</div>
+          <div className="text-sm font-medium">项目能力</div>
           <div className="text-xs text-muted-foreground mt-1">
-            插件配置随 Profile 保存；任务创建后会冻结当时的插件快照
+            上传流程互斥选择；扩展插件可叠加启用。任务创建后会冻结当前 Profile 快照
           </div>
         </div>
 
         <div className="grid grid-cols-2 gap-4">
           <div>
-            <Label>上传模式</Label>
+            <Label>上传流程</Label>
             <select
-              value={module1Enabled ? "module1" : "generic"}
+              value={uploadPipeline.id}
               onChange={(event) =>
-                updateProfilePluginEnabled(
+                updateProfilePipeline(
                   profile.id,
-                  PLUGIN_IDS.MODULE1_PREUPLOAD,
-                  event.target.value === "module1",
+                  event.target.value as NonNullable<UploadProfile["uploadPipeline"]>["id"],
                 )
               }
               className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
             >
-              <option value="generic">通用上传</option>
-              <option value="module1">Module1 上传前处理</option>
+              <option value={UPLOAD_PIPELINE_IDS.STANDARD_UPLOAD}>通用上传</option>
+              <option value={UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD}>SANY Module1 数据采集上传</option>
             </select>
           </div>
           <div>
@@ -689,9 +753,8 @@ export default function Settings() {
               value={String(module1Config.stationPrefix || "station2")}
               disabled={!module1Enabled}
               onChange={(event) =>
-                updateProfilePluginConfig(
+                updateProfilePipelineConfig(
                   profile.id,
-                  PLUGIN_IDS.MODULE1_PREUPLOAD,
                   { stationPrefix: event.target.value },
                 )
               }
@@ -706,9 +769,9 @@ export default function Settings() {
               type="checkbox"
               checked={webhookEnabled}
               onChange={(event) =>
-                updateProfilePluginEnabled(
+                updateProfileExtensionEnabled(
                   profile.id,
-                  PLUGIN_IDS.WEBHOOK_NOTIFIER,
+                  EXTENSION_IDS.WEBHOOK_NOTIFIER,
                   event.target.checked,
                 )
               }
@@ -721,9 +784,9 @@ export default function Settings() {
               type="checkbox"
               checked={ossBrowserEnabled}
               onChange={(event) =>
-                updateProfilePluginEnabled(
+                updateProfileExtensionEnabled(
                   profile.id,
-                  PLUGIN_IDS.OSS_BROWSER,
+                  EXTENSION_IDS.OSS_BROWSER,
                   event.target.checked,
                 )
               }
@@ -739,9 +802,9 @@ export default function Settings() {
             value={String(webhookConfig.url || "")}
             disabled={!webhookEnabled}
             onChange={(event) =>
-              updateProfilePluginConfig(
+              updateProfileExtensionConfig(
                 profile.id,
-                PLUGIN_IDS.WEBHOOK_NOTIFIER,
+                EXTENSION_IDS.WEBHOOK_NOTIFIER,
                 {
                   enabled: webhookEnabled,
                   url: event.target.value,
@@ -750,6 +813,44 @@ export default function Settings() {
             }
             className="mt-1"
             placeholder="https://example.com/webhook"
+          />
+        </div>
+        <div>
+          <Label>Webhook Headers (JSON)</Label>
+          <textarea
+            value={webhookHeadersText}
+            disabled={!webhookEnabled}
+            onChange={(event) =>
+              setWebhookHeaderDrafts((prev) => ({
+                ...prev,
+                [profile.id]: event.target.value,
+              }))
+            }
+            onBlur={() => {
+              try {
+                const headers = parseWebhookHeaders(webhookHeadersText);
+                updateProfileExtensionConfig(
+                  profile.id,
+                  EXTENSION_IDS.WEBHOOK_NOTIFIER,
+                  {
+                    enabled: webhookEnabled,
+                    headers,
+                  },
+                );
+                setWebhookHeaderDrafts((prev) => {
+                  const next = { ...prev };
+                  delete next[profile.id];
+                  return next;
+                });
+              } catch (error) {
+                showToast(
+                  error instanceof Error ? error.message : String(error),
+                  "error",
+                );
+              }
+            }}
+            className="mt-1 min-h-20 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono disabled:cursor-not-allowed disabled:opacity-50"
+            placeholder='{"Authorization":"Bearer ..."}'
           />
         </div>
       </div>
@@ -900,7 +1001,7 @@ export default function Settings() {
               {renderProfileProviderControls(editingProfile, "tencent")}
             </div>
 
-            {renderProfilePluginControls(editingProfile)}
+            {renderProfileCapabilityControls(editingProfile)}
 
             <div className="rounded-md border p-3 space-y-3">
               <div>

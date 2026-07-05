@@ -178,6 +178,9 @@ const IPC = {
   SETTINGS_TEST_TENCENT_S3: "settings:test-tencent-s3",
   UPLOAD_PATH_PREVIEW: "upload:path-preview",
   // 项目插件
+  CAPABILITY_LIST: "capability:list",
+  CAPABILITY_PROFILE_STATUS: "capability:profile-status",
+  CAPABILITY_TASK_RUNS: "capability:task-runs",
   PLUGIN_LIST: "plugin:list",
   PLUGIN_PROFILE_STATUS: "plugin:profile-status",
   PLUGIN_TASK_RUNS: "plugin:task-runs",
@@ -1270,10 +1273,10 @@ class TaskDestinationRepo {
     for (const row of fileRows) this.recalculateLogicalFile(row.id);
   }
 }
-let instance$l = null;
+let instance$m = null;
 function getTaskDestinationRepo() {
-  if (!instance$l) instance$l = new TaskDestinationRepo();
-  return instance$l;
+  if (!instance$m) instance$m = new TaskDestinationRepo();
+  return instance$m;
 }
 function normalizeFolderPath$1(p) {
   return path.normalize(p).replace(/[\\/]+$/, "");
@@ -2043,39 +2046,73 @@ class TaskRepo {
     return this.rowsToTasks(rows);
   }
 }
-let instance$k = null;
+let instance$l = null;
 function getTaskRepo() {
-  if (!instance$k) instance$k = new TaskRepo();
-  return instance$k;
+  if (!instance$l) instance$l = new TaskRepo();
+  return instance$l;
 }
-const PLUGIN_IDS = {
-  MODULE1_PREUPLOAD: "module1-preupload",
+const UPLOAD_PIPELINE_IDS = {
+  STANDARD_UPLOAD: "standard-upload",
+  SANY_MODULE1_UPLOAD: "sany-module1-upload"
+};
+const EXTENSION_IDS = {
   WEBHOOK_NOTIFIER: "webhook-notifier",
   OSS_BROWSER: "oss-browser"
 };
-const BUILTIN_PLUGINS = [
+const PLUGIN_IDS = {
+  MODULE1_PREUPLOAD: "module1-preupload",
+  WEBHOOK_NOTIFIER: EXTENSION_IDS.WEBHOOK_NOTIFIER,
+  OSS_BROWSER: EXTENSION_IDS.OSS_BROWSER
+};
+const BUILTIN_UPLOAD_PIPELINES = [
   {
-    id: PLUGIN_IDS.MODULE1_PREUPLOAD,
-    name: "Module1 上传前处理",
+    id: UPLOAD_PIPELINE_IDS.STANDARD_UPLOAD,
+    name: "通用上传",
     version: "1.0.0",
-    category: "preUpload",
-    description: "在上传前复制数据目录并按 SANY Module1 规则清理、分类和生成对象 Key。"
+    category: "pipeline",
+    description: "扫描原始源目录，并使用当前 Profile 的路径规则生成对象 Key。"
   },
   {
-    id: PLUGIN_IDS.WEBHOOK_NOTIFIER,
+    id: UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD,
+    name: "SANY Module1 数据采集上传",
+    version: "1.0.0",
+    category: "pipeline",
+    description: "复制到 staging 后按 SANY Module1 规则清理、分类、生成 manifest 和对象 Key。"
+  }
+];
+const BUILTIN_EXTENSIONS = [
+  {
+    id: EXTENSION_IDS.WEBHOOK_NOTIFIER,
     name: "Webhook 通知",
     version: "1.0.0",
     category: "notification",
     description: "任务完成或失败后向配置的 HTTP Webhook 发送通知。"
   },
   {
-    id: PLUGIN_IDS.OSS_BROWSER,
+    id: EXTENSION_IDS.OSS_BROWSER,
     name: "OSS 浏览器",
     version: "1.0.0",
     category: "tool",
     description: "使用当前 Profile 的阿里云 OSS 配置只读浏览对象并预览图片。"
   }
 ];
+const DEFAULT_PROFILE_UPLOAD_PIPELINE = {
+  id: UPLOAD_PIPELINE_IDS.STANDARD_UPLOAD,
+  config: {}
+};
+const DEFAULT_PROFILE_EXTENSIONS = {
+  enabledIds: [],
+  configs: {
+    [EXTENSION_IDS.WEBHOOK_NOTIFIER]: {
+      url: "",
+      headers: {},
+      enabled: false
+    },
+    [EXTENSION_IDS.OSS_BROWSER]: {
+      enabled: false
+    }
+  }
+};
 const DEFAULT_PROFILE_PLUGINS = {
   enabledPluginIds: [],
   order: [
@@ -2097,9 +2134,20 @@ const DEFAULT_PROFILE_PLUGINS = {
     }
   }
 };
-const BUILTIN_PLUGIN_ID_SET = new Set(BUILTIN_PLUGINS.map((plugin) => plugin.id));
+const BUILTIN_UPLOAD_PIPELINE_ID_SET = new Set(BUILTIN_UPLOAD_PIPELINES.map((pipeline) => pipeline.id));
+const BUILTIN_EXTENSION_ID_SET = new Set(BUILTIN_EXTENSIONS.map((extension) => extension.id));
+const LEGACY_PLUGIN_ID_SET = /* @__PURE__ */ new Set([
+  PLUGIN_IDS.MODULE1_PREUPLOAD,
+  ...BUILTIN_EXTENSIONS.map((extension) => extension.id)
+]);
+function isBuiltinUploadPipelineId(id) {
+  return BUILTIN_UPLOAD_PIPELINE_ID_SET.has(id);
+}
+function isBuiltinExtensionId(id) {
+  return BUILTIN_EXTENSION_ID_SET.has(id);
+}
 function isBuiltinPluginId(id) {
-  return BUILTIN_PLUGIN_ID_SET.has(id);
+  return LEGACY_PLUGIN_ID_SET.has(id);
 }
 const DEFAULT_WORK_DIR_NAME_PATTERN = "^\\d{2}-\\d{2}-\\d{2}$";
 const DEFAULT_UPLOAD_PROFILE_ID = "default";
@@ -2179,7 +2227,8 @@ const DEFAULT_SETTINGS = {
           objectKeyTemplate: "{relativePath}"
         }
       },
-      plugins: DEFAULT_PROFILE_PLUGINS
+      uploadPipeline: DEFAULT_PROFILE_UPLOAD_PIPELINE,
+      extensions: DEFAULT_PROFILE_EXTENSIONS
     }
   ],
   activeProfileId: DEFAULT_UPLOAD_PROFILE_ID,
@@ -2521,7 +2570,8 @@ function createDefaultProfileFromSettings(settings) {
         objectKeyTemplate: DEFAULT_OBJECT_KEY_TEMPLATE
       })
     },
-    plugins: normalizeProfilePlugins(void 0, buildDefaultPluginsFromSettings(settings))
+    uploadPipeline: DEFAULT_PROFILE_UPLOAD_PIPELINE,
+    extensions: buildDefaultExtensionsFromSettings(settings)
   };
 }
 function normalizeProfile(rawProfile, fallback) {
@@ -2552,7 +2602,60 @@ function normalizeProfile(rawProfile, fallback) {
         fallback.providers.tencent
       )
     },
-    plugins: normalizeProfilePlugins(raw.plugins, fallback.plugins)
+    uploadPipeline: normalizeProfileUploadPipeline(
+      raw.uploadPipeline,
+      raw.plugins,
+      fallback.uploadPipeline
+    ),
+    extensions: normalizeProfileExtensions(
+      raw.extensions,
+      raw.plugins,
+      fallback.extensions
+    )
+  };
+}
+function normalizeProfileUploadPipeline(rawUploadPipeline, legacyPlugins, fallback = DEFAULT_PROFILE_UPLOAD_PIPELINE) {
+  const raw = isRecord$1(rawUploadPipeline) ? rawUploadPipeline : {};
+  const fallbackId = isBuiltinUploadPipelineId(fallback.id) ? fallback.id : DEFAULT_PROFILE_UPLOAD_PIPELINE.id;
+  const rawId = typeof raw.id === "string" && isBuiltinUploadPipelineId(raw.id) ? raw.id : null;
+  const hasLegacyPlugins = isRecord$1(legacyPlugins);
+  const legacy = normalizeProfilePlugins(legacyPlugins);
+  const legacyModule1Enabled = hasLegacyPlugins && legacy.enabledPluginIds.includes(
+    PLUGIN_IDS.MODULE1_PREUPLOAD
+  );
+  const id = rawId || (legacyModule1Enabled ? UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD : fallbackId);
+  const fallbackConfig = isRecord$1(fallback.config) ? fallback.config : {};
+  const rawConfig = isRecord$1(raw.config) ? raw.config : {};
+  const legacyModule1Config = hasLegacyPlugins ? pluginConfigRecord(legacy.configs[PLUGIN_IDS.MODULE1_PREUPLOAD]) : {};
+  return {
+    id,
+    config: {
+      ...id === UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD ? legacyModule1Config : {},
+      ...fallbackConfig,
+      ...rawConfig
+    }
+  };
+}
+function normalizeProfileExtensions(rawExtensions, legacyPlugins, fallback = DEFAULT_PROFILE_EXTENSIONS) {
+  const raw = isRecord$1(rawExtensions) ? rawExtensions : {};
+  const fallbackEnabled = Array.isArray(fallback.enabledIds) ? fallback.enabledIds : [];
+  const rawEnabled = Array.isArray(raw.enabledIds) ? raw.enabledIds : null;
+  const hasLegacyPlugins = isRecord$1(legacyPlugins);
+  const legacy = normalizeProfilePlugins(legacyPlugins);
+  const legacyEnabled = hasLegacyPlugins ? legacy.enabledPluginIds.filter(isBuiltinExtensionId) : [];
+  const enabledIds = normalizeExtensionIdArray(rawEnabled || [
+    ...fallbackEnabled,
+    ...legacyEnabled
+  ]);
+  const fallbackConfigs = isRecord$1(fallback.configs) ? fallback.configs : DEFAULT_PROFILE_EXTENSIONS.configs;
+  const rawConfigs = isRecord$1(raw.configs) ? raw.configs : {};
+  return {
+    enabledIds,
+    configs: mergeExtensionConfigs(
+      fallbackConfigs,
+      hasLegacyPlugins ? legacy.configs : {},
+      rawConfigs
+    )
   };
 }
 function normalizeProfilePlugins(rawPlugins, fallback = DEFAULT_PROFILE_PLUGINS) {
@@ -2575,24 +2678,23 @@ function normalizeProfilePlugins(rawPlugins, fallback = DEFAULT_PROFILE_PLUGINS)
     configs: mergePluginConfigs(fallbackConfigs, rawConfigs)
   };
 }
-function buildDefaultPluginsFromSettings(settings) {
-  const plugins = cloneProfilePlugins(DEFAULT_PROFILE_PLUGINS);
+function buildDefaultExtensionsFromSettings(settings) {
+  const extensions = cloneProfileExtensions(DEFAULT_PROFILE_EXTENSIONS);
   if (settings.webhook?.enabled) {
-    plugins.enabledPluginIds = normalizePluginIdArray([
-      ...plugins.enabledPluginIds,
-      PLUGIN_IDS.WEBHOOK_NOTIFIER
+    extensions.enabledIds = normalizeExtensionIdArray([
+      ...extensions.enabledIds,
+      EXTENSION_IDS.WEBHOOK_NOTIFIER
     ]);
-    plugins.configs[PLUGIN_IDS.WEBHOOK_NOTIFIER] = {
-      ...pluginConfigRecord(plugins.configs[PLUGIN_IDS.WEBHOOK_NOTIFIER]),
+    extensions.configs[EXTENSION_IDS.WEBHOOK_NOTIFIER] = {
+      ...pluginConfigRecord(extensions.configs[EXTENSION_IDS.WEBHOOK_NOTIFIER]),
       ...settings.webhook
     };
   }
-  return plugins;
+  return extensions;
 }
-function cloneProfilePlugins(value) {
+function cloneProfileExtensions(value) {
   return {
-    enabledPluginIds: [...value.enabledPluginIds],
-    order: [...value.order],
+    enabledIds: [...value.enabledIds],
     configs: JSON.parse(JSON.stringify(value.configs))
   };
 }
@@ -2604,6 +2706,14 @@ function normalizePluginIdArray(value) {
     )
   );
 }
+function normalizeExtensionIdArray(value) {
+  if (!Array.isArray(value)) return [];
+  return Array.from(
+    new Set(
+      value.map((item) => String(item).trim()).filter((item) => item && isBuiltinExtensionId(item))
+    )
+  );
+}
 function mergePluginConfigs(fallbackConfigs, rawConfigs) {
   const configs = JSON.parse(
     JSON.stringify(DEFAULT_PROFILE_PLUGINS.configs)
@@ -2612,6 +2722,20 @@ function mergePluginConfigs(fallbackConfigs, rawConfigs) {
     configs[id] = {
       ...pluginConfigRecord(configs[id]),
       ...pluginConfigRecord(fallbackConfigs[id]),
+      ...pluginConfigRecord(rawConfigs[id])
+    };
+  }
+  return configs;
+}
+function mergeExtensionConfigs(fallbackConfigs, legacyConfigs, rawConfigs) {
+  const configs = JSON.parse(
+    JSON.stringify(DEFAULT_PROFILE_EXTENSIONS.configs)
+  );
+  for (const id of Object.values(EXTENSION_IDS)) {
+    configs[id] = {
+      ...pluginConfigRecord(configs[id]),
+      ...pluginConfigRecord(fallbackConfigs[id]),
+      ...pluginConfigRecord(legacyConfigs[id]),
       ...pluginConfigRecord(rawConfigs[id])
     };
   }
@@ -2880,10 +3004,10 @@ class SettingsRepo {
     transaction();
   }
 }
-let instance$j = null;
+let instance$k = null;
 function getSettingsRepo() {
-  if (!instance$j) instance$j = new SettingsRepo();
-  return instance$j;
+  if (!instance$k) instance$k = new SettingsRepo();
+  return instance$k;
 }
 function rowToHistory(row) {
   return {
@@ -2982,10 +3106,10 @@ class HistoryRepo {
     transaction();
   }
 }
-let instance$i = null;
+let instance$j = null;
 function getHistoryRepo() {
-  if (!instance$i) instance$i = new HistoryRepo();
-  return instance$i;
+  if (!instance$j) instance$j = new HistoryRepo();
+  return instance$j;
 }
 function normalizeFolderPath(p) {
   return path.normalize(p).replace(/[\\/]+$/, "");
@@ -3261,10 +3385,10 @@ class DayFolderRepo {
     return summary;
   }
 }
-let instance$h = null;
+let instance$i = null;
 function getDayFolderRepo() {
-  if (!instance$h) instance$h = new DayFolderRepo();
-  return instance$h;
+  if (!instance$i) instance$i = new DayFolderRepo();
+  return instance$i;
 }
 const MAX_ITEMS = 100;
 class DataCollectService {
@@ -3538,10 +3662,10 @@ function walkDirStats(dirPath) {
   walk(dirPath);
   return { fileCount, totalSize };
 }
-let instance$g = null;
+let instance$h = null;
 function getDataCollectService() {
-  if (!instance$g) instance$g = new DataCollectService();
-  return instance$g;
+  if (!instance$h) instance$h = new DataCollectService();
+  return instance$h;
 }
 function readTmpUpload(folderPath) {
   const filePath = path.join(folderPath, MARKER_FILES.TMP_UPLOAD);
@@ -3635,10 +3759,10 @@ class DayFolderService {
     }
   }
 }
-let instance$f = null;
+let instance$g = null;
 function getDayFolderService() {
-  if (!instance$f) instance$f = new DayFolderService();
-  return instance$f;
+  if (!instance$g) instance$g = new DayFolderService();
+  return instance$g;
 }
 function parseJsonRecord(value) {
   if (typeof value !== "string" || !value) return null;
@@ -3734,10 +3858,10 @@ class PluginRunRepo {
     }));
   }
 }
-let instance$e = null;
+let instance$f = null;
 function getPluginRunRepo() {
-  if (!instance$e) instance$e = new PluginRunRepo();
-  return instance$e;
+  if (!instance$f) instance$f = new PluginRunRepo();
+  return instance$f;
 }
 class CleanupService {
   timer = null;
@@ -3840,10 +3964,10 @@ class CleanupService {
     return Math.max(0, Math.floor(config.retentionDays));
   }
 }
-let instance$d = null;
+let instance$e = null;
 function getCleanupService() {
-  if (!instance$d) instance$d = new CleanupService();
-  return instance$d;
+  if (!instance$e) instance$e = new CleanupService();
+  return instance$e;
 }
 class TaskQueueService extends events.EventEmitter {
   runningTasks = /* @__PURE__ */ new Map();
@@ -4120,10 +4244,10 @@ class TaskQueueService extends events.EventEmitter {
     return previousStart;
   }
 }
-let instance$c = null;
+let instance$d = null;
 function getTaskQueueService() {
-  if (!instance$c) instance$c = new TaskQueueService();
-  return instance$c;
+  if (!instance$d) instance$d = new TaskQueueService();
+  return instance$d;
 }
 class FileFilterService {
   rules;
@@ -5064,10 +5188,10 @@ class ScannerService {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 }
-let instance$b = null;
+let instance$c = null;
 function getScannerService() {
-  if (!instance$b) instance$b = new ScannerService();
-  return instance$b;
+  if (!instance$c) instance$c = new ScannerService();
+  return instance$c;
 }
 class OSSUploadService {
   client = null;
@@ -5252,10 +5376,10 @@ class OSSUploadService {
     }
   }
 }
-let instance$a = null;
+let instance$b = null;
 function getOSSUploadService() {
-  if (!instance$a) instance$a = new OSSUploadService();
-  return instance$a;
+  if (!instance$b) instance$b = new OSSUploadService();
+  return instance$b;
 }
 class TencentS3UploadService {
   createTaskUploader(config, multipartThreshold = 100 * 1024 * 1024) {
@@ -5420,10 +5544,10 @@ class TencentS3UploadService {
     ].filter(Boolean).join(", ") || String(err);
   }
 }
-let instance$9 = null;
+let instance$a = null;
 function getTencentS3UploadService() {
-  if (!instance$9) instance$9 = new TencentS3UploadService();
-  return instance$9;
+  if (!instance$a) instance$a = new TencentS3UploadService();
+  return instance$a;
 }
 class CloudUploadService {
   async createTaskUploader(provider, settings, multipartThreshold) {
@@ -5447,10 +5571,10 @@ class CloudUploadService {
     return error ? `腾讯云 ${error}` : null;
   }
 }
-let instance$8 = null;
+let instance$9 = null;
 function getCloudUploadService() {
-  if (!instance$8) instance$8 = new CloudUploadService();
-  return instance$8;
+  if (!instance$9) instance$9 = new CloudUploadService();
+  return instance$9;
 }
 class SSHRsyncService {
   runningProcesses = /* @__PURE__ */ new Map();
@@ -5776,10 +5900,10 @@ class SSHRsyncService {
     return null;
   }
 }
-let instance$7 = null;
+let instance$8 = null;
 function getSSHRsyncService() {
-  if (!instance$7) instance$7 = new SSHRsyncService();
-  return instance$7;
+  if (!instance$8) instance$8 = new SSHRsyncService();
+  return instance$8;
 }
 const IMAGE_EXTENSIONS = /* @__PURE__ */ new Set([".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"]);
 const DEFAULT_MAX_KEYS = 200;
@@ -5828,8 +5952,8 @@ class OSSBrowserService {
   async getClientAndBasePrefix() {
     const settings = getSettingsRepo().getAll();
     const profile = settings.profiles.find((item) => item.id === settings.activeProfileId) || settings.profiles[0];
-    const plugins = normalizeProfilePlugins(profile.plugins);
-    if (!plugins.enabledPluginIds.includes(PLUGIN_IDS.OSS_BROWSER)) {
+    const extensions = normalizeProfileExtensions(profile.extensions, profile.plugins);
+    if (!extensions.enabledIds.includes(EXTENSION_IDS.OSS_BROWSER)) {
       throw new Error("当前 Profile 未启用 OSS 浏览器插件");
     }
     if (!providersForMode(profile.targetMode).includes("aliyun")) {
@@ -5921,306 +6045,12 @@ class OSSBrowserService {
     };
   }
 }
-let instance$6 = null;
+let instance$7 = null;
 function getOSSBrowserService() {
-  if (!instance$6) {
-    instance$6 = new OSSBrowserService();
+  if (!instance$7) {
+    instance$7 = new OSSBrowserService();
   }
-  return instance$6;
-}
-function normalizePath(p) {
-  return p.replace(/\\/g, "/");
-}
-async function walkFiles(dirPath) {
-  const entries = await promises.readdir(dirPath, { withFileTypes: true });
-  const result = [];
-  for (const entry of entries) {
-    const abs = path.join(dirPath, entry.name);
-    if (entry.isDirectory()) {
-      result.push(...await walkFiles(abs));
-      continue;
-    }
-    if (!entry.isFile()) continue;
-    const fileStat = await promises.stat(abs);
-    result.push({
-      filePath: abs,
-      size: fileStat.size,
-      mtimeMs: fileStat.mtimeMs
-    });
-  }
-  return result;
-}
-class Module1ManifestService {
-  async build(rootPath, infos, stationPrefix = "station2") {
-    const manifest = [];
-    for (const info of infos) {
-      const files = await walkFiles(info.fullPath);
-      for (const file of files) {
-        const relInFolder = normalizePath(path.relative(info.fullPath, file.filePath));
-        const localRelativePath = normalizePath(path.relative(rootPath, file.filePath));
-        const ossKey = normalizePath(
-          [stationPrefix, info.type1, info.type2, info.date, info.folderName, relInFolder].filter(Boolean).join("/")
-        ).replace(/\/+/g, "/");
-        manifest.push({
-          localRelativePath,
-          ossKey,
-          fileSize: file.size,
-          mtimeMs: file.mtimeMs
-        });
-      }
-    }
-    return manifest;
-  }
-}
-let instance$5 = null;
-function getModule1ManifestService() {
-  if (!instance$5) instance$5 = new Module1ManifestService();
-  return instance$5;
-}
-const MANIFEST_FILE = ".module1-manifest.json";
-function formatDate(d) {
-  const y = d.getFullYear();
-  const m = `${d.getMonth() + 1}`.padStart(2, "0");
-  const day = `${d.getDate()}`.padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-async function getFileDate(filePath) {
-  try {
-    const fileStat = await promises.stat(filePath);
-    return formatDate(fileStat.mtime);
-  } catch {
-    return null;
-  }
-}
-function extractTagValues(xml, tagName) {
-  const re = new RegExp(`<${tagName}>([\\s\\S]*?)<\\/${tagName}>`, "gi");
-  const values = [];
-  let match;
-  while ((match = re.exec(xml)) !== null) {
-    values.push(String(match[1]).trim());
-  }
-  return values;
-}
-function normalizeStationPrefix(value) {
-  if (typeof value !== "string") return "station2";
-  const normalized = value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").trim();
-  return normalized || "station2";
-}
-function getPluginWorkspaceRoot() {
-  const electronApp2 = electron.app;
-  return electronApp2?.getPath?.("userData") || path.join(os.tmpdir(), "ts-upload-plugin-workspaces");
-}
-class Module1PreUploadService {
-  async run(task, rawConfig) {
-    if (!fs.existsSync(task.folderPath)) {
-      throw new Error("源目录不存在，无法执行 Module1 上传前处理");
-    }
-    const config = typeof rawConfig === "object" && rawConfig !== null ? rawConfig : {};
-    const stationPrefix = normalizeStationPrefix(config.stationPrefix);
-    const stagingRootPath = path.join(
-      getPluginWorkspaceRoot(),
-      "plugin-workspaces",
-      task.id,
-      "module1"
-    );
-    await promises.rm(stagingRootPath, { recursive: true, force: true });
-    await promises.mkdir(stagingRootPath, { recursive: true });
-    await promises.cp(task.folderPath, stagingRootPath, {
-      recursive: true,
-      force: true,
-      errorOnExist: false
-    });
-    await this.processDataFolders(stagingRootPath);
-    const fileInfos = await this.splitType(stagingRootPath);
-    const manifest = await getModule1ManifestService().build(
-      stagingRootPath,
-      fileInfos,
-      stationPrefix
-    );
-    if (manifest.length === 0) {
-      throw new Error("Module1 筛选结果为空：未找到包含 annotation/segment_timestamps.xml 的有效数据目录");
-    }
-    const payload = {
-      version: 1,
-      createdAt: (/* @__PURE__ */ new Date()).toISOString(),
-      sourceRootPath: task.folderPath,
-      stagingRootPath,
-      manifest
-    };
-    await promises.writeFile(
-      path.join(stagingRootPath, MANIFEST_FILE),
-      JSON.stringify(payload, null, 2),
-      "utf-8"
-    );
-    const totalBytes = manifest.reduce((sum, item) => sum + item.fileSize, 0);
-    return {
-      pluginId: PLUGIN_IDS.MODULE1_PREUPLOAD,
-      uploadRootPath: stagingRootPath,
-      files: manifest.map((item) => ({
-        relativePath: item.localRelativePath,
-        fileSize: item.fileSize,
-        mtimeMs: item.mtimeMs,
-        plannedObjectKey: item.ossKey
-      })),
-      summary: {
-        sourceRootPath: task.folderPath,
-        stagingRootPath,
-        files: manifest.length,
-        totalBytes,
-        stationPrefix
-      },
-      artifacts: {
-        manifestPath: path.join(stagingRootPath, MANIFEST_FILE)
-      }
-    };
-  }
-  async processDataFolders(rootPath) {
-    const entries = await promises.readdir(rootPath, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const folderPath = path.join(rootPath, entry.name);
-      const weldSignalPath = path.join(folderPath, "welding_state", "weld_signal.csv");
-      if (!fs.existsSync(weldSignalPath)) continue;
-      const { startTime, endTime } = await this.readWeldSignal(weldSignalPath);
-      if (startTime === null || endTime === null) continue;
-      const startRange = startTime - 5e6;
-      const endRange = endTime + 5e6;
-      const subNames = await promises.readdir(folderPath);
-      for (const subName of subNames) {
-        if (!subName.includes("camera_0")) continue;
-        const cameraPath = path.join(folderPath, subName);
-        if (!fs.existsSync(cameraPath)) continue;
-        await this.cleanImages(cameraPath, startRange, endRange);
-      }
-    }
-  }
-  async readWeldSignal(filePath) {
-    let startTime = null;
-    let endTime = null;
-    const strictPattern = /^\s*(\d+)\s+[^:]*:\s*(true|false)\s*$/i;
-    try {
-      const text = await promises.readFile(filePath, "utf-8");
-      const lines = text.split(/\r?\n/);
-      for (const raw of lines) {
-        const line = raw.trim();
-        if (!line) continue;
-        let ts = null;
-        let isTrue = null;
-        const strict = strictPattern.exec(line);
-        if (strict) {
-          ts = Number(strict[1]);
-          isTrue = strict[2].toLowerCase() === "true";
-        } else {
-          const tsMatch = line.match(/(\d+)/);
-          const boolMatch = line.match(/(true|false)/i);
-          if (!tsMatch || !boolMatch) continue;
-          ts = Number(tsMatch[1]);
-          isTrue = boolMatch[1].toLowerCase() === "true";
-        }
-        if (!Number.isFinite(ts) || isTrue === null) continue;
-        if (isTrue && startTime === null) startTime = ts;
-        if (!isTrue) endTime = ts;
-      }
-    } catch {
-      return { startTime: null, endTime: null };
-    }
-    return { startTime, endTime };
-  }
-  async cleanImages(folderPath, startRange, endRange) {
-    let deletedCount = 0;
-    const filenames = await promises.readdir(folderPath);
-    for (const filename of filenames) {
-      if (!filename.toLowerCase().endsWith(".jpg")) continue;
-      const abs = path.join(folderPath, filename);
-      try {
-        const stem = filename.slice(0, -4);
-        const ts = Number(stem);
-        if (!Number.isFinite(ts)) {
-          log.warn(`文件名 ${filename} 不包含有效时间戳，已跳过`);
-          continue;
-        }
-        if (ts >= startRange && ts <= endRange) continue;
-        await promises.rm(abs, { force: true });
-        deletedCount++;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        log.warn(`删除文件 ${filename} 时出错: ${msg}`);
-      }
-    }
-    log.info(`Module1 staging 在 ${path.basename(folderPath)} 中删除了 ${deletedCount} 个文件`);
-  }
-  async splitType(rootPath) {
-    const originalDirs = (await promises.readdir(rootPath, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
-    await this.createProjectStructure(rootPath);
-    const infos = [];
-    for (const dirName of originalDirs) {
-      const fullPath = path.join(rootPath, dirName);
-      const xmlPath = path.join(fullPath, "annotation", "segment_timestamps.xml");
-      if (!fs.existsSync(xmlPath)) continue;
-      let type1 = "unknown";
-      let type2 = "";
-      let failed = false;
-      let specMin = 0;
-      let specMax = 0;
-      let dataType = "";
-      let qualityType = "";
-      try {
-        const xml = await promises.readFile(xmlPath, "utf-8");
-        const minValues = extractTagValues(xml, "data_spec_min");
-        const maxValues = extractTagValues(xml, "data_spec_max");
-        const dataTypeValues = extractTagValues(xml, "data_type");
-        const qualityValues = extractTagValues(xml, "quality_type");
-        if (minValues.length !== 1 || maxValues.length !== 1 || dataTypeValues.length !== 1 || qualityValues.length !== 1) {
-          failed = true;
-        } else {
-          specMin = Number(minValues[0]);
-          specMax = Number(maxValues[0]);
-          dataType = dataTypeValues[0];
-          qualityType = qualityValues[0];
-          if (!Number.isFinite(specMin) || !Number.isFinite(specMax)) failed = true;
-        }
-      } catch {
-        failed = true;
-      }
-      if (!failed) {
-        if (qualityType === "bad") type1 = "RL";
-        else if (dataType.includes("teleop")) type1 = "teleop";
-        else type1 = "vla";
-        type2 = specMin === specMax ? `${specMin}mm` : `${specMin}-${specMax}mm`;
-      }
-      const stateTypePath = path.join(fullPath, "state_type");
-      const date = await getFileDate(stateTypePath);
-      infos.push({
-        fullPath,
-        folderName: path.basename(fullPath),
-        type1,
-        type2,
-        date
-      });
-    }
-    log.info("Module1 split 完成, fileInfo 数量:", infos.length);
-    return infos;
-  }
-  async createProjectStructure(rootPath) {
-    const structure = {
-      vla: ["1mm", "1-2mm", "2mm", "3mm"],
-      teleop: ["1mm", "1-2mm", "2mm", "3mm"],
-      RL: ["1mm", "1-2mm", "2mm", "3mm"],
-      unknown: []
-    };
-    for (const [top, subs] of Object.entries(structure)) {
-      const topDir = path.join(rootPath, top);
-      await promises.mkdir(topDir, { recursive: true });
-      for (const sub of subs) {
-        await promises.mkdir(path.join(topDir, sub), { recursive: true });
-      }
-    }
-  }
-}
-let instance$4 = null;
-function getModule1PreUploadService() {
-  if (!instance$4) instance$4 = new Module1PreUploadService();
-  return instance$4;
+  return instance$7;
 }
 class WebhookService {
   async notify(config, payload) {
@@ -6252,23 +6082,24 @@ class WebhookService {
     log.error(`Webhook 通知最终失败: ${config.url}`);
   }
 }
-let instance$3 = null;
+let instance$6 = null;
 function getWebhookService() {
-  if (!instance$3) instance$3 = new WebhookService();
-  return instance$3;
+  if (!instance$6) instance$6 = new WebhookService();
+  return instance$6;
 }
 function isRecord(value) {
   return typeof value === "object" && value !== null;
 }
-function normalizedTaskPlugins(task) {
-  return normalizeProfilePlugins(
+function normalizedTaskExtensions(task) {
+  return normalizeProfileExtensions(
+    task.profileSnapshot?.extensions,
     task.profileSnapshot?.plugins
   );
 }
-function configForPlugin(plugins, pluginId) {
-  return plugins.configs[pluginId];
+function configForExtension(extensions, extensionId) {
+  return extensions.configs[extensionId];
 }
-function webhookConfigFromPlugin(rawConfig) {
+function webhookConfigFromExtension(rawConfig) {
   if (!isRecord(rawConfig)) return null;
   return {
     enabled: rawConfig.enabled === true,
@@ -6278,62 +6109,46 @@ function webhookConfigFromPlugin(rawConfig) {
     ) : {}
   };
 }
-function summarizeConfig(plugin, rawConfig) {
-  if (plugin.id === PLUGIN_IDS.MODULE1_PREUPLOAD) {
-    const stationPrefix = isRecord(rawConfig) && typeof rawConfig.stationPrefix === "string" ? rawConfig.stationPrefix : "station2";
-    return `stationPrefix=${stationPrefix}`;
-  }
-  if (plugin.id === PLUGIN_IDS.WEBHOOK_NOTIFIER) {
-    const config = webhookConfigFromPlugin(rawConfig);
+function summarizeExtensionConfig(extension, rawConfig) {
+  if (extension.id === EXTENSION_IDS.WEBHOOK_NOTIFIER) {
+    const config = webhookConfigFromExtension(rawConfig);
     return config?.enabled && config.url ? `已配置 ${config.url}` : "未配置";
   }
-  if (plugin.id === PLUGIN_IDS.OSS_BROWSER) {
+  if (extension.id === EXTENSION_IDS.OSS_BROWSER) {
     return "使用当前 Profile 的阿里云 OSS 配置";
   }
   return "";
 }
-class PluginRuntimeService {
-  listManifests() {
-    return BUILTIN_PLUGINS;
+function summarizePipelineConfig(pipelineId, rawConfig) {
+  if (pipelineId === UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD) {
+    const stationPrefix = isRecord(rawConfig) && typeof rawConfig.stationPrefix === "string" ? rawConfig.stationPrefix : "station2";
+    return `stationPrefix=${stationPrefix}`;
   }
-  async runPreUploadPlugins(task) {
-    const plugins = normalizedTaskPlugins(task);
-    const enabled = new Set(plugins.enabledPluginIds);
-    for (const pluginId of plugins.order) {
-      if (pluginId !== PLUGIN_IDS.MODULE1_PREUPLOAD || !enabled.has(pluginId)) continue;
-      const run = getPluginRunRepo().start(task.id, pluginId, "preUpload");
-      try {
-        const result = await getModule1PreUploadService().run(
-          task,
-          configForPlugin(plugins, pluginId)
-        );
-        getPluginRunRepo().complete(run.id, {
-          summary: result.summary || null,
-          stagingPath: result.uploadRootPath,
-          artifacts: result.artifacts || null
-        });
-        return result;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        getPluginRunRepo().fail(run.id, message);
-        throw error;
-      }
-    }
-    return null;
+  return "使用原始源目录和 Profile 路径规则";
+}
+class ExtensionRuntimeService {
+  listManifests() {
+    return BUILTIN_EXTENSIONS;
+  }
+  listCapabilities() {
+    return {
+      uploadPipelines: BUILTIN_UPLOAD_PIPELINES,
+      extensions: BUILTIN_EXTENSIONS
+    };
   }
   notifyTaskEvent(task, event) {
     const settings = getSettingsRepo();
-    const plugins = normalizedTaskPlugins(task);
-    const webhookPluginEnabled = plugins.enabledPluginIds.includes(
-      PLUGIN_IDS.WEBHOOK_NOTIFIER
+    const extensions = normalizedTaskExtensions(task);
+    const webhookExtensionEnabled = extensions.enabledIds.includes(
+      EXTENSION_IDS.WEBHOOK_NOTIFIER
     );
-    const pluginConfig = webhookConfigFromPlugin(
-      configForPlugin(plugins, PLUGIN_IDS.WEBHOOK_NOTIFIER)
+    const extensionConfig = webhookConfigFromExtension(
+      configForExtension(extensions, EXTENSION_IDS.WEBHOOK_NOTIFIER)
     );
     const legacyConfig = settings.get("webhook");
-    const config = webhookPluginEnabled ? pluginConfig : legacyConfig;
+    const config = webhookExtensionEnabled ? extensionConfig : legacyConfig;
     if (!config?.enabled || !config.url) return;
-    const run = getPluginRunRepo().start(task.id, PLUGIN_IDS.WEBHOOK_NOTIFIER, "notification");
+    const run = getPluginRunRepo().start(task.id, EXTENSION_IDS.WEBHOOK_NOTIFIER, "notification");
     const createdAt = new Date(task.createdAt).getTime();
     const durationSeconds = Number.isFinite(createdAt) ? Math.max(0, Math.round((Date.now() - createdAt) / 1e3)) : 0;
     void getWebhookService().notify(config, {
@@ -6355,24 +6170,45 @@ class PluginRuntimeService {
     }).catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
       getPluginRunRepo().fail(run.id, message);
-      log.warn("Webhook 插件通知失败:", message);
+      log.warn("Webhook 扩展通知失败:", message);
     });
   }
-  getProfileStatus(profileId) {
+  getProjectCapabilityStatus(profileId) {
     const settings = getSettingsRepo().getAll();
     const profile = settings.profiles.find((item) => item.id === profileId) || settings.profiles.find((item) => item.id === settings.activeProfileId) || settings.profiles[0];
-    const plugins = normalizeProfilePlugins(profile.plugins);
-    const enabled = new Set(plugins.enabledPluginIds);
+    const pipeline = normalizeProfileUploadPipeline(
+      profile.uploadPipeline,
+      profile.plugins
+    );
+    const extensions = normalizeProfileExtensions(
+      profile.extensions,
+      profile.plugins
+    );
+    const enabled = new Set(extensions.enabledIds);
     const recentRuns = getPluginRunRepo().listRecent(100);
+    const pipelineManifest = BUILTIN_UPLOAD_PIPELINES.find((item) => item.id === pipeline.id) || BUILTIN_UPLOAD_PIPELINES[0];
     return {
       profileId: profile.id,
       profileName: profile.name,
-      plugins: BUILTIN_PLUGINS.map((manifest) => ({
+      uploadPipeline: {
+        manifest: pipelineManifest,
+        configSummary: summarizePipelineConfig(pipeline.id, pipeline.config),
+        lastRun: this.findLastRun(recentRuns, pipeline.id)
+      },
+      extensions: BUILTIN_EXTENSIONS.map((manifest) => ({
         manifest,
         enabled: enabled.has(manifest.id),
-        configSummary: summarizeConfig(manifest, plugins.configs[manifest.id]),
+        configSummary: summarizeExtensionConfig(manifest, extensions.configs[manifest.id]),
         lastRun: this.findLastRun(recentRuns, manifest.id)
       }))
+    };
+  }
+  getProfileStatus(profileId) {
+    const status = this.getProjectCapabilityStatus(profileId);
+    return {
+      profileId: status.profileId,
+      profileName: status.profileName,
+      plugins: status.extensions
     };
   }
   listTaskRuns(taskId) {
@@ -6382,10 +6218,10 @@ class PluginRuntimeService {
     return runs.find((run) => run.pluginId === pluginId) || null;
   }
 }
-let instance$2 = null;
-function getPluginRuntimeService() {
-  if (!instance$2) instance$2 = new PluginRuntimeService();
-  return instance$2;
+let instance$5 = null;
+function getExtensionRuntimeService() {
+  if (!instance$5) instance$5 = new ExtensionRuntimeService();
+  return instance$5;
 }
 function shouldRestartScannerAfterSettingsSave(data) {
   return data.scan !== void 0 || data.stability !== void 0 || data.profiles !== void 0 || data.activeProfileId !== void 0;
@@ -6649,14 +6485,23 @@ function registerAllIpc() {
       };
     }
   );
+  electron.ipcMain.handle(IPC.CAPABILITY_LIST, () => {
+    return getExtensionRuntimeService().listCapabilities();
+  });
+  electron.ipcMain.handle(IPC.CAPABILITY_PROFILE_STATUS, (_event, args) => {
+    return getExtensionRuntimeService().getProjectCapabilityStatus(args?.profileId);
+  });
+  electron.ipcMain.handle(IPC.CAPABILITY_TASK_RUNS, (_event, args) => {
+    return getExtensionRuntimeService().listTaskRuns(args.taskId);
+  });
   electron.ipcMain.handle(IPC.PLUGIN_LIST, () => {
-    return getPluginRuntimeService().listManifests();
+    return getExtensionRuntimeService().listManifests();
   });
   electron.ipcMain.handle(IPC.PLUGIN_PROFILE_STATUS, (_event, args) => {
-    return getPluginRuntimeService().getProfileStatus(args?.profileId);
+    return getExtensionRuntimeService().getProfileStatus(args?.profileId);
   });
   electron.ipcMain.handle(IPC.PLUGIN_TASK_RUNS, (_event, args) => {
-    return getPluginRuntimeService().listTaskRuns(args.taskId);
+    return getExtensionRuntimeService().listTaskRuns(args.taskId);
   });
   electron.ipcMain.handle(IPC.OSS_BROWSER_LIST, async (_event, args) => {
     return getOSSBrowserService().list(args?.prefix, args?.continuationToken, args?.maxKeys);
@@ -6909,6 +6754,352 @@ function registerAllIpc() {
     return results;
   });
 }
+function normalizePath(p) {
+  return p.replace(/\\/g, "/");
+}
+async function walkFiles(dirPath) {
+  const entries = await promises.readdir(dirPath, { withFileTypes: true });
+  const result = [];
+  for (const entry of entries) {
+    const abs = path.join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      result.push(...await walkFiles(abs));
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    const fileStat = await promises.stat(abs);
+    result.push({
+      filePath: abs,
+      size: fileStat.size,
+      mtimeMs: fileStat.mtimeMs
+    });
+  }
+  return result;
+}
+class Module1ManifestService {
+  async build(rootPath, infos, stationPrefix = "station2") {
+    const manifest = [];
+    for (const info of infos) {
+      const files = await walkFiles(info.fullPath);
+      for (const file of files) {
+        const relInFolder = normalizePath(path.relative(info.fullPath, file.filePath));
+        const localRelativePath = normalizePath(path.relative(rootPath, file.filePath));
+        const ossKey = normalizePath(
+          [stationPrefix, info.type1, info.type2, info.date, info.folderName, relInFolder].filter(Boolean).join("/")
+        ).replace(/\/+/g, "/");
+        manifest.push({
+          localRelativePath,
+          ossKey,
+          fileSize: file.size,
+          mtimeMs: file.mtimeMs
+        });
+      }
+    }
+    return manifest;
+  }
+}
+let instance$4 = null;
+function getModule1ManifestService() {
+  if (!instance$4) instance$4 = new Module1ManifestService();
+  return instance$4;
+}
+const MANIFEST_FILE = ".module1-manifest.json";
+function formatDate(d) {
+  const y = d.getFullYear();
+  const m = `${d.getMonth() + 1}`.padStart(2, "0");
+  const day = `${d.getDate()}`.padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+async function getFileDate(filePath) {
+  try {
+    const fileStat = await promises.stat(filePath);
+    return formatDate(fileStat.mtime);
+  } catch {
+    return null;
+  }
+}
+function extractTagValues(xml, tagName) {
+  const re = new RegExp(`<${tagName}>([\\s\\S]*?)<\\/${tagName}>`, "gi");
+  const values = [];
+  let match;
+  while ((match = re.exec(xml)) !== null) {
+    values.push(String(match[1]).trim());
+  }
+  return values;
+}
+function normalizeStationPrefix(value) {
+  if (typeof value !== "string") return "station2";
+  const normalized = value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").trim();
+  return normalized || "station2";
+}
+function getPluginWorkspaceRoot() {
+  const electronApp2 = electron.app;
+  return electronApp2?.getPath?.("userData") || path.join(os.tmpdir(), "ts-upload-plugin-workspaces");
+}
+class Module1PreUploadService {
+  async run(task, rawConfig) {
+    if (!fs.existsSync(task.folderPath)) {
+      throw new Error("源目录不存在，无法执行 Module1 上传前处理");
+    }
+    const config = typeof rawConfig === "object" && rawConfig !== null ? rawConfig : {};
+    const stationPrefix = normalizeStationPrefix(config.stationPrefix);
+    const stagingRootPath = path.join(
+      getPluginWorkspaceRoot(),
+      "plugin-workspaces",
+      task.id,
+      "module1"
+    );
+    await promises.rm(stagingRootPath, { recursive: true, force: true });
+    await promises.mkdir(stagingRootPath, { recursive: true });
+    await promises.cp(task.folderPath, stagingRootPath, {
+      recursive: true,
+      force: true,
+      errorOnExist: false
+    });
+    await this.processDataFolders(stagingRootPath);
+    const fileInfos = await this.splitType(stagingRootPath);
+    const manifest = await getModule1ManifestService().build(
+      stagingRootPath,
+      fileInfos,
+      stationPrefix
+    );
+    if (manifest.length === 0) {
+      throw new Error("Module1 筛选结果为空：未找到包含 annotation/segment_timestamps.xml 的有效数据目录");
+    }
+    const payload = {
+      version: 1,
+      createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+      sourceRootPath: task.folderPath,
+      stagingRootPath,
+      manifest
+    };
+    await promises.writeFile(
+      path.join(stagingRootPath, MANIFEST_FILE),
+      JSON.stringify(payload, null, 2),
+      "utf-8"
+    );
+    const totalBytes = manifest.reduce((sum, item) => sum + item.fileSize, 0);
+    return {
+      pipelineId: UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD,
+      uploadRootPath: stagingRootPath,
+      requiredStableChecks: 1,
+      files: manifest.map((item) => ({
+        relativePath: item.localRelativePath,
+        fileSize: item.fileSize,
+        mtimeMs: item.mtimeMs,
+        plannedObjectKey: item.ossKey
+      })),
+      summary: {
+        sourceRootPath: task.folderPath,
+        stagingRootPath,
+        files: manifest.length,
+        totalBytes,
+        stationPrefix
+      },
+      artifacts: {
+        manifestPath: path.join(stagingRootPath, MANIFEST_FILE)
+      }
+    };
+  }
+  async processDataFolders(rootPath) {
+    const entries = await promises.readdir(rootPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const folderPath = path.join(rootPath, entry.name);
+      const weldSignalPath = path.join(folderPath, "welding_state", "weld_signal.csv");
+      if (!fs.existsSync(weldSignalPath)) continue;
+      const { startTime, endTime } = await this.readWeldSignal(weldSignalPath);
+      if (startTime === null || endTime === null) continue;
+      const startRange = startTime - 5e6;
+      const endRange = endTime + 5e6;
+      const subNames = await promises.readdir(folderPath);
+      for (const subName of subNames) {
+        if (!subName.includes("camera_0")) continue;
+        const cameraPath = path.join(folderPath, subName);
+        if (!fs.existsSync(cameraPath)) continue;
+        await this.cleanImages(cameraPath, startRange, endRange);
+      }
+    }
+  }
+  async readWeldSignal(filePath) {
+    let startTime = null;
+    let endTime = null;
+    const strictPattern = /^\s*(\d+)\s+[^:]*:\s*(true|false)\s*$/i;
+    try {
+      const text = await promises.readFile(filePath, "utf-8");
+      const lines = text.split(/\r?\n/);
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+        let ts = null;
+        let isTrue = null;
+        const strict = strictPattern.exec(line);
+        if (strict) {
+          ts = Number(strict[1]);
+          isTrue = strict[2].toLowerCase() === "true";
+        } else {
+          const tsMatch = line.match(/(\d+)/);
+          const boolMatch = line.match(/(true|false)/i);
+          if (!tsMatch || !boolMatch) continue;
+          ts = Number(tsMatch[1]);
+          isTrue = boolMatch[1].toLowerCase() === "true";
+        }
+        if (!Number.isFinite(ts) || isTrue === null) continue;
+        if (isTrue && startTime === null) startTime = ts;
+        if (!isTrue) endTime = ts;
+      }
+    } catch {
+      return { startTime: null, endTime: null };
+    }
+    return { startTime, endTime };
+  }
+  async cleanImages(folderPath, startRange, endRange) {
+    let deletedCount = 0;
+    const filenames = await promises.readdir(folderPath);
+    for (const filename of filenames) {
+      if (!filename.toLowerCase().endsWith(".jpg")) continue;
+      const abs = path.join(folderPath, filename);
+      try {
+        const stem = filename.slice(0, -4);
+        const ts = Number(stem);
+        if (!Number.isFinite(ts)) {
+          log.warn(`文件名 ${filename} 不包含有效时间戳，已跳过`);
+          continue;
+        }
+        if (ts >= startRange && ts <= endRange) continue;
+        await promises.rm(abs, { force: true });
+        deletedCount++;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`删除文件 ${filename} 时出错: ${msg}`);
+      }
+    }
+    log.info(`Module1 staging 在 ${path.basename(folderPath)} 中删除了 ${deletedCount} 个文件`);
+  }
+  async splitType(rootPath) {
+    const originalDirs = (await promises.readdir(rootPath, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    await this.createProjectStructure(rootPath);
+    const infos = [];
+    for (const dirName of originalDirs) {
+      const fullPath = path.join(rootPath, dirName);
+      const xmlPath = path.join(fullPath, "annotation", "segment_timestamps.xml");
+      if (!fs.existsSync(xmlPath)) continue;
+      let type1 = "unknown";
+      let type2 = "";
+      let failed = false;
+      let specMin = 0;
+      let specMax = 0;
+      let dataType = "";
+      let qualityType = "";
+      try {
+        const xml = await promises.readFile(xmlPath, "utf-8");
+        const minValues = extractTagValues(xml, "data_spec_min");
+        const maxValues = extractTagValues(xml, "data_spec_max");
+        const dataTypeValues = extractTagValues(xml, "data_type");
+        const qualityValues = extractTagValues(xml, "quality_type");
+        if (minValues.length !== 1 || maxValues.length !== 1 || dataTypeValues.length !== 1 || qualityValues.length !== 1) {
+          failed = true;
+        } else {
+          specMin = Number(minValues[0]);
+          specMax = Number(maxValues[0]);
+          dataType = dataTypeValues[0];
+          qualityType = qualityValues[0];
+          if (!Number.isFinite(specMin) || !Number.isFinite(specMax)) failed = true;
+        }
+      } catch {
+        failed = true;
+      }
+      if (!failed) {
+        if (qualityType === "bad") type1 = "RL";
+        else if (dataType.includes("teleop")) type1 = "teleop";
+        else type1 = "vla";
+        type2 = specMin === specMax ? `${specMin}mm` : `${specMin}-${specMax}mm`;
+      }
+      const stateTypePath = path.join(fullPath, "state_type");
+      const date = await getFileDate(stateTypePath);
+      infos.push({
+        fullPath,
+        folderName: path.basename(fullPath),
+        type1,
+        type2,
+        date
+      });
+    }
+    log.info("Module1 split 完成, fileInfo 数量:", infos.length);
+    return infos;
+  }
+  async createProjectStructure(rootPath) {
+    const structure = {
+      vla: ["1mm", "1-2mm", "2mm", "3mm"],
+      teleop: ["1mm", "1-2mm", "2mm", "3mm"],
+      RL: ["1mm", "1-2mm", "2mm", "3mm"],
+      unknown: []
+    };
+    for (const [top, subs] of Object.entries(structure)) {
+      const topDir = path.join(rootPath, top);
+      await promises.mkdir(topDir, { recursive: true });
+      for (const sub of subs) {
+        await promises.mkdir(path.join(topDir, sub), { recursive: true });
+      }
+    }
+  }
+}
+let instance$3 = null;
+function getModule1PreUploadService() {
+  if (!instance$3) instance$3 = new Module1PreUploadService();
+  return instance$3;
+}
+class UploadPipelineRuntimeService {
+  listManifests() {
+    return BUILTIN_UPLOAD_PIPELINES;
+  }
+  async prepareUploadPlan(task, sourceStableChecks) {
+    const pipeline = normalizeProfileUploadPipeline(
+      task.profileSnapshot?.uploadPipeline,
+      task.profileSnapshot?.plugins
+    );
+    const run = getPluginRunRepo().start(task.id, pipeline.id, "pipeline");
+    try {
+      const result = pipeline.id === UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD ? await getModule1PreUploadService().run(task, pipeline.config) : await this.prepareStandardUploadPlan(task, sourceStableChecks);
+      getPluginRunRepo().complete(run.id, {
+        summary: result.summary || null,
+        stagingPath: result.pipelineId === UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD ? result.uploadRootPath : null,
+        artifacts: result.artifacts || null
+      });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      getPluginRunRepo().fail(run.id, message);
+      throw error;
+    }
+  }
+  async prepareStandardUploadPlan(task, requiredStableChecks) {
+    const settings = getSettingsRepo().getAll();
+    const files = await new FileFilterService(
+      task.profileSnapshot?.filter || settings.filter
+    ).scanFolderAsync(task.folderPath);
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+    return {
+      pipelineId: UPLOAD_PIPELINE_IDS.STANDARD_UPLOAD,
+      uploadRootPath: task.folderPath,
+      requiredStableChecks,
+      files: files.map((file) => ({
+        relativePath: file.relativePath,
+        fileSize: file.size,
+        mtimeMs: file.mtimeMs
+      })),
+      summary: {
+        files: files.length,
+        totalBytes
+      }
+    };
+  }
+}
+let instance$2 = null;
+function getUploadPipelineRuntimeService() {
+  if (!instance$2) instance$2 = new UploadPipelineRuntimeService();
+  return instance$2;
+}
 class SpeedCalculator {
   samples = [];
   windowMs;
@@ -7021,17 +7212,19 @@ class TaskRunnerService {
       );
       return "skipped";
     }
-    const preUploadResult = await getPluginRuntimeService().runPreUploadPlugins(task);
-    const uploadRootPath = preUploadResult?.uploadRootPath || task.folderPath;
+    const uploadPlan = await getUploadPipelineRuntimeService().prepareUploadPlan(
+      task,
+      stableChecks
+    );
+    const uploadRootPath = uploadPlan.uploadRootPath;
     if (!fs.existsSync(uploadRootPath)) {
       throw new Error("上传工作目录不存在");
     }
-    const requiredStableChecks = preUploadResult ? 1 : stableChecks;
+    const requiredStableChecks = uploadPlan.requiredStableChecks;
     await this.reconcileBeforeUpload(
       task,
       requiredStableChecks,
-      uploadRootPath,
-      preUploadResult
+      uploadPlan
     );
     const destinations = destinationRepo.listByTask(task.id);
     if (destinations.length === 0) {
@@ -7166,19 +7359,12 @@ class TaskRunnerService {
     );
     return finalStatus;
   }
-  async reconcileBeforeUpload(task, stableChecks, uploadRootPath, preUploadResult) {
-    const settings = getSettingsRepo().getAll();
-    const files = preUploadResult ? preUploadResult.files.map((file) => ({
+  async reconcileBeforeUpload(task, stableChecks, uploadPlan) {
+    const files = uploadPlan.files.map((file) => ({
       relativePath: file.relativePath,
       size: file.fileSize,
       mtimeMs: file.mtimeMs,
       plannedObjectKey: file.plannedObjectKey
-    })) : (await new FileFilterService(task.profileSnapshot?.filter || settings.filter).scanFolderAsync(
-      uploadRootPath
-    )).map((file) => ({
-      relativePath: file.relativePath,
-      size: file.size,
-      mtimeMs: file.mtimeMs
     }));
     getTaskRepo().reconcileFiles(
       task.id,
@@ -7849,7 +8035,7 @@ function registerHotkey() {
 function startServices() {
   const taskQueue = getTaskQueueService();
   const taskRunner = getTaskRunnerService();
-  const pluginRuntime = getPluginRuntimeService();
+  const extensionRuntime = getExtensionRuntimeService();
   const taskRepo = getTaskRepo();
   const scanner = getScannerService();
   taskQueue.setTaskRunner(async (task, signal) => {
@@ -7857,14 +8043,14 @@ function startServices() {
     if (signal.aborted) return finalStatus;
     if (finalStatus === "completed") {
       const updatedTask = taskRepo.getById(task.id);
-      if (updatedTask) pluginRuntime.notifyTaskEvent(updatedTask, "task_completed");
+      if (updatedTask) extensionRuntime.notifyTaskEvent(updatedTask, "task_completed");
     }
     return finalStatus;
   });
   taskQueue.on("task:status-change", (event) => {
     if (event.newStatus === "failed") {
       const task = taskRepo.getById(event.taskId);
-      if (task) pluginRuntime.notifyTaskEvent(task, "task_failed");
+      if (task) extensionRuntime.notifyTaskEvent(task, "task_failed");
     }
     for (const win of electron.BrowserWindow.getAllWindows()) {
       win.webContents.send(IPC.TASK_STATUS_CHANGE, event);

@@ -16,7 +16,7 @@ import { getSettingsRepo } from './db/settings.repo'
 import { getScannerService } from './services/scanner.service'
 import { getTaskQueueService } from './services/task-queue.service'
 import { getTaskRunnerService } from './services/task-runner.service'
-import { getPluginRuntimeService } from './services/plugin-runtime.service'
+import { getExtensionRuntimeService } from './services/extension-runtime.service'
 import { getCleanupService } from './services/cleanup.service'
 import { getTaskRepo } from './db/task.repo'
 import { initLogger } from './utils/logger'
@@ -179,7 +179,7 @@ function registerHotkey(): void {
 function startServices(): void {
   const taskQueue = getTaskQueueService()
   const taskRunner = getTaskRunnerService()
-  const pluginRuntime = getPluginRuntimeService()
+  const extensionRuntime = getExtensionRuntimeService()
   const taskRepo = getTaskRepo()
   const scanner = getScannerService()
 
@@ -190,7 +190,7 @@ function startServices(): void {
 
     if (finalStatus === 'completed') {
       const updatedTask = taskRepo.getById(task.id)
-      if (updatedTask) pluginRuntime.notifyTaskEvent(updatedTask, 'task_completed')
+      if (updatedTask) extensionRuntime.notifyTaskEvent(updatedTask, 'task_completed')
     }
     return finalStatus
   })
@@ -198,7 +198,7 @@ function startServices(): void {
   taskQueue.on('task:status-change', (event: { taskId: string; newStatus: string }) => {
     if (event.newStatus === 'failed') {
       const task = taskRepo.getById(event.taskId)
-      if (task) pluginRuntime.notifyTaskEvent(task, 'task_failed')
+      if (task) extensionRuntime.notifyTaskEvent(task, 'task_failed')
     }
 
     // 广播状态变更到渲染进程

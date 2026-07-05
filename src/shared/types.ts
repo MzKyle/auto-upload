@@ -305,6 +305,8 @@ export interface UploadProfile {
   filter: FilterRules
   scan: UploadProfileScanConfig
   providers: Record<CloudProvider, UploadProfileProviderConfig>
+  uploadPipeline?: ProfileUploadPipelineConfig
+  extensions?: ProfileExtensionConfig
   plugins?: ProfilePluginConfig
 }
 
@@ -314,15 +316,37 @@ export interface WebhookConfig {
   enabled: boolean
 }
 
-export type PluginCategory = 'preUpload' | 'notification' | 'tool'
+export type UploadPipelineId = 'standard-upload' | 'sany-module1-upload'
+export type ExtensionId = 'webhook-notifier' | 'oss-browser'
+export type PluginCategory = 'pipeline' | 'preUpload' | 'notification' | 'tool'
 export type PluginRunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped'
 
-export interface PluginManifest {
-  id: string
+export interface UploadPipelineManifest {
+  id: UploadPipelineId
   name: string
   version: string
-  category: PluginCategory
+  category: 'pipeline'
   description: string
+}
+
+export interface ExtensionManifest {
+  id: ExtensionId
+  name: string
+  version: string
+  category: 'notification' | 'tool'
+  description: string
+}
+
+export type PluginManifest = ExtensionManifest
+
+export interface ProfileUploadPipelineConfig {
+  id: UploadPipelineId
+  config: Record<string, unknown>
+}
+
+export interface ProfileExtensionConfig {
+  enabledIds: string[]
+  configs: Record<string, unknown>
 }
 
 export interface ProfilePluginConfig {
@@ -338,13 +362,16 @@ export interface PreUploadFilePlan {
   plannedObjectKey?: string
 }
 
-export interface PreUploadResult {
-  pluginId: string
+export interface UploadPipelineResult {
+  pipelineId: UploadPipelineId
   uploadRootPath: string
   files: PreUploadFilePlan[]
+  requiredStableChecks: number
   summary?: Record<string, unknown>
   artifacts?: Record<string, unknown>
 }
+
+export type PreUploadResult = UploadPipelineResult
 
 export interface TaskPluginRun {
   id: string
@@ -371,6 +398,17 @@ export interface PluginProfileStatus {
   profileId: string
   profileName: string
   plugins: PluginProfileStatusItem[]
+}
+
+export interface ProjectCapabilityStatus {
+  profileId: string
+  profileName: string
+  uploadPipeline: {
+    manifest: UploadPipelineManifest
+    configSummary: string
+    lastRun: TaskPluginRun | null
+  }
+  extensions: PluginProfileStatusItem[]
 }
 
 export interface ScanConfig {

@@ -9,7 +9,7 @@ import { getSSHRsyncService } from '../services/ssh-rsync.service'
 import { getOSSUploadService } from '../services/oss-upload.service'
 import { getTencentS3UploadService } from '../services/tencent-s3-upload.service'
 import { getOSSBrowserService } from '../services/oss-browser.service'
-import { getPluginRuntimeService } from '../services/plugin-runtime.service'
+import { getExtensionRuntimeService } from '../services/extension-runtime.service'
 import { getCleanupService } from '../services/cleanup.service'
 import { getDayFolderRepo } from '../db/day-folder.repo'
 import { getDayFolderService } from '../services/day-folder.service'
@@ -342,17 +342,30 @@ export function registerAllIpc(): void {
     }
   )
 
-  // ---- 项目插件 ----
+  // ---- 项目能力 ----
+  ipcMain.handle(IPC.CAPABILITY_LIST, () => {
+    return getExtensionRuntimeService().listCapabilities()
+  })
+
+  ipcMain.handle(IPC.CAPABILITY_PROFILE_STATUS, (_event, args?: { profileId?: string }) => {
+    return getExtensionRuntimeService().getProjectCapabilityStatus(args?.profileId)
+  })
+
+  ipcMain.handle(IPC.CAPABILITY_TASK_RUNS, (_event, args: { taskId: string }) => {
+    return getExtensionRuntimeService().listTaskRuns(args.taskId)
+  })
+
+  // ---- 项目插件兼容别名 ----
   ipcMain.handle(IPC.PLUGIN_LIST, () => {
-    return getPluginRuntimeService().listManifests()
+    return getExtensionRuntimeService().listManifests()
   })
 
   ipcMain.handle(IPC.PLUGIN_PROFILE_STATUS, (_event, args?: { profileId?: string }) => {
-    return getPluginRuntimeService().getProfileStatus(args?.profileId)
+    return getExtensionRuntimeService().getProfileStatus(args?.profileId)
   })
 
   ipcMain.handle(IPC.PLUGIN_TASK_RUNS, (_event, args: { taskId: string }) => {
-    return getPluginRuntimeService().listTaskRuns(args.taskId)
+    return getExtensionRuntimeService().listTaskRuns(args.taskId)
   })
 
   // ---- OSS 浏览器工具插件 ----
