@@ -52,8 +52,6 @@ export default function Plugins() {
 
   useEffect(() => {
     load().catch(() => {})
-    // 初次加载只需要运行一次。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   return (

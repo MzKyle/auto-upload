@@ -34,6 +34,7 @@ export default tseslint.config(
       '__MACOSX/**',
       'coverage/**',
       'release/**',
+      'index-*.js',
       '*.config.js',
       '*.config.cjs'
     ]

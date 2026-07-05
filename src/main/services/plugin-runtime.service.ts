@@ -2,7 +2,6 @@ import log from 'electron-log'
 import { BUILTIN_PLUGINS, PLUGIN_IDS } from '@shared/plugins'
 import { normalizeProfilePlugins } from '@shared/upload-profile'
 import type {
-  AppSettings,
   PluginManifest,
   PluginProfileStatus,
   PreUploadResult,
