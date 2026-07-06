@@ -9,6 +9,20 @@ interface PatternMatcher {
   wildcard?: RegExp
 }
 
+interface ScannedFile {
+  relativePath: string
+  absolutePath: string
+  size: number
+  mtimeMs: number
+}
+
+const MARKER_FILE_NAMES = new Set([
+  'tmp_upload.json',
+  'process_task.json',
+  'day_upload.json'
+])
+const ASYNC_STAT_BATCH_SIZE = 64
+
 /**
  * 文件过滤规则引擎
  * 优先级：白名单 > 黑名单 > 正则排除 > 后缀匹配
@@ -80,51 +94,33 @@ export class FileFilterService {
    */
   scanFolder(
     folderPath: string
-  ): Array<{
-    relativePath: string
-    absolutePath: string
-    size: number
-    mtimeMs: number
-  }> {
-    const results: Array<{
-      relativePath: string
-      absolutePath: string
-      size: number
-      mtimeMs: number
-    }> = []
+  ): ScannedFile[] {
+    const results: ScannedFile[] = []
     this.walkDir(folderPath, folderPath, results)
     return results
   }
 
-  async scanFolderAsync(
-    folderPath: string
-  ): Promise<
-    Array<{
-      relativePath: string
-      absolutePath: string
-      size: number
-      mtimeMs: number
-    }>
-  > {
-    const results: Array<{
-      relativePath: string
-      absolutePath: string
-      size: number
-      mtimeMs: number
-    }> = []
-    await this.walkDirAsync(folderPath, folderPath, results)
+  async scanFolderAsync(folderPath: string): Promise<ScannedFile[]> {
+    const results: ScannedFile[] = []
+    const pendingStats: Array<Promise<ScannedFile | null>> = []
+    const flushStats = async (): Promise<void> => {
+      if (pendingStats.length === 0) return
+      const batch = pendingStats.splice(0, pendingStats.length)
+      const files = await Promise.all(batch)
+      for (const file of files) {
+        if (file) results.push(file)
+      }
+    }
+
+    await this.walkDirAsync(folderPath, folderPath, pendingStats, flushStats)
+    await flushStats()
     return results
   }
 
   private walkDir(
     basePath: string,
     currentPath: string,
-    results: Array<{
-      relativePath: string
-      absolutePath: string
-      size: number
-      mtimeMs: number
-    }>
+    results: ScannedFile[]
   ): void {
     const entries = readdirSync(currentPath, { withFileTypes: true })
     for (const entry of entries) {
@@ -136,11 +132,7 @@ export class FileFilterService {
       } else if (entry.isFile()) {
         const relativePath = fullPath.slice(basePath.length + 1)
         // 跳过标记文件
-        if (
-          entry.name === 'tmp_upload.json' ||
-          entry.name === 'process_task.json' ||
-          entry.name === 'day_upload.json'
-        ) continue
+        if (MARKER_FILE_NAMES.has(entry.name)) continue
         if (this.shouldInclude(relativePath)) {
           const stat = statSync(fullPath)
           results.push({
@@ -157,40 +149,43 @@ export class FileFilterService {
   private async walkDirAsync(
     basePath: string,
     currentPath: string,
-    results: Array<{
-      relativePath: string
-      absolutePath: string
-      size: number
-      mtimeMs: number
-    }>
+    pendingStats: Array<Promise<ScannedFile | null>>,
+    flushStats: () => Promise<void>
   ): Promise<void> {
     const entries = await readdir(currentPath, { withFileTypes: true })
     for (const entry of entries) {
       const fullPath = join(currentPath, entry.name)
       if (entry.isDirectory()) {
         if (entry.name.startsWith('.')) continue
-        await this.walkDirAsync(basePath, fullPath, results)
+        await this.walkDirAsync(basePath, fullPath, pendingStats, flushStats)
       } else if (entry.isFile()) {
         const relativePath = fullPath.slice(basePath.length + 1)
-        if (
-          entry.name === 'tmp_upload.json' ||
-          entry.name === 'process_task.json' ||
-          entry.name === 'day_upload.json'
-        ) continue
+        if (MARKER_FILE_NAMES.has(entry.name)) continue
         if (!this.shouldInclude(relativePath)) continue
 
-        try {
-          const fileStat = await stat(fullPath)
-          results.push({
-            relativePath,
-            absolutePath: fullPath,
-            size: fileStat.size,
-            mtimeMs: fileStat.mtimeMs
-          })
-        } catch {
-          // 文件可能在异步扫描期间被删除。
+        pendingStats.push(this.statScannedFile(fullPath, relativePath))
+        if (pendingStats.length >= ASYNC_STAT_BATCH_SIZE) {
+          await flushStats()
         }
       }
+    }
+  }
+
+  private async statScannedFile(
+    fullPath: string,
+    relativePath: string
+  ): Promise<ScannedFile | null> {
+    try {
+      const fileStat = await stat(fullPath)
+      return {
+        relativePath,
+        absolutePath: fullPath,
+        size: fileStat.size,
+        mtimeMs: fileStat.mtimeMs
+      }
+    } catch {
+      // 文件可能在异步扫描期间被删除。
+      return null
     }
   }
 

@@ -5,9 +5,14 @@ import {
   runMigrations,
   setDbForTests
 } from '../src/main/db/database'
-import { TaskDestinationRepo } from '../src/main/db/task-destination.repo'
+import {
+  TaskDestinationRepo,
+  type FileDestinationUploadTarget
+} from '../src/main/db/task-destination.repo'
 import { TaskRepo } from '../src/main/db/task.repo'
 import { TaskRunnerService } from '../src/main/services/task-runner.service'
+import type { ObjectKeyRenderContext } from '../src/shared/upload-profile'
+import type { CloudProvider, Task } from '../src/shared/types'
 
 function createDatabase(): Database.Database {
   const db = new Database(':memory:')
@@ -275,4 +280,97 @@ test('scanner-style reconcile does not rewrite planned object keys', () => {
     TaskDestinationRepo.prototype.replacePlannedObjectKeys = originalReplace
     closeDatabase(db)
   }
+})
+
+test('object key validation reuses task-level path context', () => {
+  interface TaskRunnerInternals {
+    findProfileBasePath: (task: Task) => string | undefined
+    buildObjectKeyBaseContext: (
+      task: Task
+    ) => Omit<ObjectKeyRenderContext, 'relativePath'>
+    assertNoDuplicateObjectKeys: (
+      destinationByProvider: Map<CloudProvider, Task['destinations'][number]>,
+      jobs: FileDestinationUploadTarget[],
+      objectKeyBaseContext: Omit<ObjectKeyRenderContext, 'relativePath'>
+    ) => void
+  }
+
+  const service = new TaskRunnerService() as unknown as TaskRunnerInternals
+  let basePathLookups = 0
+  service.findProfileBasePath = () => {
+    basePathLookups++
+    return '/data/root'
+  }
+  const task = {
+    id: 'task-1',
+    folderPath: '/data/root/2026-06-30/work-1',
+    folderName: 'work-1',
+    status: 'pending',
+    totalFiles: 0,
+    uploadedFiles: 0,
+    totalBytes: 0,
+    uploadedBytes: 0,
+    ossPrefix: '',
+    uploadTargetMode: 'aliyun',
+    destinations: [],
+    dayFolderId: 'day-1',
+    uploadRelativePath: '2026-06-30/work-1',
+    errorMessage: null,
+    sourceType: 'local',
+    sourceMachineId: null,
+    profileId: 'profile-1',
+    profileName: 'Profile 1',
+    profileSnapshot: null,
+    createdAt: '2026-06-30T00:00:00.000Z',
+    updatedAt: '2026-06-30T00:00:00.000Z',
+    completedAt: null
+  } as Task
+  const destination = {
+    id: 'destination-1',
+    taskId: task.id,
+    provider: 'aliyun',
+    status: 'pending',
+    prefix: 'upload',
+    uploadRelativePath: '',
+    pathMode: 'keep-source',
+    objectKeyTemplate: null,
+    totalFiles: 0,
+    uploadedFiles: 0,
+    totalBytes: 0,
+    uploadedBytes: 0,
+    errorMessage: null,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    completedAt: null
+  } as Task['destinations'][number]
+  const jobs = Array.from({ length: 1000 }, (_, index) => ({
+    id: `target-${index}`,
+    taskFileId: `file-${index}`,
+    taskDestinationId: destination.id,
+    provider: 'aliyun',
+    status: 'pending',
+    objectKey: null,
+    plannedObjectKey: null,
+    uploadId: null,
+    errorMessage: null,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    taskId: task.id,
+    relativePath: `camera/${String(index).padStart(5, '0')}.jpg`,
+    fileSize: 10,
+    mtimeMs: 1000,
+    retryCount: 0,
+    nextRetryAt: null,
+    sourceStatus: 'present',
+    stableCount: 2
+  })) as FileDestinationUploadTarget[]
+
+  const baseContext = service.buildObjectKeyBaseContext(task)
+  service.assertNoDuplicateObjectKeys(
+    new Map([['aliyun', destination]]),
+    jobs,
+    baseContext
+  )
+
+  assert.equal(basePathLookups, 1)
 })
