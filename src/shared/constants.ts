@@ -2,6 +2,11 @@
 // 共享常量
 // ============================================
 
+import {
+  DEFAULT_PROFILE_EXTENSIONS,
+  DEFAULT_PROFILE_UPLOAD_PIPELINE
+} from './plugins'
+
 export const APP_NAME = '云桥上传器'
 export const DEFAULT_WORK_DIR_NAME_PATTERN = '^\\d{2}-\\d{2}-\\d{2}$'
 export const DEFAULT_UPLOAD_PROFILE_ID = 'default'
@@ -19,7 +24,7 @@ export const DEFAULT_SETTINGS = {
   upload: {
     maxConcurrentTasks: 4,
     maxFilesPerTask: 12,
-    maxConcurrentUploads: 24,
+    maxConcurrentUploads: 12,
     multipartThreshold: 100 * 1024 * 1024, // 100MB
     startAfterTime: '20:30',
     endBeforeTime: '23:59'
@@ -80,7 +85,9 @@ export const DEFAULT_SETTINGS = {
           pathSegmentCount: 2,
           objectKeyTemplate: '{relativePath}'
         }
-      }
+      },
+      uploadPipeline: DEFAULT_PROFILE_UPLOAD_PIPELINE,
+      extensions: DEFAULT_PROFILE_EXTENSIONS
     }
   ],
   activeProfileId: DEFAULT_UPLOAD_PROFILE_ID,

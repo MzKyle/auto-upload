@@ -7,6 +7,9 @@ import { deriveDateScopedUploadRelativePath } from '@shared/day-folder'
 
 let db: Database.Database | null = null
 
+const DATA_MIGRATION_DATE_PATHS = 'data-migration:date-upload-paths:v1'
+const DATA_MIGRATION_DESTINATIONS = 'data-migration:task-destinations:v1'
+
 export function getDb(): Database.Database {
   if (!db) {
     throw new Error('数据库未初始化')
@@ -127,6 +130,7 @@ export function runMigrations(db: Database.Database): void {
       provider TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending',
       object_key TEXT,
+      planned_object_key TEXT,
       upload_id TEXT,
       error_message TEXT,
       created_at TEXT NOT NULL,
@@ -143,6 +147,24 @@ export function runMigrations(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_task_file_destinations_task_file_id ON task_file_destinations(task_file_id);
     CREATE INDEX IF NOT EXISTS idx_task_file_destinations_destination_id ON task_file_destinations(task_destination_id);
     CREATE INDEX IF NOT EXISTS idx_day_folders_status ON day_folders(status);
+
+    CREATE TABLE IF NOT EXISTS task_plugin_runs (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      plugin_id TEXT NOT NULL,
+      category TEXT NOT NULL,
+      status TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      error_message TEXT,
+      summary_json TEXT,
+      staging_path TEXT,
+      artifacts_json TEXT,
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_task_plugin_runs_task_id ON task_plugin_runs(task_id);
+    CREATE INDEX IF NOT EXISTS idx_task_plugin_runs_plugin_status ON task_plugin_runs(plugin_id, status);
 
     CREATE TABLE IF NOT EXISTS ssh_machines (
       id TEXT PRIMARY KEY,
@@ -165,6 +187,12 @@ export function runMigrations(db: Database.Database): void {
     );
 
     CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS app_meta (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -215,6 +243,12 @@ export function runMigrations(db: Database.Database): void {
     log.info('迁移: task_destinations 表添加 object_key_template 列')
   }
 
+  const taskFileDestinationColumns = db.pragma('table_info(task_file_destinations)') as Array<{ name: string }>
+  if (!taskFileDestinationColumns.some((c) => c.name === 'planned_object_key')) {
+    db.exec(`ALTER TABLE task_file_destinations ADD COLUMN planned_object_key TEXT`)
+    log.info('迁移: task_file_destinations 表添加 planned_object_key 列')
+  }
+
   const dayFolderColumns = db.pragma('table_info(day_folders)') as Array<{ name: string }>
   if (!dayFolderColumns.some((c) => c.name === 'ignored')) {
     db.exec(`ALTER TABLE day_folders ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0`)
@@ -241,53 +275,65 @@ export function runMigrations(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_task_files_retry
     ON task_files(status, next_retry_at)
   `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`)
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_task_files_task_status
+    ON task_files(task_id, status, source_status)
+  `)
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_task_file_destinations_status_file
+    ON task_file_destinations(status, task_file_id)
+  `)
 
-  const incompleteTasks = db.prepare(
-    `SELECT id, folder_path, source_type, source_machine_id, upload_relative_path
-     FROM tasks
-     WHERE status != 'completed'`
-  ).all() as Array<{
-    id: string
-    folder_path: string
-    source_type: string
-    source_machine_id: string | null
-    upload_relative_path: string
-  }>
-  const findRemoteDirectory = db.prepare(
-    'SELECT remote_dir FROM ssh_machines WHERE id = ?'
-  )
-  const updateUploadRelativePath = db.prepare(
-    `UPDATE tasks
-     SET upload_relative_path = ?, updated_at = ?
-     WHERE id = ?`
-  )
-  let migratedDatePaths = 0
-  for (const task of incompleteTasks) {
-    let uploadRelativePath: string | null = null
-    if (task.source_type === 'rsync' && task.source_machine_id) {
-      const machine = findRemoteDirectory.get(task.source_machine_id) as
-        | { remote_dir: string }
-        | undefined
-      uploadRelativePath = machine
-        ? deriveDateScopedUploadRelativePath(machine.remote_dir)
-        : null
-    }
-    uploadRelativePath ||= deriveDateScopedUploadRelativePath(task.folder_path)
+  if (!isDataMigrationDone(db, DATA_MIGRATION_DATE_PATHS)) {
+    const incompleteTasks = db.prepare(
+      `SELECT id, folder_path, source_type, source_machine_id, upload_relative_path
+       FROM tasks
+       WHERE status != 'completed'`
+    ).all() as Array<{
+      id: string
+      folder_path: string
+      source_type: string
+      source_machine_id: string | null
+      upload_relative_path: string
+    }>
+    const findRemoteDirectory = db.prepare(
+      'SELECT remote_dir FROM ssh_machines WHERE id = ?'
+    )
+    const updateUploadRelativePath = db.prepare(
+      `UPDATE tasks
+       SET upload_relative_path = ?, updated_at = ?
+       WHERE id = ?`
+    )
+    let migratedDatePaths = 0
+    for (const task of incompleteTasks) {
+      let uploadRelativePath: string | null = null
+      if (task.source_type === 'rsync' && task.source_machine_id) {
+        const machine = findRemoteDirectory.get(task.source_machine_id) as
+          | { remote_dir: string }
+          | undefined
+        uploadRelativePath = machine
+          ? deriveDateScopedUploadRelativePath(machine.remote_dir)
+          : null
+      }
+      uploadRelativePath ||= deriveDateScopedUploadRelativePath(task.folder_path)
 
-    if (
-      uploadRelativePath &&
-      task.upload_relative_path !== uploadRelativePath
-    ) {
-      updateUploadRelativePath.run(
-        uploadRelativePath,
-        new Date().toISOString(),
-        task.id
-      )
-      migratedDatePaths++
+      if (
+        uploadRelativePath &&
+        task.upload_relative_path !== uploadRelativePath
+      ) {
+        updateUploadRelativePath.run(
+          uploadRelativePath,
+          new Date().toISOString(),
+          task.id
+        )
+        migratedDatePaths++
+      }
     }
-  }
-  if (migratedDatePaths > 0) {
-    log.info(`日期层路径迁移完成: ${migratedDatePaths} 个未完成任务`)
+    if (migratedDatePaths > 0) {
+      log.info(`日期层路径迁移完成: ${migratedDatePaths} 个未完成任务`)
+    }
+    markDataMigrationDone(db, DATA_MIGRATION_DATE_PATHS)
   }
 
   if (addedDestinationUploadPath) {
@@ -302,45 +348,48 @@ export function runMigrations(db: Database.Database): void {
     log.info('迁移: 已回填任务目标上传相对路径')
   }
 
-  const migratedDestinations = db.prepare(
-    `INSERT OR IGNORE INTO task_destinations (
-      id, task_id, provider, status, prefix, total_files, uploaded_files,
-      total_bytes, uploaded_bytes, error_message, created_at, updated_at,
-      completed_at, upload_relative_path, path_mode, object_key_template
-    )
-    SELECT lower(hex(randomblob(16))), id, 'aliyun', status, COALESCE(oss_prefix, ''),
-      total_files, uploaded_files, total_bytes, uploaded_bytes, error_message,
-      created_at, updated_at, completed_at, COALESCE(upload_relative_path, ''),
-      'target-root', NULL
-    FROM tasks t
-    WHERE NOT EXISTS (
-      SELECT 1 FROM task_destinations existing WHERE existing.task_id = t.id
-    )`
-  ).run().changes
+  if (!isDataMigrationDone(db, DATA_MIGRATION_DESTINATIONS)) {
+    const migratedDestinations = db.prepare(
+      `INSERT OR IGNORE INTO task_destinations (
+        id, task_id, provider, status, prefix, total_files, uploaded_files,
+        total_bytes, uploaded_bytes, error_message, created_at, updated_at,
+        completed_at, upload_relative_path, path_mode, object_key_template
+      )
+      SELECT lower(hex(randomblob(16))), id, 'aliyun', status, COALESCE(oss_prefix, ''),
+        total_files, uploaded_files, total_bytes, uploaded_bytes, error_message,
+        created_at, updated_at, completed_at, COALESCE(upload_relative_path, ''),
+        'target-root', NULL
+      FROM tasks t
+      WHERE NOT EXISTS (
+        SELECT 1 FROM task_destinations existing WHERE existing.task_id = t.id
+      )`
+    ).run().changes
 
-  const migratedFileDestinations = db.prepare(
-    `INSERT OR IGNORE INTO task_file_destinations (
-      id, task_file_id, task_destination_id, provider, status, object_key,
-      upload_id, error_message, created_at, updated_at
-    )
-    SELECT lower(hex(randomblob(16))), tf.id, td.id, 'aliyun', tf.status,
-      tf.oss_key, tf.upload_id, tf.error_message, tf.created_at, tf.updated_at
-    FROM tasks t
-    INNER JOIN task_files tf ON tf.task_id = t.id
-    INNER JOIN task_destinations td
-      ON td.task_id = t.id AND td.provider = 'aliyun'
-    WHERE t.status != 'completed'
-      AND NOT EXISTS (
-      SELECT 1
-      FROM task_file_destinations existing
-      WHERE existing.task_file_id = tf.id
-    )`
-  ).run().changes
-  if (migratedDestinations > 0 || migratedFileDestinations > 0) {
-    log.info(
-      `双云任务迁移完成: ${migratedDestinations} 个任务目标, ` +
-      `${migratedFileDestinations} 个文件目标`
-    )
+    const migratedFileDestinations = db.prepare(
+      `INSERT OR IGNORE INTO task_file_destinations (
+        id, task_file_id, task_destination_id, provider, status, object_key,
+        upload_id, error_message, created_at, updated_at
+      )
+      SELECT lower(hex(randomblob(16))), tf.id, td.id, 'aliyun', tf.status,
+        tf.oss_key, tf.upload_id, tf.error_message, tf.created_at, tf.updated_at
+      FROM tasks t
+      INNER JOIN task_files tf ON tf.task_id = t.id
+      INNER JOIN task_destinations td
+        ON td.task_id = t.id AND td.provider = 'aliyun'
+      WHERE t.status != 'completed'
+        AND NOT EXISTS (
+        SELECT 1
+        FROM task_file_destinations existing
+        WHERE existing.task_file_id = tf.id
+      )`
+    ).run().changes
+    if (migratedDestinations > 0 || migratedFileDestinations > 0) {
+      log.info(
+        `双云任务迁移完成: ${migratedDestinations} 个任务目标, ` +
+        `${migratedFileDestinations} 个文件目标`
+      )
+    }
+    markDataMigrationDone(db, DATA_MIGRATION_DESTINATIONS)
   }
 
   // 增量迁移：为已有的 ssh_machines 表补充 transfer_mode 列
@@ -355,6 +404,22 @@ export function runMigrations(db: Database.Database): void {
     db.exec(`ALTER TABLE ssh_machines ADD COLUMN profile_id TEXT`)
     log.info('迁移: ssh_machines 表添加 profile_id 列')
   }
+}
+
+function isDataMigrationDone(db: Database.Database, key: string): boolean {
+  const row = db
+    .prepare('SELECT value FROM app_meta WHERE key = ?')
+    .get(key) as { value: string } | undefined
+  return row?.value === 'done'
+}
+
+function markDataMigrationDone(db: Database.Database, key: string): void {
+  const now = new Date().toISOString()
+  db.prepare(
+    `INSERT INTO app_meta (key, value, updated_at)
+     VALUES (?, 'done', ?)
+     ON CONFLICT(key) DO UPDATE SET value = 'done', updated_at = ?`
+  ).run(key, now, now)
 }
 
 function ensureUniqueTaskFilePathIndex(db: Database.Database): void {
@@ -410,21 +475,21 @@ export function reconcileStartupState(db: Database.Database): void {
      WHERE status = 'uploading'`
   ).run(now)
 
-  const unfinished = db.prepare(
-    `SELECT id, folder_path, source_type, status
+  const monitorableTasks = db.prepare(
+    `SELECT id, folder_path
      FROM tasks
-     WHERE status NOT IN ('completed', 'synced', 'skipped')`
+     WHERE source_type IN ('local', 'rsync')
+       AND status NOT IN ('completed', 'synced', 'skipped')`
   ).all() as Array<{
     id: string
     folder_path: string
-    source_type: string
-    status: string
   }>
 
-  const resetTask = db.prepare(
+  const resetTasks = db.prepare(
     `UPDATE tasks
-     SET status = 'pending', error_message = NULL, completed_at = NULL, updated_at = ?
-     WHERE id = ?`
+     SET status = 'pending', error_message = NULL,
+         completed_at = NULL, updated_at = ?
+     WHERE status NOT IN ('completed', 'synced', 'skipped')`
   )
   const resetDestinations = db.prepare(
     `UPDATE task_destinations
@@ -439,24 +504,31 @@ export function reconcileStartupState(db: Database.Database): void {
            ELSE NULL
          END,
          updated_at = ?
-     WHERE task_id = ?`
+     WHERE task_id IN (
+       SELECT id FROM tasks WHERE status NOT IN ('completed', 'synced', 'skipped')
+     )`
   )
-  const resetActiveFiles = db.prepare(
+  const resetAllActiveFiles = db.prepare(
     `UPDATE task_files
      SET status = 'pending',
          error_message = NULL, retry_count = 0, next_retry_at = NULL,
          updated_at = ?
-     WHERE task_id = ?
-       AND source_status = 'present'
-       AND status IN ('uploading', 'failed')`
+     WHERE source_status = 'present'
+       AND status IN ('uploading', 'failed')
+       AND task_id IN (
+         SELECT id FROM tasks WHERE status NOT IN ('completed', 'synced', 'skipped')
+       )`
   )
-  const resetActiveFileDestinations = db.prepare(
+  const resetAllActiveFileDestinations = db.prepare(
     `UPDATE task_file_destinations
      SET status = 'pending', error_message = NULL, updated_at = ?
      WHERE status IN ('uploading', 'failed')
        AND task_file_id IN (
-         SELECT id FROM task_files
-         WHERE task_id = ? AND source_status = 'present'
+         SELECT tf.id
+         FROM task_files tf
+         INNER JOIN tasks t ON t.id = tf.task_id
+         WHERE tf.source_status = 'present'
+           AND t.status NOT IN ('completed', 'synced', 'skipped')
        )`
   )
   const skipTask = db.prepare(
@@ -480,18 +552,17 @@ export function reconcileStartupState(db: Database.Database): void {
   )
 
   const transaction = db.transaction(() => {
-    for (const task of unfinished) {
-      const monitorable = task.source_type === 'local' || task.source_type === 'rsync'
-      if (monitorable && !existsSync(task.folder_path)) {
+    for (const task of monitorableTasks) {
+      if (!existsSync(task.folder_path)) {
         skipTask.run(now, now, task.id)
         skipDestinations.run(now, now, task.id)
-        continue
       }
-      resetTask.run(now, task.id)
-      resetDestinations.run(now, task.id)
-      resetActiveFiles.run(now, task.id)
-      resetActiveFileDestinations.run(now, task.id)
     }
+
+    resetTasks.run(now)
+    resetDestinations.run(now)
+    resetAllActiveFiles.run(now)
+    resetAllActiveFileDestinations.run(now)
   })
   transaction()
 }

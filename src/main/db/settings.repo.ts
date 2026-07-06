@@ -21,14 +21,42 @@ function normalizeSuffixes(suffixes: string[]): string[] {
 }
 
 export class SettingsRepo {
-  get<T>(key: string): T | null {
+  private static valueCache = new Map<string, unknown>()
+  private static allCache: AppSettings | null = null
+  private static dbIdentity: unknown = null
+
+  private db(): ReturnType<typeof getDb> {
     const db = getDb()
+    if (SettingsRepo.dbIdentity !== db) {
+      SettingsRepo.valueCache.clear()
+      SettingsRepo.allCache = null
+      SettingsRepo.dbIdentity = db
+    }
+    return db
+  }
+
+  get<T>(key: string): T | null {
+    const db = this.db()
+    if (SettingsRepo.valueCache.has(key)) {
+      return SettingsRepo.valueCache.get(key) as T | null
+    }
+
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as
       | { value: string }
       | undefined
-    if (!row) return null
+    if (!row) {
+      SettingsRepo.valueCache.set(key, null)
+      return null
+    }
+
+    const value = this.decodeValue(key, row.value) as T
+    SettingsRepo.valueCache.set(key, value)
+    return value
+  }
+
+  private decodeValue(key: string, value: string): unknown {
     try {
-      const parsed = JSON.parse(row.value) as T
+      const parsed = JSON.parse(value) as unknown
       if (
         key === 'filter' &&
         typeof parsed === 'object' &&
@@ -65,16 +93,16 @@ export class SettingsRepo {
       ) {
         return normalizeUploadPathConfig(
           parsed as unknown as Record<string, unknown>
-        ) as T
+        )
       }
       return parsed
     } catch {
-      return row.value as unknown as T
+      return value
     }
   }
 
   set(key: string, value: unknown): void {
-    const db = getDb()
+    const db = this.db()
     const now = new Date().toISOString()
     let persistedValue = value
 
@@ -125,9 +153,14 @@ export class SettingsRepo {
     db.prepare(
       'INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?'
     ).run(key, serialized, now, serialized, now)
+    SettingsRepo.valueCache.delete(key)
+    SettingsRepo.allCache = null
   }
 
   getAll(): AppSettings {
+    const db = this.db()
+    if (SettingsRepo.allCache) return SettingsRepo.allCache
+
     const settings = { ...DEFAULT_SETTINGS, profiles: [] } as AppSettings
     const settingsRecord = settings as unknown as Record<string, unknown>
 
@@ -147,8 +180,20 @@ export class SettingsRepo {
       { section: 'cleanup', key: 'cleanup' }
     ]
 
+    const rows = db
+      .prepare('SELECT key, value FROM settings')
+      .all() as Array<{ key: string; value: string }>
+    const stored = new Map(rows.map((row) => [row.key, row.value]))
+
     for (const { section, key } of keys) {
-      const val = this.get(key)
+      const serialized = stored.get(key)
+      const val =
+        serialized === undefined
+          ? null
+          : this.decodeValue(key, serialized)
+      if (serialized !== undefined) {
+        SettingsRepo.valueCache.set(key, val)
+      }
       if (val !== null) {
         const defaultSection = settingsRecord[section]
         if (
@@ -169,8 +214,14 @@ export class SettingsRepo {
       }
     }
 
-    const hotkey = this.get<string>('hotkey')
-    if (hotkey) settings.hotkey = hotkey
+    const hotkeySerialized = stored.get('hotkey')
+    const hotkey = hotkeySerialized === undefined
+      ? null
+      : this.decodeValue('hotkey', hotkeySerialized)
+    if (hotkeySerialized !== undefined) {
+      SettingsRepo.valueCache.set('hotkey', hotkey)
+    }
+    if (typeof hotkey === 'string' && hotkey) settings.hotkey = hotkey
 
     if (settings.filter && Array.isArray(settings.filter.suffixes)) {
       settings.filter.suffixes = normalizeSuffixes(settings.filter.suffixes)
@@ -189,11 +240,12 @@ export class SettingsRepo {
     settings.profiles = normalizedProfiles.profiles
     settings.activeProfileId = normalizedProfiles.activeProfileId
 
+    SettingsRepo.allCache = settings
     return settings
   }
 
   saveAll(partial: Partial<AppSettings>): void {
-    const db = getDb()
+    const db = this.db()
     const transaction = db.transaction(() => {
       for (const [key, value] of Object.entries(partial)) {
         if (value !== undefined) {

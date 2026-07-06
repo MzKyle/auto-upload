@@ -25,8 +25,12 @@ export interface FileDestinationUploadTarget extends TaskFileDestination {
 
 export interface FileDestinationSummary {
   total: number
+  totalBytes: number
+  uploaded: number
+  uploadedBytes: number
   failed: number
   pending: number
+  skipped: number
   retryWaiting: number
 }
 
@@ -59,6 +63,7 @@ function rowToFileDestination(row: Record<string, unknown>): TaskFileDestination
     provider: row.provider as CloudProvider,
     status: row.status as FileStatus,
     objectKey: (row.object_key as string) || null,
+    plannedObjectKey: (row.planned_object_key as string) || null,
     uploadId: (row.upload_id as string) || null,
     errorMessage: (row.error_message as string) || null,
     createdAt: row.created_at as string,
@@ -118,6 +123,35 @@ export class TaskDestinationRepo {
         .prepare('SELECT * FROM task_destinations WHERE task_id = ? ORDER BY provider')
         .all(taskId) as Record<string, unknown>[]
     ).map(rowToDestination)
+  }
+
+  listByTaskIds(taskIds: string[]): Map<string, TaskDestination[]> {
+    const result = new Map<string, TaskDestination[]>()
+    const uniqueIds = Array.from(new Set(taskIds)).filter(Boolean)
+    if (uniqueIds.length === 0) return result
+
+    const chunkSize = 500
+    for (let index = 0; index < uniqueIds.length; index += chunkSize) {
+      const chunk = uniqueIds.slice(index, index + chunkSize)
+      const placeholders = chunk.map(() => '?').join(',')
+      const rows = getDb()
+        .prepare(
+          `SELECT *
+           FROM task_destinations
+           WHERE task_id IN (${placeholders})
+           ORDER BY task_id, provider`
+        )
+        .all(...chunk) as Record<string, unknown>[]
+
+      for (const row of rows) {
+        const destination = rowToDestination(row)
+        const destinations = result.get(destination.taskId) || []
+        destinations.push(destination)
+        result.set(destination.taskId, destinations)
+      }
+    }
+
+    return result
   }
 
   get(taskId: string, provider: CloudProvider): TaskDestination | null {
@@ -223,6 +257,76 @@ export class TaskDestinationRepo {
     ).run(now, now, taskId)
   }
 
+  replacePlannedObjectKeys(
+    taskId: string,
+    plannedKeysByRelativePath: Map<string, string>
+  ): void {
+    const db = getDb()
+    const now = new Date().toISOString()
+    db.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS tmp_planned_object_keys (
+        relative_path TEXT PRIMARY KEY,
+        object_key TEXT NOT NULL
+      )
+    `)
+    const insertPlannedKey = db.prepare(
+      `INSERT OR REPLACE INTO tmp_planned_object_keys (relative_path, object_key)
+       VALUES (?, ?)`
+    )
+    const clearStale = db.prepare(
+      `UPDATE task_file_destinations
+       SET planned_object_key = NULL, updated_at = ?
+       WHERE id IN (
+         SELECT tfd.id
+         FROM task_file_destinations tfd
+         INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+         LEFT JOIN tmp_planned_object_keys planned
+           ON planned.relative_path = tf.relative_path
+         WHERE tf.task_id = ?
+           AND tfd.planned_object_key IS NOT NULL
+           AND planned.relative_path IS NULL
+       )`
+    )
+    const updateChanged = db.prepare(
+      `UPDATE task_file_destinations
+       SET planned_object_key = (
+           SELECT planned.object_key
+           FROM task_files tf
+           INNER JOIN tmp_planned_object_keys planned
+             ON planned.relative_path = tf.relative_path
+           WHERE tf.id = task_file_destinations.task_file_id
+         ),
+         updated_at = ?
+       WHERE task_file_id IN (
+         SELECT tf.id
+         FROM task_files tf
+         INNER JOIN tmp_planned_object_keys planned
+           ON planned.relative_path = tf.relative_path
+         WHERE tf.task_id = ?
+       )
+       AND (
+         planned_object_key IS NULL
+         OR planned_object_key != (
+           SELECT planned.object_key
+           FROM task_files tf
+           INNER JOIN tmp_planned_object_keys planned
+             ON planned.relative_path = tf.relative_path
+           WHERE tf.id = task_file_destinations.task_file_id
+         )
+       )`
+    )
+    const transaction = db.transaction(() => {
+      db.prepare('DELETE FROM tmp_planned_object_keys').run()
+      for (const [relativePath, objectKey] of plannedKeysByRelativePath) {
+        insertPlannedKey.run(relativePath, objectKey)
+      }
+      clearStale.run(now, taskId)
+      updateChanged.run(now, taskId)
+      db.prepare('DELETE FROM tmp_planned_object_keys').run()
+    })
+    transaction()
+  }
+
   listFileTargets(taskId: string, provider?: CloudProvider): FileDestinationUploadTarget[] {
     const providerCondition = provider ? 'AND tfd.provider = ?' : ''
     const params: unknown[] = [taskId]
@@ -292,8 +396,12 @@ export class TaskDestinationRepo {
     const row = getDb().prepare(
       `SELECT
          COUNT(*) AS total,
+         COALESCE(SUM(tf.file_size), 0) AS total_bytes,
+         SUM(CASE WHEN tfd.status = 'completed' THEN 1 ELSE 0 END) AS uploaded,
+         COALESCE(SUM(CASE WHEN tfd.status = 'completed' THEN tf.file_size ELSE 0 END), 0) AS uploaded_bytes,
          SUM(CASE WHEN tfd.status = 'failed' THEN 1 ELSE 0 END) AS failed,
          SUM(CASE WHEN tfd.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+         SUM(CASE WHEN tfd.status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
          SUM(CASE
            WHEN tfd.status = 'pending'
             AND tf.next_retry_at IS NOT NULL
@@ -305,10 +413,36 @@ export class TaskDestinationRepo {
     ).get(now, taskId, provider) as Record<string, number>
     return {
       total: row.total || 0,
+      totalBytes: row.total_bytes || 0,
+      uploaded: row.uploaded || 0,
+      uploadedBytes: row.uploaded_bytes || 0,
       failed: row.failed || 0,
       pending: row.pending || 0,
+      skipped: row.skipped || 0,
       retryWaiting: row.retry_waiting || 0
     }
+  }
+
+  listFailedFileTargetExamples(
+    taskId: string,
+    provider: CloudProvider,
+    limit = 3
+  ): Array<{ relativePath: string; errorMessage: string | null }> {
+    const rows = getDb().prepare(
+      `SELECT tf.relative_path, tfd.error_message
+       FROM task_file_destinations tfd
+       INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+       WHERE tf.task_id = ? AND tfd.provider = ? AND tfd.status = 'failed'
+       ORDER BY tf.created_at
+       LIMIT ?`
+    ).all(taskId, provider, Math.max(1, limit)) as Array<{
+      relative_path: string
+      error_message: string | null
+    }>
+    return rows.map((row) => ({
+      relativePath: row.relative_path,
+      errorMessage: row.error_message || null
+    }))
   }
 
   updateFileStatus(

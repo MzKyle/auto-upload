@@ -1,7 +1,10 @@
 import { useEffect, useState, useCallback } from "react";
-import { RotateCcw, Trash2 } from "lucide-react";
+import { Clock, RotateCcw, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { EmptyState } from "@/components/ui/empty-state";
+import { PageHeader } from "@/components/ui/page-header";
 import { formatBytes, formatDuration } from "@/lib/utils";
 import {
   fetchHistory,
@@ -19,6 +22,11 @@ import type {
 } from "@shared/types";
 import { DayFolderCard } from "@/components/DayFolderCard";
 
+type HistoryConfirmAction =
+  | { kind: "clear" }
+  | { kind: "delete-day"; item: DayFolderSummary }
+  | { kind: "delete-item"; item: HistoryItem };
+
 export default function History() {
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [total, setTotal] = useState(0);
@@ -27,6 +35,8 @@ export default function History() {
   const [dayFolders, setDayFolders] = useState<DayFolderSummary[]>([]);
   const [provider, setProvider] = useState<CloudProvider>("aliyun");
   const [providerReady, setProviderReady] = useState(false);
+  const [confirmAction, setConfirmAction] =
+    useState<HistoryConfirmAction | null>(null);
   const pageSize = 20;
 
   const load = useCallback(async () => {
@@ -61,15 +71,13 @@ export default function History() {
     load();
   }, [load]);
 
-  const handleClear = useCallback(async () => {
+  const performClear = useCallback(async () => {
     await clearHistory(undefined, provider);
     load();
   }, [load, provider]);
 
-  const handleDeleteDayFolder = useCallback(
+  const performDeleteDayFolder = useCallback(
     async (item: DayFolderSummary) => {
-      const ok = window.confirm(`确认删除日期目录汇总「${item.date}」吗？`);
-      if (!ok) return;
       setDeletingId(item.id);
       try {
         await deleteDayFolderHistory(item.id, provider);
@@ -81,11 +89,8 @@ export default function History() {
     [load, provider]
   );
 
-  const handleDeleteItem = useCallback(
+  const performDeleteItem = useCallback(
     async (item: HistoryItem) => {
-      const ok = window.confirm(`确认删除历史记录「${item.folderName}」吗？`);
-      if (!ok) return;
-
       setDeletingId(item.id);
       try {
         await deleteHistoryItem(item.id, item.provider);
@@ -101,6 +106,46 @@ export default function History() {
     [items.length, load, page]
   );
 
+  const handleConfirm = useCallback(async () => {
+    if (!confirmAction) return;
+    if (confirmAction.kind === "clear") {
+      await performClear();
+    } else if (confirmAction.kind === "delete-day") {
+      await performDeleteDayFolder(confirmAction.item);
+    } else {
+      await performDeleteItem(confirmAction.item);
+    }
+    setConfirmAction(null);
+  }, [
+    confirmAction,
+    performClear,
+    performDeleteDayFolder,
+    performDeleteItem,
+  ]);
+
+  const confirmDialog = (() => {
+    if (!confirmAction) return null;
+    if (confirmAction.kind === "clear") {
+      return {
+        title: "清空历史记录",
+        description: "确认后会删除当前云端视图下的历史记录和日期目录汇总。",
+        confirmText: "清空",
+      };
+    }
+    if (confirmAction.kind === "delete-day") {
+      return {
+        title: "删除日期目录汇总",
+        description: `确认删除日期目录汇总「${confirmAction.item.date}」吗？工作次历史记录不会被自动恢复。`,
+        confirmText: "删除汇总",
+      };
+    }
+    return {
+      title: "删除历史记录",
+      description: `确认删除历史记录「${confirmAction.item.folderName}」吗？`,
+      confirmText: "删除",
+    };
+  })();
+
   const handleRetry = useCallback(
     async (item: HistoryItem) => {
       await retryTask(item.id, item.provider);
@@ -113,18 +158,21 @@ export default function History() {
 
   return (
     <div className="p-6 space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-xl font-bold">历史记录</h1>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handleClear}
-          disabled={items.length === 0 && dayFolders.length === 0}
-        >
-          <Trash2 className="h-4 w-4 mr-1" />
-          清空历史
-        </Button>
-      </div>
+      <PageHeader
+        title="历史记录"
+        description="查看已完成日期目录和工作次上传历史。"
+        actions={
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setConfirmAction({ kind: "clear" })}
+            disabled={items.length === 0 && dayFolders.length === 0}
+          >
+            <Trash2 className="h-4 w-4 mr-1" />
+            清空历史
+          </Button>
+        }
+      />
 
       <div className="inline-flex rounded-md border p-1 bg-muted/30">
         {(["aliyun", "tencent"] as CloudProvider[]).map((item) => (
@@ -154,7 +202,7 @@ export default function History() {
                 variant="ghost"
                 size="sm"
                 className="absolute right-3 bottom-3 text-destructive hover:text-destructive"
-                onClick={() => handleDeleteDayFolder(item)}
+                onClick={() => setConfirmAction({ kind: "delete-day", item })}
                 disabled={deletingId === item.id}
               >
                 <Trash2 className="h-4 w-4 mr-1" />
@@ -170,9 +218,11 @@ export default function History() {
       </h2>
 
       {items.length === 0 ? (
-        <div className="text-sm text-muted-foreground text-center py-12 border rounded-lg border-dashed">
-          暂无历史记录
-        </div>
+        <EmptyState
+          icon={<Clock className="h-5 w-5" />}
+          title="暂无历史记录"
+          description="上传完成或失败后会在这里显示工作次历史。"
+        />
       ) : (
         <div className="border rounded-lg overflow-hidden">
           <table className="w-full text-sm">
@@ -223,7 +273,7 @@ export default function History() {
                       variant="ghost"
                       size="sm"
                       className="text-destructive hover:text-destructive"
-                      onClick={() => handleDeleteItem(item)}
+                      onClick={() => setConfirmAction({ kind: "delete-item", item })}
                       disabled={deletingId === item.id}
                     >
                       <Trash2 className="h-4 w-4 mr-1" />
@@ -259,6 +309,21 @@ export default function History() {
             下一页
           </Button>
         </div>
+      )}
+
+      {confirmDialog && (
+        <ConfirmDialog
+          open={Boolean(confirmDialog)}
+          title={confirmDialog.title}
+          description={confirmDialog.description}
+          confirmText={confirmDialog.confirmText}
+          cancelText="取消"
+          variant="destructive"
+          onConfirm={handleConfirm}
+          onOpenChange={(open) => {
+            if (!open) setConfirmAction(null);
+          }}
+        />
       )}
     </div>
   );

@@ -18,6 +18,12 @@ export const IPC = {
   TASK_STATUS_CHANGE: 'task:status-change', // push from main
   TASK_DESTINATION_CHANGE: 'task:destination-change',
 
+  // 上传队列
+  UPLOAD_QUEUE_STATUS: 'upload-queue:status',
+  UPLOAD_QUEUE_START: 'upload-queue:start',
+  UPLOAD_QUEUE_STOP: 'upload-queue:stop',
+  UPLOAD_QUEUE_EVENT: 'upload-queue:event',
+
   // 日期目录汇总
   DAY_FOLDER_LIST: 'day-folder:list',
   DAY_FOLDER_DELETE: 'day-folder:delete',
@@ -43,6 +49,20 @@ export const IPC = {
   SETTINGS_TEST_OSS: 'settings:test-oss',
   SETTINGS_TEST_TENCENT_S3: 'settings:test-tencent-s3',
   UPLOAD_PATH_PREVIEW: 'upload:path-preview',
+
+  // 项目插件
+  CAPABILITY_LIST: 'capability:list',
+  CAPABILITY_PROFILE_STATUS: 'capability:profile-status',
+  CAPABILITY_TASK_RUNS: 'capability:task-runs',
+  PLUGIN_LIST: 'plugin:list',
+  PLUGIN_PROFILE_STATUS: 'plugin:profile-status',
+  PLUGIN_TASK_RUNS: 'plugin:task-runs',
+
+  // OSS 浏览器工具插件
+  OSS_BROWSER_LIST: 'oss-browser:list',
+  OSS_BROWSER_HEAD: 'oss-browser:head',
+  OSS_BROWSER_GET_IMAGE: 'oss-browser:get-image',
+  OSS_BROWSER_OPEN_PREVIEW_WINDOW: 'oss-browser:open-preview-window',
 
   // SSH / rsync
   SSH_LIST_MACHINES: 'ssh:list-machines',

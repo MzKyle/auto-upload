@@ -2,6 +2,17 @@ import { DEFAULT_SETTINGS, DEFAULT_UPLOAD_PROFILE_ID, DEFAULT_WORK_DIR_NAME_PATT
 import { buildOssKey, joinOssPath } from './day-folder'
 import { modeForProviders, providersForMode, type UploadTargetSnapshot } from './cloud-upload'
 import {
+  DEFAULT_PROFILE_EXTENSIONS,
+  DEFAULT_PROFILE_PLUGINS,
+  DEFAULT_PROFILE_UPLOAD_PIPELINE,
+  EXTENSION_IDS,
+  PLUGIN_IDS,
+  UPLOAD_PIPELINE_IDS,
+  isBuiltinExtensionId,
+  isBuiltinPluginId,
+  isBuiltinUploadPipelineId
+} from './plugins'
+import {
   normalizeProviderDirectories,
   normalizeScanConfig
 } from './scan-config'
@@ -15,6 +26,10 @@ import type {
   AppSettings,
   CloudProvider,
   FilterRules,
+  ProfileExtensionConfig,
+  ProfilePluginConfig,
+  ProfileUploadPipelineConfig,
+  UploadPipelineId,
   UploadPathMode,
   UploadProfile,
   UploadProfileProviderConfig,
@@ -324,7 +339,9 @@ function createDefaultProfileFromSettings(settings: Partial<AppSettings>): Uploa
         pathSegmentCount: settings.tencentS3?.pathSegmentCount,
         objectKeyTemplate: DEFAULT_OBJECT_KEY_TEMPLATE
       })
-    }
+    },
+    uploadPipeline: DEFAULT_PROFILE_UPLOAD_PIPELINE,
+    extensions: buildDefaultExtensionsFromSettings(settings)
   }
 }
 
@@ -365,8 +382,206 @@ function normalizeProfile(rawProfile: unknown, fallback: UploadProfile): UploadP
         isRecord(rawProviders.tencent) ? rawProviders.tencent : {},
         fallback.providers.tencent
       )
+    },
+    uploadPipeline: normalizeProfileUploadPipeline(
+      raw.uploadPipeline,
+      raw.plugins,
+      fallback.uploadPipeline
+    ),
+    extensions: normalizeProfileExtensions(
+      raw.extensions,
+      raw.plugins,
+      fallback.extensions
+    )
+  }
+}
+
+export function normalizeProfileUploadPipeline(
+  rawUploadPipeline: unknown,
+  legacyPlugins?: unknown,
+  fallback: ProfileUploadPipelineConfig = DEFAULT_PROFILE_UPLOAD_PIPELINE
+): ProfileUploadPipelineConfig {
+  const raw = isRecord(rawUploadPipeline) ? rawUploadPipeline : {}
+  const fallbackId = isBuiltinUploadPipelineId(fallback.id)
+    ? fallback.id
+    : DEFAULT_PROFILE_UPLOAD_PIPELINE.id
+  const rawId =
+    typeof raw.id === 'string' && isBuiltinUploadPipelineId(raw.id)
+      ? raw.id as UploadPipelineId
+      : null
+  const hasLegacyPlugins = isRecord(legacyPlugins)
+  const legacy = normalizeProfilePlugins(legacyPlugins)
+  const legacyModule1Enabled = hasLegacyPlugins && legacy.enabledPluginIds.includes(
+    PLUGIN_IDS.MODULE1_PREUPLOAD
+  )
+  const id = rawId || (legacyModule1Enabled ? UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD : fallbackId)
+  const fallbackConfig = isRecord(fallback.config) ? fallback.config : {}
+  const rawConfig = isRecord(raw.config) ? raw.config : {}
+  const legacyModule1Config = hasLegacyPlugins
+    ? pluginConfigRecord(legacy.configs[PLUGIN_IDS.MODULE1_PREUPLOAD])
+    : {}
+
+  return {
+    id,
+    config: {
+      ...(id === UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD ? legacyModule1Config : {}),
+      ...fallbackConfig,
+      ...rawConfig
     }
   }
+}
+
+export function normalizeProfileExtensions(
+  rawExtensions: unknown,
+  legacyPlugins?: unknown,
+  fallback: ProfileExtensionConfig = DEFAULT_PROFILE_EXTENSIONS
+): ProfileExtensionConfig {
+  const raw = isRecord(rawExtensions) ? rawExtensions : {}
+  const fallbackEnabled = Array.isArray(fallback.enabledIds)
+    ? fallback.enabledIds
+    : []
+  const rawEnabled = Array.isArray(raw.enabledIds) ? raw.enabledIds : null
+  const hasLegacyPlugins = isRecord(legacyPlugins)
+  const legacy = normalizeProfilePlugins(legacyPlugins)
+  const legacyEnabled = hasLegacyPlugins
+    ? legacy.enabledPluginIds.filter(isBuiltinExtensionId)
+    : []
+  const enabledIds = normalizeExtensionIdArray(rawEnabled || [
+    ...fallbackEnabled,
+    ...legacyEnabled
+  ])
+  const fallbackConfigs = isRecord(fallback.configs)
+    ? fallback.configs
+    : DEFAULT_PROFILE_EXTENSIONS.configs
+  const rawConfigs = isRecord(raw.configs) ? raw.configs : {}
+
+  return {
+    enabledIds,
+    configs: mergeExtensionConfigs(
+      fallbackConfigs,
+      hasLegacyPlugins ? legacy.configs : {},
+      rawConfigs
+    )
+  }
+}
+
+export function normalizeProfilePlugins(
+  rawPlugins: unknown,
+  fallback: ProfilePluginConfig = DEFAULT_PROFILE_PLUGINS
+): ProfilePluginConfig {
+  const raw = isRecord(rawPlugins) ? rawPlugins : {}
+  const fallbackEnabled = Array.isArray(fallback.enabledPluginIds)
+    ? fallback.enabledPluginIds
+    : []
+  const rawEnabled = Array.isArray(raw.enabledPluginIds)
+    ? raw.enabledPluginIds
+    : fallbackEnabled
+  const enabledPluginIds = normalizePluginIdArray(rawEnabled)
+
+  const fallbackOrder = Array.isArray(fallback.order)
+    ? fallback.order
+    : DEFAULT_PROFILE_PLUGINS.order
+  const rawOrder = Array.isArray(raw.order) ? raw.order : fallbackOrder
+  const order = normalizePluginIdArray([
+    ...rawOrder,
+    ...DEFAULT_PROFILE_PLUGINS.order,
+    ...enabledPluginIds
+  ])
+
+  const fallbackConfigs = isRecord(fallback.configs)
+    ? fallback.configs
+    : DEFAULT_PROFILE_PLUGINS.configs
+  const rawConfigs = isRecord(raw.configs) ? raw.configs : {}
+
+  return {
+    enabledPluginIds,
+    order,
+    configs: mergePluginConfigs(fallbackConfigs, rawConfigs)
+  }
+}
+
+function buildDefaultExtensionsFromSettings(settings: Partial<AppSettings>): ProfileExtensionConfig {
+  const extensions = cloneProfileExtensions(DEFAULT_PROFILE_EXTENSIONS)
+  if (settings.webhook?.enabled) {
+    extensions.enabledIds = normalizeExtensionIdArray([
+      ...extensions.enabledIds,
+      EXTENSION_IDS.WEBHOOK_NOTIFIER
+    ])
+    extensions.configs[EXTENSION_IDS.WEBHOOK_NOTIFIER] = {
+      ...pluginConfigRecord(extensions.configs[EXTENSION_IDS.WEBHOOK_NOTIFIER]),
+      ...settings.webhook
+    }
+  }
+  return extensions
+}
+
+function cloneProfileExtensions(value: ProfileExtensionConfig): ProfileExtensionConfig {
+  return {
+    enabledIds: [...value.enabledIds],
+    configs: JSON.parse(JSON.stringify(value.configs)) as Record<string, unknown>
+  }
+}
+
+function normalizePluginIdArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return Array.from(
+    new Set(
+      value
+        .map((item) => String(item).trim())
+        .filter((item) => item && isBuiltinPluginId(item))
+    )
+  )
+}
+
+function normalizeExtensionIdArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return Array.from(
+    new Set(
+      value
+        .map((item) => String(item).trim())
+        .filter((item) => item && isBuiltinExtensionId(item))
+    )
+  )
+}
+
+function mergePluginConfigs(
+  fallbackConfigs: Record<string, unknown>,
+  rawConfigs: Record<string, unknown>
+): Record<string, unknown> {
+  const configs: Record<string, unknown> = JSON.parse(
+    JSON.stringify(DEFAULT_PROFILE_PLUGINS.configs)
+  ) as Record<string, unknown>
+  for (const id of DEFAULT_PROFILE_PLUGINS.order) {
+    configs[id] = {
+      ...pluginConfigRecord(configs[id]),
+      ...pluginConfigRecord(fallbackConfigs[id]),
+      ...pluginConfigRecord(rawConfigs[id])
+    }
+  }
+  return configs
+}
+
+function mergeExtensionConfigs(
+  fallbackConfigs: Record<string, unknown>,
+  legacyConfigs: Record<string, unknown>,
+  rawConfigs: Record<string, unknown>
+): Record<string, unknown> {
+  const configs: Record<string, unknown> = JSON.parse(
+    JSON.stringify(DEFAULT_PROFILE_EXTENSIONS.configs)
+  ) as Record<string, unknown>
+  for (const id of Object.values(EXTENSION_IDS)) {
+    configs[id] = {
+      ...pluginConfigRecord(configs[id]),
+      ...pluginConfigRecord(fallbackConfigs[id]),
+      ...pluginConfigRecord(legacyConfigs[id]),
+      ...pluginConfigRecord(rawConfigs[id])
+    }
+  }
+  return configs
+}
+
+function pluginConfigRecord(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {}
 }
 
 function normalizeProfileProviderConfig(

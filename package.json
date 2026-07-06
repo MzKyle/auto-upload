@@ -16,11 +16,15 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "rebuild:node": "npm rebuild better-sqlite3",
+    "rebuild:electron": "electron-rebuild -f -w better-sqlite3 -v 33.4.11",
+    "pretest": "npm run rebuild:node",
     "test": "tsx --test tests/*.test.ts",
+    "posttest": "npm run rebuild:electron",
     "lint": "eslint .",
-    "build:linux": "electron-vite build && rm -rf node_modules/cpu-features && electron-rebuild -f -w better-sqlite3 -v 33.4.11 && electron-builder --linux --x64 && npm rebuild better-sqlite3",
-    "build:win": "electron-vite build && electron-builder --win --x64 && npx electron-rebuild -f -w better-sqlite3",
-    "build:all": "electron-vite build && electron-builder --linux --win --x64 && npx electron-rebuild -f -w better-sqlite3",
+    "build:linux": "electron-vite build && rm -rf node_modules/cpu-features && npm run rebuild:electron && electron-builder --linux --x64 && npm run rebuild:node",
+    "build:win": "electron-vite build && electron-builder --win --x64 && npm run rebuild:electron",
+    "build:all": "electron-vite build && electron-builder --linux --win --x64 && npm run rebuild:electron",
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
@@ -31,14 +35,8 @@
     "better-sqlite3": "^11.7.0",
     "chokidar": "^4.0.3",
     "electron-log": "^5.3.0",
-    "express": "^5.2.1",
-    "lucide-react": "^0.469.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-router-dom": "^7.1.0",
     "ssh2": "^1.16.0",
-    "uuid": "^11.0.5",
-    "zustand": "^5.0.3"
+    "uuid": "^11.0.5"
   },
   "devDependencies": {
     "@electron-toolkit/preload": "^3.0.1",
@@ -57,12 +55,17 @@
     "electron-builder": "^25.1.8",
     "electron-vite": "^5.0.0",
     "eslint": "^9.17.0",
+    "lucide-react": "^0.469.0",
     "postcss": "^8.4.49",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.1.0",
     "tailwind-merge": "^3.0.0",
     "tailwindcss": "^3.4.17",
     "tsx": "^4.22.4",
     "typescript": "^5.7.3",
     "typescript-eslint": "^8.62.0",
-    "vite": "^6.0.7"
+    "vite": "^6.0.7",
+    "zustand": "^5.0.3"
   }
 }

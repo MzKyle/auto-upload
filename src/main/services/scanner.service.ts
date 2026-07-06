@@ -217,7 +217,8 @@ export class ScannerService {
           root,
           today,
           profile.scan.workDirNamePattern || scanConfig?.workDirNamePattern,
-          seenChildPaths
+          seenChildPaths,
+          profile
         )
         scannedDirs += result.scanned
         newDirsFound += result.newFound
@@ -259,7 +260,8 @@ export class ScannerService {
     root: ActiveProfileScanRoot,
     today: string,
     workDirNamePattern: string | undefined,
-    seenChildPaths: Set<string>
+    seenChildPaths: Set<string>,
+    profile = getProfileById(getSettingsRepo().getAll(), root.profileId)
   ): Promise<{ scanned: number; newFound: number; existing: number; ignored: number; skipped: number }> {
     let scanned = 0
     let newFound = 0
@@ -274,7 +276,6 @@ export class ScannerService {
         workDirNamePattern
       )
       if (dayDirectory) {
-        const profile = getProfileById(getSettingsRepo().getAll(), root.profileId)
         const result = await this.scanDayDirectory(
           root.directory,
           dayDirectory.folderPath,
@@ -465,14 +466,14 @@ export class ScannerService {
 
   private checkStability(): void {
     const today = this.formatLocalDate(new Date())
-    const tasks = getTaskRepo().listContinuouslyMonitored(today)
-    if (tasks.length > 0) {
-      const batchSize = Math.min(RECONCILE_BATCH_SIZE, tasks.length)
+    const taskIds = getTaskRepo().listContinuouslyMonitoredTaskIds(today)
+    if (taskIds.length > 0) {
+      const batchSize = Math.min(RECONCILE_BATCH_SIZE, taskIds.length)
       for (let i = 0; i < batchSize; i++) {
-        const task = tasks[(this.stabilityCursor + i) % tasks.length]
-        if (task) this.queueReconcileTask(task)
+        const taskId = taskIds[(this.stabilityCursor + i) % taskIds.length]
+        if (taskId) this.queueReconcileTask(taskId)
       }
-      this.stabilityCursor = (this.stabilityCursor + batchSize) % tasks.length
+      this.stabilityCursor = (this.stabilityCursor + batchSize) % taskIds.length
     }
     this.broadcastStatus()
   }
@@ -632,11 +633,25 @@ export class ScannerService {
     }
   }
 
-  queueReconcileTask(task: Task): void {
-    if (this.reconcileQueuedIds.has(task.id)) return
-    this.reconcileQueuedIds.add(task.id)
-    this.reconcileQueue.push(task.id)
+  queueReconcileTask(task: Pick<Task, 'id'> | string): void {
+    const taskId = typeof task === 'string' ? task : task.id
+    if (!this.enqueueReconcileTaskId(taskId)) return
     void this.processReconcileQueue()
+  }
+
+  queueReconcileTaskIds(taskIds: string[]): void {
+    let queued = false
+    for (const taskId of taskIds) {
+      queued = this.enqueueReconcileTaskId(taskId) || queued
+    }
+    if (queued) void this.processReconcileQueue()
+  }
+
+  private enqueueReconcileTaskId(taskId: string): boolean {
+    if (this.reconcileQueuedIds.has(taskId)) return false
+    this.reconcileQueuedIds.add(taskId)
+    this.reconcileQueue.push(taskId)
+    return true
   }
 
   private async processReconcileQueue(): Promise<void> {
@@ -677,18 +692,16 @@ export class ScannerService {
 
     try {
       const settings = getSettingsRepo().getAll()
-      const files = await new FileFilterService(task.profileSnapshot?.filter || settings.filter).scanFolderAsync(task.folderPath)
+      const fileFilter = new FileFilterService(
+        task.profileSnapshot?.filter || settings.filter
+      )
       const stableChecks =
         task.sourceType === 'local' && task.dayFolderId
           ? Math.max(2, settings.stability.checkCount || 2)
           : 1
-      getTaskRepo().reconcileFiles(
+      await getTaskRepo().reconcileFileBatches(
         task.id,
-        files.map((file) => ({
-          relativePath: file.relativePath,
-          size: file.size,
-          mtimeMs: file.mtimeMs
-        })),
+        fileFilter.scanFolderBatches(task.folderPath),
         stableChecks
       )
       const updated = getTaskRepo().getById(task.id)
@@ -715,10 +728,9 @@ export class ScannerService {
     const normalizedRoots = watchedDirectories.map((directory) =>
       directory.replace(/[\\/]+$/, '')
     )
-    const tasks = getTaskRepo().listByStatus()
+    const tasks = getTaskRepo().listMonitorableLocalUnfinishedTasks()
     for (let index = 0; index < tasks.length; index++) {
       const task = tasks[index]
-      if (task.sourceType !== 'local' || !task.dayFolderId) continue
       if (
         !normalizedRoots.some(
           (root) =>

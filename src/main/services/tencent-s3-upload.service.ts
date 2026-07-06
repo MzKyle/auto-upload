@@ -151,19 +151,14 @@ export class TencentS3UploadService {
     config: AppSettings['tencentS3'],
     requestTimeout = 300000
   ): S3Client {
-    const requestHandler = config.allowInsecureTls
-      ? new NodeHttpHandler({
-          connectionTimeout: 30000,
-          requestTimeout,
-          httpsAgent: new HttpsAgent({
-            keepAlive: true,
-            rejectUnauthorized: false
-          })
-        })
-      : new NodeHttpHandler({
-          connectionTimeout: 30000,
-          requestTimeout
-        })
+    const requestHandler = new NodeHttpHandler({
+      connectionTimeout: 30000,
+      requestTimeout,
+      httpsAgent: new HttpsAgent({
+        keepAlive: true,
+        rejectUnauthorized: !config.allowInsecureTls
+      })
+    })
 
     return new S3Client({
       endpoint: config.endpoint,

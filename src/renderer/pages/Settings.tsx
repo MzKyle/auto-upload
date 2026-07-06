@@ -1,20 +1,47 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
-import { TestTube, Plus, X, FolderOpen, Copy, Trash2 } from "lucide-react";
+import {
+  Cloud,
+  FolderOpen,
+  Globe,
+  Plus,
+  Settings as SettingsIcon,
+  TestTube,
+  Trash2,
+  X,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { PageHeader } from "@/components/ui/page-header";
+import { AutoSaveStatusBadge } from "@/components/settings/AutoSaveStatusBadge";
+import { InlineFieldError } from "@/components/settings/InlineFieldError";
+import { SettingsNav } from "@/components/settings/SettingsNav";
+import { SettingsSectionCard } from "@/components/settings/SettingsSectionCard";
 import { PathTree } from "@/components/PathTree";
 import { useSettingsStore } from "@/stores/settings.store";
 import { testOSS, testTencentS3, selectFolder, previewUploadPath } from "@/lib/ipc-client";
 import { buildPathTreeFromPaths } from "@/lib/path-tree";
 import { showToast } from "@/components/ui/toast";
 import { CLOUD_PROVIDER_LABELS } from "@shared/constants";
+import {
+  DEFAULT_PROFILE_EXTENSIONS,
+  DEFAULT_PROFILE_UPLOAD_PIPELINE,
+  EXTENSION_IDS,
+  UPLOAD_PIPELINE_IDS
+} from "@shared/plugins";
 import type { AppSettings, CloudProvider, UploadPathMode, UploadProfile } from "@shared/types";
 import type { UploadPathPreview } from "@shared/upload-profile";
 
 type SettingsSection = "global" | "profiles" | CloudProvider;
+type ProfileSection =
+  | "basic"
+  | "directories"
+  | "paths"
+  | "capabilities"
+  | "preview";
 
 const uploadPathModeOptions: Array<{ value: UploadPathMode; label: string }> = [
   { value: "target-root", label: "上传到目标路径" },
@@ -23,6 +50,26 @@ const uploadPathModeOptions: Array<{ value: UploadPathMode; label: string }> = [
   { value: "last-segments", label: "保留末 N 级" },
   { value: "template", label: "对象 Key 模板" },
 ];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringifyWebhookHeaders(value: unknown): string {
+  return JSON.stringify(isRecord(value) ? value : {}, null, 2);
+}
+
+function parseWebhookHeaders(value: string): Record<string, string> {
+  const trimmed = value.trim();
+  if (!trimmed) return {};
+  const parsed = JSON.parse(trimmed) as unknown;
+  if (!isRecord(parsed)) {
+    throw new Error("Webhook Header 必须是 JSON 对象");
+  }
+  return Object.fromEntries(
+    Object.entries(parsed).map(([key, headerValue]) => [key, String(headerValue)]),
+  );
+}
 
 export default function Settings() {
   const { settings, loading, loadSettings, saveSettings } = useSettingsStore();
@@ -42,10 +89,15 @@ export default function Settings() {
   const [suffixInput, setSuffixInput] = useState("");
   const [activeSection, setActiveSection] =
     useState<SettingsSection>("global");
+  const [activeProfileSection, setActiveProfileSection] =
+    useState<ProfileSection>("basic");
   const [editingProfileId, setEditingProfileId] = useState(settings.activeProfileId);
+  const [deleteProfileId, setDeleteProfileId] = useState<string | null>(null);
   const [profilePreviewSource, setProfilePreviewSource] = useState("");
   const [profilePreview, setProfilePreview] = useState<UploadPathPreview | null>(null);
   const [profilePreviewLoading, setProfilePreviewLoading] = useState(false);
+  const [webhookHeaderDrafts, setWebhookHeaderDrafts] = useState<Record<string, string>>({});
+  const [webhookHeaderErrors, setWebhookHeaderErrors] = useState<Record<string, string>>({});
   const scanDirectoryTrees = useMemo(
     () => ({
       aliyun: buildPathTreeFromPaths(
@@ -220,6 +272,8 @@ export default function Settings() {
 
   const handleAddProfile = useCallback(() => {
     const base = editingProfile || local.profiles[0];
+    const baseUploadPipeline = base.uploadPipeline || DEFAULT_PROFILE_UPLOAD_PIPELINE;
+    const baseExtensions = base.extensions || DEFAULT_PROFILE_EXTENSIONS;
     const id = `profile-${Date.now()}`;
     const profile: UploadProfile = {
       ...base,
@@ -243,7 +297,16 @@ export default function Settings() {
         aliyun: { ...base.providers.aliyun },
         tencent: { ...base.providers.tencent },
       },
+      uploadPipeline: {
+        id: baseUploadPipeline.id,
+        config: JSON.parse(JSON.stringify(baseUploadPipeline.config)),
+      },
+      extensions: {
+        enabledIds: [...baseExtensions.enabledIds],
+        configs: JSON.parse(JSON.stringify(baseExtensions.configs)),
+      },
     };
+    delete profile.plugins;
     setLocal((prev) => ({
       ...prev,
       profiles: [...prev.profiles, profile],
@@ -252,7 +315,7 @@ export default function Settings() {
     setEditingProfileId(id);
   }, [editingProfile, local.profiles]);
 
-  const handleDeleteProfile = useCallback((profileId: string) => {
+  const performDeleteProfile = useCallback((profileId: string) => {
     setLocal((prev) => {
       if (prev.profiles.length <= 1) return prev;
       const profiles = prev.profiles.filter((profile) => profile.id !== profileId);
@@ -261,6 +324,7 @@ export default function Settings() {
       setEditingProfileId(activeProfileId);
       return { ...prev, profiles, activeProfileId };
     });
+    setDeleteProfileId(null);
   }, []);
 
   const updateProfileProvider = useCallback((
@@ -278,6 +342,99 @@ export default function Settings() {
         },
       },
     }));
+  }, [updateProfile]);
+
+  const updateProfilePipeline = useCallback((
+    profileId: string,
+    pipelineId: NonNullable<UploadProfile["uploadPipeline"]>["id"],
+  ) => {
+    updateProfile(profileId, (profile) => ({
+      ...profile,
+      uploadPipeline: {
+        id: pipelineId,
+        config: profile.uploadPipeline?.config || {},
+      },
+      plugins: undefined,
+    }));
+  }, [updateProfile]);
+
+  const updateProfilePipelineConfig = useCallback((
+    profileId: string,
+    patch: Record<string, unknown>,
+  ) => {
+    updateProfile(profileId, (profile) => ({
+      ...profile,
+      uploadPipeline: {
+        id: profile.uploadPipeline?.id || DEFAULT_PROFILE_UPLOAD_PIPELINE.id,
+        config: {
+          ...(profile.uploadPipeline?.config || {}),
+          ...patch,
+        },
+      },
+      plugins: undefined,
+    }));
+  }, [updateProfile]);
+
+  const updateProfileExtensionEnabled = useCallback((
+    profileId: string,
+    extensionId: string,
+    enabled: boolean,
+  ) => {
+    updateProfile(profileId, (profile) => {
+      const extensions = profile.extensions || DEFAULT_PROFILE_EXTENSIONS;
+      const enabledIds = new Set(extensions.enabledIds || []);
+      if (enabled) enabledIds.add(extensionId);
+      else enabledIds.delete(extensionId);
+      const currentConfig =
+        typeof extensions.configs?.[extensionId] === "object" && extensions.configs?.[extensionId] !== null
+          ? extensions.configs[extensionId] as Record<string, unknown>
+          : {};
+
+      return {
+        ...profile,
+        extensions: {
+          enabledIds: Array.from(enabledIds),
+          configs: {
+            ...DEFAULT_PROFILE_EXTENSIONS.configs,
+            ...(extensions.configs || {}),
+            [extensionId]: {
+              ...currentConfig,
+              enabled,
+            },
+          },
+        },
+        plugins: undefined,
+      };
+    });
+  }, [updateProfile]);
+
+  const updateProfileExtensionConfig = useCallback((
+    profileId: string,
+    extensionId: string,
+    patch: Record<string, unknown>,
+  ) => {
+    updateProfile(profileId, (profile) => {
+      const extensions = profile.extensions || DEFAULT_PROFILE_EXTENSIONS;
+      const currentConfig =
+        typeof extensions.configs?.[extensionId] === "object" && extensions.configs?.[extensionId] !== null
+          ? extensions.configs[extensionId] as Record<string, unknown>
+          : {};
+      return {
+        ...profile,
+        extensions: {
+          enabledIds: [...(extensions.enabledIds || [])],
+          configs: {
+            ...DEFAULT_PROFILE_EXTENSIONS.configs,
+            ...(extensions.configs || {}),
+            [extensionId]: {
+              ...currentConfig,
+              ...patch,
+            },
+          },
+        },
+        plugins: undefined,
+      };
+    });
   }, [updateProfile]);
 
   const updateProfileDirectories = useCallback((
@@ -388,13 +545,9 @@ export default function Settings() {
     const directories = local.scan.providerDirectories?.[provider] ?? [];
 
     return (
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">
-            {CLOUD_PROVIDER_LABELS[provider]}监控目录 ({directories.length})
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
+      <SettingsSectionCard
+        title={`${CLOUD_PROVIDER_LABELS[provider]}监控目录 (${directories.length})`}
+      >
           <p className="text-xs text-muted-foreground">
             根目录下仅自动扫描当天 YYYY-MM-DD 日期目录；旧日期需要手动添加具体工作次目录
           </p>
@@ -431,8 +584,7 @@ export default function Settings() {
               添加目录
             </Button>
           </div>
-        </CardContent>
-      </Card>
+      </SettingsSectionCard>
     );
   };
 
@@ -570,6 +722,175 @@ export default function Settings() {
     );
   };
 
+  const renderProfileCapabilityControls = (profile: UploadProfile) => {
+    const uploadPipeline = profile.uploadPipeline || DEFAULT_PROFILE_UPLOAD_PIPELINE;
+    const extensions = profile.extensions || DEFAULT_PROFILE_EXTENSIONS;
+    const enabledIds = new Set(extensions.enabledIds || []);
+    const module1Enabled = uploadPipeline.id === UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD;
+    const webhookEnabled = enabledIds.has(EXTENSION_IDS.WEBHOOK_NOTIFIER);
+    const ossBrowserEnabled = enabledIds.has(EXTENSION_IDS.OSS_BROWSER);
+    const module1Config =
+      typeof uploadPipeline.config === "object" &&
+      uploadPipeline.config !== null
+        ? uploadPipeline.config as Record<string, unknown>
+        : {};
+    const webhookConfig =
+      typeof extensions.configs?.[EXTENSION_IDS.WEBHOOK_NOTIFIER] === "object" &&
+      extensions.configs?.[EXTENSION_IDS.WEBHOOK_NOTIFIER] !== null
+        ? extensions.configs[EXTENSION_IDS.WEBHOOK_NOTIFIER] as Record<string, unknown>
+        : {};
+    const webhookHeadersText =
+      webhookHeaderDrafts[profile.id] ?? stringifyWebhookHeaders(webhookConfig.headers);
+
+    return (
+      <div className="rounded-md border p-3 space-y-4">
+        <div>
+          <div className="text-sm font-medium">项目能力</div>
+          <div className="text-xs text-muted-foreground mt-1">
+            上传流程互斥选择；扩展插件可叠加启用。任务创建后会冻结当前 Profile 快照
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <Label>上传流程</Label>
+            <select
+              value={uploadPipeline.id}
+              onChange={(event) =>
+                updateProfilePipeline(
+                  profile.id,
+                  event.target.value as NonNullable<UploadProfile["uploadPipeline"]>["id"],
+                )
+              }
+              className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            >
+              <option value={UPLOAD_PIPELINE_IDS.STANDARD_UPLOAD}>通用上传</option>
+              <option value={UPLOAD_PIPELINE_IDS.SANY_MODULE1_UPLOAD}>SANY Module1 数据采集上传</option>
+            </select>
+          </div>
+          <div>
+            <Label>Module1 Station 前缀</Label>
+            <Input
+              value={String(module1Config.stationPrefix || "station2")}
+              disabled={!module1Enabled}
+              onChange={(event) =>
+                updateProfilePipelineConfig(
+                  profile.id,
+                  { stationPrefix: event.target.value },
+                )
+              }
+              className="mt-1"
+            />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={webhookEnabled}
+              onChange={(event) =>
+                updateProfileExtensionEnabled(
+                  profile.id,
+                  EXTENSION_IDS.WEBHOOK_NOTIFIER,
+                  event.target.checked,
+                )
+              }
+              className="rounded"
+            />
+            启用 Webhook 通知插件
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={ossBrowserEnabled}
+              onChange={(event) =>
+                updateProfileExtensionEnabled(
+                  profile.id,
+                  EXTENSION_IDS.OSS_BROWSER,
+                  event.target.checked,
+                )
+              }
+              className="rounded"
+            />
+            启用 OSS 浏览工具插件
+          </label>
+        </div>
+
+        <div>
+          <Label>Webhook URL</Label>
+          <Input
+            value={String(webhookConfig.url || "")}
+            disabled={!webhookEnabled}
+            onChange={(event) =>
+              updateProfileExtensionConfig(
+                profile.id,
+                EXTENSION_IDS.WEBHOOK_NOTIFIER,
+                {
+                  enabled: webhookEnabled,
+                  url: event.target.value,
+                },
+              )
+            }
+            className="mt-1"
+            placeholder="https://example.com/webhook"
+          />
+        </div>
+        <div>
+          <Label>Webhook Headers (JSON)</Label>
+          <textarea
+            value={webhookHeadersText}
+            disabled={!webhookEnabled}
+            onChange={(event) => {
+              setWebhookHeaderDrafts((prev) => ({
+                ...prev,
+                [profile.id]: event.target.value,
+              }));
+              setWebhookHeaderErrors((prev) => {
+                if (!prev[profile.id]) return prev;
+                const next = { ...prev };
+                delete next[profile.id];
+                return next;
+              });
+            }}
+            onBlur={() => {
+              try {
+                const headers = parseWebhookHeaders(webhookHeadersText);
+                updateProfileExtensionConfig(
+                  profile.id,
+                  EXTENSION_IDS.WEBHOOK_NOTIFIER,
+                  {
+                    enabled: webhookEnabled,
+                    headers,
+                  },
+                );
+                setWebhookHeaderDrafts((prev) => {
+                  const next = { ...prev };
+                  delete next[profile.id];
+                  return next;
+                });
+                setWebhookHeaderErrors((prev) => {
+                  const next = { ...prev };
+                  delete next[profile.id];
+                  return next;
+                });
+              } catch (error) {
+                setWebhookHeaderErrors((prev) => ({
+                  ...prev,
+                  [profile.id]:
+                    error instanceof Error ? error.message : String(error),
+                }));
+              }
+            }}
+            className="mt-1 min-h-20 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono disabled:cursor-not-allowed disabled:opacity-50"
+            placeholder='{"Authorization":"Bearer ..."}'
+          />
+          <InlineFieldError message={webhookHeaderErrors[profile.id]} />
+        </div>
+      </div>
+    );
+  };
+
   const renderProfilesSection = () => {
     if (!editingProfile) return null;
 
@@ -611,6 +932,27 @@ export default function Settings() {
           </div>
 
           <div className="space-y-4">
+            <div className="flex flex-wrap gap-1 rounded-md border bg-muted/30 p-1">
+              {[
+                { id: "basic" as const, label: "基础信息" },
+                { id: "directories" as const, label: "扫描目录" },
+                { id: "paths" as const, label: "上传路径" },
+                { id: "capabilities" as const, label: "项目能力" },
+                { id: "preview" as const, label: "模板预览" },
+              ].map((item) => (
+                <Button
+                  key={item.id}
+                  variant={activeProfileSection === item.id ? "default" : "ghost"}
+                  size="sm"
+                  onClick={() => setActiveProfileSection(item.id)}
+                >
+                  {item.label}
+                </Button>
+              ))}
+            </div>
+
+            {activeProfileSection === "basic" && (
+              <>
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <Label>Profile 名称</Label>
@@ -669,13 +1011,13 @@ export default function Settings() {
                   }))
                 }
               >
-                <Copy className="h-3.5 w-3.5 mr-1" />
+                <SettingsIcon className="h-3.5 w-3.5 mr-1" />
                 设为默认
               </Button>
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => handleDeleteProfile(editingProfile.id)}
+                onClick={() => setDeleteProfileId(editingProfile.id)}
                 disabled={local.profiles.length <= 1}
               >
                 <Trash2 className="h-3.5 w-3.5 mr-1" />
@@ -703,17 +1045,27 @@ export default function Settings() {
                 placeholder=".jpg, .csv, .json"
               />
             </div>
+              </>
+            )}
 
+            {activeProfileSection === "directories" && (
             <div className="grid gap-3">
               {renderProfileDirectories(editingProfile, "aliyun")}
               {renderProfileDirectories(editingProfile, "tencent")}
             </div>
+            )}
 
+            {activeProfileSection === "paths" && (
             <div className="grid gap-3">
               {renderProfileProviderControls(editingProfile, "aliyun")}
               {renderProfileProviderControls(editingProfile, "tencent")}
             </div>
+            )}
 
+            {activeProfileSection === "capabilities" &&
+              renderProfileCapabilityControls(editingProfile)}
+
+            {activeProfileSection === "preview" && (
             <div className="rounded-md border p-3 space-y-3">
               <div>
                 <div className="text-sm font-medium">模板预览</div>
@@ -757,44 +1109,66 @@ export default function Settings() {
                 </div>
               )}
             </div>
+            )}
           </div>
         </CardContent>
       </Card>
     );
   };
 
+  const settingsNavItems = [
+    {
+      id: "global" as const,
+      label: "全局配置",
+      description: "扫描、上传、过滤和日志",
+      icon: <SettingsIcon className="h-4 w-4" />,
+    },
+    {
+      id: "profiles" as const,
+      label: "项目 Profile",
+      description: "项目目录、路径和能力",
+      icon: <Globe className="h-4 w-4" />,
+    },
+    {
+      id: "aliyun" as const,
+      label: "阿里云",
+      description: "OSS 连接和监控目录",
+      icon: <Cloud className="h-4 w-4" />,
+    },
+    {
+      id: "tencent" as const,
+      label: "腾讯云",
+      description: "TurboS3 连接和监控目录",
+      icon: <Cloud className="h-4 w-4" />,
+    },
+  ];
+  const deleteProfile = local.profiles.find(
+    (profile) => profile.id === deleteProfileId,
+  );
+
   if (loading)
     return <div className="p-6 text-muted-foreground">加载中...</div>;
 
   return (
-    <div className="p-6 space-y-6 max-w-3xl">
-      <div className="flex items-center justify-between">
-        <h1 className="text-xl font-bold">设置</h1>
-        <div className="text-sm text-muted-foreground">
-          {autoSaveState === "saving" && "自动保存中..."}
-          {autoSaveState === "saved" &&
-            (lastSavedAt ? `已自动保存 ${lastSavedAt}` : "已自动保存")}
-          {autoSaveState === "error" && "自动保存失败"}
-        </div>
-      </div>
+    <div className="p-6 space-y-6">
+      <PageHeader
+        title="设置"
+        description="管理扫描、上传目标、项目 Profile 和云端连接。"
+        actions={
+          <AutoSaveStatusBadge
+            state={autoSaveState}
+            lastSavedAt={lastSavedAt}
+          />
+        }
+      />
 
-      <div className="inline-flex rounded-md border p-1 bg-muted/30">
-        {[
-          { id: "global" as const, label: "全局配置" },
-          { id: "profiles" as const, label: "项目 Profile" },
-          { id: "aliyun" as const, label: "阿里云" },
-          { id: "tencent" as const, label: "腾讯云" },
-        ].map((item) => (
-          <Button
-            key={item.id}
-            variant={activeSection === item.id ? "default" : "ghost"}
-            size="sm"
-            onClick={() => setActiveSection(item.id)}
-          >
-            {item.label}
-          </Button>
-        ))}
-      </div>
+      <div className="grid gap-6 lg:grid-cols-[240px,1fr]">
+        <SettingsNav
+          items={settingsNavItems}
+          activeId={activeSection}
+          onChange={setActiveSection}
+        />
+        <div className="min-w-0 space-y-6">
 
       {activeSection === "profiles" && renderProfilesSection()}
 
@@ -1596,6 +1970,27 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
+      )}
+        </div>
+      </div>
+
+      {deleteProfile && (
+        <ConfirmDialog
+          open={Boolean(deleteProfile)}
+          title="删除项目 Profile"
+          description={
+            local.activeProfileId === deleteProfile.id
+              ? `确认删除「${deleteProfile.name}」吗？当前默认 Profile 会自动切换到列表中的第一个 Profile。`
+              : `确认删除「${deleteProfile.name}」吗？已有任务仍保留创建时的 Profile 快照。`
+          }
+          confirmText="删除"
+          cancelText="取消"
+          variant="destructive"
+          onConfirm={() => performDeleteProfile(deleteProfile.id)}
+          onOpenChange={(open) => {
+            if (!open) setDeleteProfileId(null);
+          }}
+        />
       )}
     </div>
   );

@@ -3,15 +3,22 @@ import type {
   Task, TaskStatus, AppSettings, HistoryQuery, HistoryResult,
   SSHMachine, SSHMachineInput, ScannerStatus, DataCollectInfo, DiskUsageInfo,
   DayFolderSummary, DayFolderListQuery, CloudProvider, MultiCloudOperationResult,
-  TaskDetail
+  TaskDetail, TaskListQuery, UploadQueueStartInput, UploadQueueStatus,
+  UploadQueueStopInput, PluginManifest, PluginProfileStatus, ProjectCapabilityStatus, TaskPluginRun,
+  UploadPipelineManifest,
+  OSSListQuery, OSSListResult, OSSObjectHead, OSSImageResult
 } from '@shared/types'
 import type { UploadPathPreview } from '@shared/upload-profile'
 
 const api = window.api
 
 // ---- 任务 ----
-export async function fetchTasks(status?: TaskStatus): Promise<Task[]> {
-  return (await api.invoke(IPC.TASK_LIST, status ? { status } : undefined)) as Task[]
+export async function fetchTasks(query?: TaskStatus | TaskListQuery): Promise<Task[]> {
+  const args =
+    typeof query === 'string'
+      ? { status: query }
+      : query
+  return (await api.invoke(IPC.TASK_LIST, args)) as Task[]
 }
 
 export async function fetchTask(taskId: string): Promise<Task> {
@@ -48,6 +55,19 @@ export async function restoreTask(taskId: string): Promise<void> {
 
 export async function retryTask(taskId: string, provider?: CloudProvider): Promise<void> {
   await api.invoke(IPC.TASK_RETRY, { taskId, provider })
+}
+
+// ---- 上传队列 ----
+export async function fetchUploadQueueStatus(): Promise<UploadQueueStatus> {
+  return (await api.invoke(IPC.UPLOAD_QUEUE_STATUS)) as UploadQueueStatus
+}
+
+export async function startUploadQueue(input: UploadQueueStartInput): Promise<UploadQueueStatus> {
+  return (await api.invoke(IPC.UPLOAD_QUEUE_START, input)) as UploadQueueStatus
+}
+
+export async function stopUploadQueue(input: UploadQueueStopInput): Promise<UploadQueueStatus> {
+  return (await api.invoke(IPC.UPLOAD_QUEUE_STOP, input)) as UploadQueueStatus
 }
 
 // ---- 日期目录汇总 ----
@@ -108,6 +128,54 @@ export async function previewUploadPath(input: {
   sampleFiles?: string[]
 }): Promise<UploadPathPreview> {
   return (await api.invoke(IPC.UPLOAD_PATH_PREVIEW, input)) as UploadPathPreview
+}
+
+// ---- 项目插件 ----
+export async function fetchCapabilities(): Promise<{
+  uploadPipelines: UploadPipelineManifest[]
+  extensions: PluginManifest[]
+}> {
+  return (await api.invoke(IPC.CAPABILITY_LIST)) as {
+    uploadPipelines: UploadPipelineManifest[]
+    extensions: PluginManifest[]
+  }
+}
+
+export async function fetchProjectCapabilityStatus(profileId?: string): Promise<ProjectCapabilityStatus> {
+  return (await api.invoke(IPC.CAPABILITY_PROFILE_STATUS, { profileId })) as ProjectCapabilityStatus
+}
+
+export async function fetchCapabilityRuns(taskId: string): Promise<TaskPluginRun[]> {
+  return (await api.invoke(IPC.CAPABILITY_TASK_RUNS, { taskId })) as TaskPluginRun[]
+}
+
+export async function fetchPlugins(): Promise<PluginManifest[]> {
+  return (await api.invoke(IPC.PLUGIN_LIST)) as PluginManifest[]
+}
+
+export async function fetchPluginProfileStatus(profileId?: string): Promise<PluginProfileStatus> {
+  return (await api.invoke(IPC.PLUGIN_PROFILE_STATUS, { profileId })) as PluginProfileStatus
+}
+
+export async function fetchTaskPluginRuns(taskId: string): Promise<TaskPluginRun[]> {
+  return (await api.invoke(IPC.PLUGIN_TASK_RUNS, { taskId })) as TaskPluginRun[]
+}
+
+// ---- OSS 浏览（只读工具插件） ----
+export async function listOSSObjects(query: OSSListQuery): Promise<OSSListResult> {
+  return (await api.invoke(IPC.OSS_BROWSER_LIST, query)) as OSSListResult
+}
+
+export async function headOSSObject(key: string): Promise<OSSObjectHead> {
+  return (await api.invoke(IPC.OSS_BROWSER_HEAD, { key })) as OSSObjectHead
+}
+
+export async function getOSSImagePreview(key: string, maxBytes?: number): Promise<OSSImageResult> {
+  return (await api.invoke(IPC.OSS_BROWSER_GET_IMAGE, { key, maxBytes })) as OSSImageResult
+}
+
+export async function openOSSPreviewWindow(key: string): Promise<void> {
+  await api.invoke(IPC.OSS_BROWSER_OPEN_PREVIEW_WINDOW, { key })
 }
 
 // ---- SSH ----

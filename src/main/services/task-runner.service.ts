@@ -4,6 +4,7 @@ import { BrowserWindow } from 'electron'
 import log from 'electron-log'
 import { IPC } from '@shared/ipc-channels'
 import { isDateFolderName } from '@shared/day-folder'
+import { DEFAULT_SETTINGS } from '@shared/constants'
 import {
   renderObjectKey,
   type ObjectKeyRenderContext
@@ -16,7 +17,7 @@ import {
 import { getSettingsRepo } from '../db/settings.repo'
 import { getCloudUploadService } from './cloud-upload.service'
 import type { CloudTaskUploader } from './cloud-upload.types'
-import { FileFilterService } from './file-filter.service'
+import { getUploadPipelineRuntimeService } from './upload-pipeline-runtime.service'
 import { writeProcessTask } from '../utils/marker-file'
 import { SpeedCalculator } from '../utils/speed-calculator'
 import { getUploadSemaphore } from '../utils/upload-semaphore'
@@ -24,6 +25,7 @@ import type {
   CloudProvider,
   ProcessTaskMarker,
   Task,
+  UploadPipelineResult,
   TaskProgress,
   TaskStatus
 } from '@shared/types'
@@ -41,14 +43,22 @@ interface ProviderRuntime {
   activeUploads: Map<string, number>
   transferredBytes: number
   lastBroadcastAt: number
+  lastProgressPersistAt: number
+  activeBytes: number
 }
 
 interface LogicalProgress {
-  completed: Set<string>
+  completedThisRun: Set<string>
+  uploadedFiles: number
   uploadedBytes: number
+  lastPersistAt: number
 }
 
+type ObjectKeyBaseContext = Omit<ObjectKeyRenderContext, 'relativePath'>
+
 const RETRY_DELAYS_MS = [1000, 2000, 5000, 15000, 30000]
+const MARKER_WRITE_INTERVAL_MS = 5000
+const PROGRESS_PERSIST_INTERVAL_MS = 1000
 
 export class TaskRunnerService {
   async run(task: Task, signal?: AbortSignal): Promise<TaskStatus> {
@@ -69,21 +79,43 @@ export class TaskRunnerService {
       return 'skipped'
     }
 
-    await this.reconcileBeforeUpload(task, stableChecks)
+    const uploadPlan = await getUploadPipelineRuntimeService().prepareUploadPlan(
+      task,
+      stableChecks
+    )
+    const uploadRootPath = uploadPlan.uploadRootPath
+    if (!existsSync(uploadRootPath)) {
+      throw new Error('上传工作目录不存在')
+    }
+
+    const requiredStableChecks = uploadPlan.requiredStableChecks
+    await this.reconcileBeforeUpload(
+      task,
+      requiredStableChecks,
+      uploadPlan
+    )
     const destinations = destinationRepo.listByTask(task.id)
     if (destinations.length === 0) {
       throw new Error('任务没有配置任何上传目标')
     }
+    const destinationByProvider = new Map(
+      destinations.map((destination) => [destination.provider, destination])
+    )
+    const objectKeyBaseContext = this.buildObjectKeyBaseContext(task)
 
     const jobs = destinationRepo.listReadyFileTargets(
       task.id,
-      stableChecks
+      requiredStableChecks
     )
     if (jobs.length === 0) {
       taskRepo.recalculateProgress(task.id)
       return this.updateDestinationFinalStates(task)
     }
-    this.assertNoDuplicateObjectKeys(task, destinations, jobs)
+    this.assertNoDuplicateObjectKeys(
+      destinationByProvider,
+      jobs,
+      objectKeyBaseContext
+    )
     const jobProviders = new Set(jobs.map((job) => job.provider))
     for (const destination of destinations) {
       if (!jobProviders.has(destination.provider)) continue
@@ -93,53 +125,44 @@ export class TaskRunnerService {
       )
       if (error) throw new Error(error)
     }
-    const completedLogicalFiles = taskRepo.listFiles(task.id, 'completed')
+    const initialLogicalSummary = taskRepo.summarizeFiles(task.id)
     const logicalProgress: LogicalProgress = {
-      completed: new Set(completedLogicalFiles.map((file) => file.id)),
-      uploadedBytes: completedLogicalFiles.reduce(
-        (sum, file) => sum + file.fileSize,
-        0
-      )
+      completedThisRun: new Set(),
+      uploadedFiles: initialLogicalSummary.completedFiles,
+      uploadedBytes: initialLogicalSummary.completedBytes,
+      lastPersistAt: 0
     }
 
-    const providers = Array.from(new Set(jobs.map((job) => job.provider)))
+    const providers = Array.from(jobProviders)
     const runtimes = new Map<CloudProvider, ProviderRuntime>()
     try {
       for (const provider of providers) {
-        const destination = destinations.find((item) => item.provider === provider)
+        const destination = destinationByProvider.get(provider)
         if (!destination) continue
         const uploader = await getCloudUploadService().createTaskUploader(
           provider,
           settings,
           settings.upload.multipartThreshold
         )
-        const providerTargets = destinationRepo.listFileTargets(task.id, provider)
+        const providerSummary = destinationRepo.summarizeFileTargets(
+          task.id,
+          provider
+        )
         runtimes.set(provider, {
           uploader,
           speed: new SpeedCalculator(),
-          uploadedFiles: providerTargets.filter(
-            (target) => target.status === 'completed'
-          ).length,
-          uploadedBytes: providerTargets
-            .filter((target) => target.status === 'completed')
-            .reduce((sum, target) => sum + target.fileSize, 0),
-          totalFiles: providerTargets.length,
-          totalBytes: providerTargets.reduce(
-            (sum, target) => sum + target.fileSize,
-            0
-          ),
-          queuedFiles: providerTargets.filter(
-            (target) => target.status === 'pending'
-          ).length,
-          failedFiles: providerTargets.filter(
-            (target) => target.status === 'failed'
-          ).length,
-          skippedFiles: providerTargets.filter(
-            (target) => target.status === 'skipped'
-          ).length,
+          uploadedFiles: providerSummary.uploaded,
+          uploadedBytes: providerSummary.uploadedBytes,
+          totalFiles: providerSummary.total,
+          totalBytes: providerSummary.totalBytes,
+          queuedFiles: providerSummary.pending,
+          failedFiles: providerSummary.failed,
+          skippedFiles: providerSummary.skipped,
           activeUploads: new Map(),
+          activeBytes: 0,
           transferredBytes: 0,
-          lastBroadcastAt: 0
+          lastBroadcastAt: 0,
+          lastProgressPersistAt: 0
         })
         destinationRepo.updateStatus(task.id, provider, 'uploading')
         this.broadcastDestinationStatus(task.id, provider, 'uploading')
@@ -154,9 +177,14 @@ export class TaskRunnerService {
     }
     signal?.addEventListener('abort', abortUploaders, { once: true })
 
+    const markerDestinations = destinations.map((destination) =>
+      jobProviders.has(destination.provider)
+        ? { ...destination, status: 'uploading' as const }
+        : destination
+    )
     const marker = this.createCompactMarker(
       { ...task, status: 'uploading' },
-      destinations
+      markerDestinations
     )
     this.writeMarker(task.folderPath, marker)
     const markerTimer = setInterval(() => {
@@ -164,16 +192,17 @@ export class TaskRunnerService {
       if (!currentTask) return
       this.writeMarker(
         task.folderPath,
-        this.createCompactMarker(
-          currentTask,
-          destinationRepo.listByTask(task.id)
-        )
+        this.createCompactMarker(currentTask, currentTask.destinations)
       )
-    }, 2000)
+    }, MARKER_WRITE_INTERVAL_MS)
 
-    const semaphore = getUploadSemaphore(
-      settings.upload.maxConcurrentUploads || 24
-    )
+    const maxConcurrentUploads =
+      settings.upload.maxConcurrentUploads ||
+      DEFAULT_SETTINGS.upload.maxConcurrentUploads
+    const multipartThreshold =
+      settings.upload.multipartThreshold ||
+      DEFAULT_SETTINGS.upload.multipartThreshold
+    const semaphore = getUploadSemaphore(maxConcurrentUploads)
     let nextIndex = 0
     const workerCount = Math.max(
       1,
@@ -186,10 +215,13 @@ export class TaskRunnerService {
         await this.uploadTarget(
           task,
           target,
-          destinations,
           runtimes,
           semaphore,
           logicalProgress,
+          destinationByProvider,
+          objectKeyBaseContext,
+          uploadRootPath,
+          multipartThreshold,
           signal
         )
       }
@@ -202,6 +234,10 @@ export class TaskRunnerService {
     } finally {
       clearInterval(markerTimer)
       signal?.removeEventListener('abort', abortUploaders)
+      this.persistLogicalProgress(task.id, logicalProgress, true)
+      for (const [provider, runtime] of runtimes) {
+        this.persistProviderProgress(task.id, provider, runtime, true)
+      }
       for (const runtime of runtimes.values()) runtime.uploader.dispose()
     }
 
@@ -215,45 +251,45 @@ export class TaskRunnerService {
     const finalTask = { ...currentTask, status: finalStatus }
     this.writeMarker(
       task.folderPath,
-      this.createCompactMarker(finalTask, destinationRepo.listByTask(task.id))
+      this.createCompactMarker(finalTask, finalTask.destinations)
     )
     return finalStatus
   }
 
   private async reconcileBeforeUpload(
     task: Task,
-    stableChecks: number
+    stableChecks: number,
+    uploadPlan: UploadPipelineResult
   ): Promise<void> {
-    const settings = getSettingsRepo().getAll()
-    const files = await new FileFilterService(task.profileSnapshot?.filter || settings.filter).scanFolderAsync(
-      task.folderPath
-    )
+    const files =
+      uploadPlan.files.map((file) => ({
+        relativePath: file.relativePath,
+        size: file.fileSize,
+        mtimeMs: file.mtimeMs,
+        plannedObjectKey: file.plannedObjectKey
+      }))
     getTaskRepo().reconcileFiles(
       task.id,
-      files.map((file) => ({
-        relativePath: file.relativePath,
-        size: file.size,
-        mtimeMs: file.mtimeMs
-      })),
-      stableChecks
+      files,
+      stableChecks,
+      { replacePlannedObjectKeys: true }
     )
   }
 
   private assertNoDuplicateObjectKeys(
-    task: Task,
-    destinations: Task['destinations'],
-    jobs: FileDestinationUploadTarget[]
+    destinationByProvider: Map<CloudProvider, Task['destinations'][number]>,
+    jobs: FileDestinationUploadTarget[],
+    objectKeyBaseContext: ObjectKeyBaseContext
   ): void {
     const keysByProvider = new Map<CloudProvider, Map<string, string>>()
     for (const target of jobs) {
-      const destination = destinations.find(
-        (item) => item.provider === target.provider
-      )
+      const destination = destinationByProvider.get(target.provider)
       if (!destination) continue
       const objectKey = this.renderTaskObjectKey(
-        task,
         destination,
-        target.relativePath
+        target.relativePath,
+        target.plannedObjectKey,
+        objectKeyBaseContext
       )
       const providerKeys = keysByProvider.get(target.provider) || new Map()
       const existing = providerKeys.get(objectKey)
@@ -268,10 +304,12 @@ export class TaskRunnerService {
   }
 
   private renderTaskObjectKey(
-    task: Task,
     destination: Task['destinations'][number],
-    relativePath: string
+    relativePath: string,
+    plannedObjectKey: string | null | undefined,
+    objectKeyBaseContext: ObjectKeyBaseContext
   ): string {
+    if (plannedObjectKey) return plannedObjectKey
     return renderObjectKey(
       {
         provider: destination.provider,
@@ -280,14 +318,11 @@ export class TaskRunnerService {
         pathMode: destination.pathMode,
         objectKeyTemplate: destination.objectKeyTemplate
       },
-      this.buildObjectKeyContext(task, relativePath)
+      this.buildObjectKeyContext(objectKeyBaseContext, relativePath)
     )
   }
 
-  private buildObjectKeyContext(
-    task: Task,
-    relativePath: string
-  ): ObjectKeyRenderContext {
+  private buildObjectKeyBaseContext(task: Task): ObjectKeyBaseContext {
     const dateContext = this.deriveDateContext(task.folderPath)
     return {
       sourcePath: task.folderPath,
@@ -295,10 +330,19 @@ export class TaskRunnerService {
       dateName: dateContext.dateName,
       workDirName: dateContext.workDirName || task.folderName,
       folderName: task.folderName,
-      relativePath,
       profileId: task.profileId,
       profileName: task.profileName,
       createdAt: task.createdAt
+    }
+  }
+
+  private buildObjectKeyContext(
+    baseContext: ObjectKeyBaseContext,
+    relativePath: string
+  ): ObjectKeyRenderContext {
+    return {
+      ...baseContext,
+      relativePath
     }
   }
 
@@ -334,21 +378,22 @@ export class TaskRunnerService {
   private async uploadTarget(
     task: Task,
     target: FileDestinationUploadTarget,
-    destinations: Task['destinations'],
     runtimes: Map<CloudProvider, ProviderRuntime>,
     semaphore: ReturnType<typeof getUploadSemaphore>,
     logicalProgress: LogicalProgress,
+    destinationByProvider: Map<CloudProvider, Task['destinations'][number]>,
+    objectKeyBaseContext: ObjectKeyBaseContext,
+    uploadRootPath: string,
+    multipartThreshold: number,
     signal?: AbortSignal
   ): Promise<void> {
     const taskRepo = getTaskRepo()
     const destinationRepo = getTaskDestinationRepo()
     const runtime = runtimes.get(target.provider)
-    const destination = destinations.find(
-      (item) => item.provider === target.provider
-    )
+    const destination = destinationByProvider.get(target.provider)
     if (!runtime || !destination) return
 
-    const localPath = join(task.folderPath, target.relativePath)
+    const localPath = join(uploadRootPath, target.relativePath)
     if (!existsSync(localPath)) {
       destinationRepo.updateFileStatus(
         target.id,
@@ -360,13 +405,19 @@ export class TaskRunnerService {
       destinationRepo.recalculateLogicalFile(target.taskFileId)
       runtime.skippedFiles++
       runtime.queuedFiles = Math.max(0, runtime.queuedFiles - 1)
+      this.persistProviderProgress(task.id, target.provider, runtime)
       this.broadcastProgress(task.id, target.provider, runtime, null, true)
       return
     }
 
     let acquired = false
+    const uploadWeight = this.getUploadSlotWeight(
+      target.fileSize,
+      multipartThreshold,
+      semaphore.getMax()
+    )
     try {
-      await semaphore.acquire(signal)
+      await semaphore.acquire(signal, uploadWeight)
       acquired = true
       if (signal?.aborted) throw new DOMException('Upload aborted', 'AbortError')
 
@@ -394,7 +445,12 @@ export class TaskRunnerService {
         true
       )
 
-      const objectKey = this.renderTaskObjectKey(task, destination, target.relativePath)
+      const objectKey = this.renderTaskObjectKey(
+        destination,
+        target.relativePath,
+        target.plannedObjectKey,
+        objectKeyBaseContext
+      )
       let previousLoaded = 0
       const result = await runtime.uploader.uploadFile(
         localPath,
@@ -408,6 +464,8 @@ export class TaskRunnerService {
           const delta = Math.max(0, loaded - previousLoaded)
           previousLoaded = loaded
           runtime.transferredBytes += delta
+          runtime.activeBytes +=
+            loaded - (runtime.activeUploads.get(target.id) || 0)
           runtime.activeUploads.set(target.id, loaded)
           runtime.speed.addSample(runtime.transferredBytes)
           this.broadcastProgress(
@@ -443,14 +501,11 @@ export class TaskRunnerService {
       )
       if (logicalStatus === 'completed') {
         taskRepo.clearRetry(target.taskFileId)
-        if (!logicalProgress.completed.has(target.taskFileId)) {
-          logicalProgress.completed.add(target.taskFileId)
+        if (!logicalProgress.completedThisRun.has(target.taskFileId)) {
+          logicalProgress.completedThisRun.add(target.taskFileId)
+          logicalProgress.uploadedFiles++
           logicalProgress.uploadedBytes += target.fileSize
-          taskRepo.updateProgress(
-            task.id,
-            logicalProgress.completed.size,
-            logicalProgress.uploadedBytes
-          )
+          this.persistLogicalProgress(task.id, logicalProgress)
         }
       }
       runtime.uploadedFiles++
@@ -501,16 +556,66 @@ export class TaskRunnerService {
         )
       }
     } finally {
-      runtime.activeUploads.delete(target.id)
-      if (acquired) semaphore.release()
-      destinationRepo.updateProgress(
-        task.id,
-        target.provider,
-        runtime.uploadedFiles,
-        runtime.uploadedBytes
+      runtime.activeBytes = Math.max(
+        0,
+        runtime.activeBytes - (runtime.activeUploads.get(target.id) || 0)
       )
+      runtime.activeUploads.delete(target.id)
+      if (acquired) semaphore.release(uploadWeight)
+      this.persistProviderProgress(task.id, target.provider, runtime)
       this.broadcastProgress(task.id, target.provider, runtime, null, true)
     }
+  }
+
+  private getUploadSlotWeight(
+    fileSize: number,
+    multipartThreshold: number,
+    maxConcurrentUploads: number
+  ): number {
+    if (fileSize <= multipartThreshold) return 1
+    return Math.max(1, Math.min(4, Math.floor(maxConcurrentUploads || 1)))
+  }
+
+  private persistProviderProgress(
+    taskId: string,
+    provider: CloudProvider,
+    runtime: ProviderRuntime,
+    force = false
+  ): void {
+    const now = Date.now()
+    if (
+      !force &&
+      now - runtime.lastProgressPersistAt < PROGRESS_PERSIST_INTERVAL_MS
+    ) {
+      return
+    }
+    getTaskDestinationRepo().updateProgress(
+      taskId,
+      provider,
+      runtime.uploadedFiles,
+      runtime.uploadedBytes
+    )
+    runtime.lastProgressPersistAt = now
+  }
+
+  private persistLogicalProgress(
+    taskId: string,
+    logicalProgress: LogicalProgress,
+    force = false
+  ): void {
+    const now = Date.now()
+    if (
+      !force &&
+      now - logicalProgress.lastPersistAt < PROGRESS_PERSIST_INTERVAL_MS
+    ) {
+      return
+    }
+    getTaskRepo().updateProgress(
+      taskId,
+      logicalProgress.uploadedFiles,
+      logicalProgress.uploadedBytes
+    )
+    logicalProgress.lastPersistAt = now
   }
 
   private updateDestinationFinalStates(task: Task): TaskStatus {
@@ -519,39 +624,39 @@ export class TaskRunnerService {
       task.sourceType === 'local' && task.dayFolderId ? 'synced' : 'completed'
 
     for (const destination of repo.listByTask(task.id)) {
-      const targets = repo.listFileTargets(task.id, destination.provider)
-      const failed = targets.filter((target) => target.status === 'failed')
-      const pending = targets.filter((target) => target.status === 'pending')
-      const skipped = targets.filter((target) => target.status === 'skipped')
+      const summary = repo.summarizeFileTargets(task.id, destination.provider)
 
-      if (failed.length > 0) {
-        const summary = `${failed.length} 个文件上传失败，例如 ${failed
-          .slice(0, 3)
+      if (summary.failed > 0) {
+        const examples = repo.listFailedFileTargetExamples(
+          task.id,
+          destination.provider
+        )
+        const message = `${summary.failed} 个文件上传失败，例如 ${examples
           .map(
-            (target) =>
-              `${target.relativePath}: ${target.errorMessage || 'unknown error'}`
+            (example) =>
+              `${example.relativePath}: ${example.errorMessage || 'unknown error'}`
           )
           .join(' | ')}`
-        repo.updateStatus(task.id, destination.provider, 'failed', summary)
+        repo.updateStatus(task.id, destination.provider, 'failed', message)
         this.broadcastDestinationStatus(
           task.id,
           destination.provider,
           'failed',
-          summary
+          message
         )
         taskStatus = 'failed'
-      } else if (pending.length > 0) {
+      } else if (summary.pending > 0) {
         repo.updateStatus(
           task.id,
           destination.provider,
           'retrying',
-          `${pending.length} 个文件等待自动重试或稳定`
+          `${summary.pending} 个文件等待自动重试或稳定`
         )
         this.broadcastDestinationStatus(
           task.id,
           destination.provider,
           'retrying',
-          `${pending.length} 个文件等待自动重试或稳定`
+          `${summary.pending} 个文件等待自动重试或稳定`
         )
         if (taskStatus !== 'failed') taskStatus = 'retrying'
       } else {
@@ -563,16 +668,27 @@ export class TaskRunnerService {
           task.id,
           destination.provider,
           status,
-          skipped.length > 0 ? `${skipped.length} 个源文件已跳过` : undefined
+          summary.skipped > 0 ? `${summary.skipped} 个源文件已跳过` : undefined
         )
         this.broadcastDestinationStatus(
           task.id,
           destination.provider,
           status,
-          skipped.length > 0 ? `${skipped.length} 个源文件已跳过` : undefined
+          summary.skipped > 0 ? `${summary.skipped} 个源文件已跳过` : undefined
         )
       }
-      repo.recalculateProgress(task.id, destination.provider)
+      repo.setTotals(
+        task.id,
+        destination.provider,
+        summary.total,
+        summary.totalBytes
+      )
+      repo.updateProgress(
+        task.id,
+        destination.provider,
+        summary.uploaded,
+        summary.uploadedBytes
+      )
     }
 
     return taskStatus
@@ -583,14 +699,15 @@ export class TaskRunnerService {
     destinations: Task['destinations']
   ): ProcessTaskMarker {
     const destinationRepo = getTaskDestinationRepo()
+    const taskSummary = getTaskRepo().summarizeFiles(task.id)
     return {
       version: 3,
       taskId: task.id,
       status: task.status,
-      totalFiles: task.totalFiles,
-      uploadedFiles: task.uploadedFiles,
-      failedFiles: taskRepoCount(task.id, 'failed'),
-      skippedFiles: taskRepoCount(task.id, 'skipped'),
+      totalFiles: taskSummary.totalFiles,
+      uploadedFiles: taskSummary.completedFiles,
+      failedFiles: taskSummary.failedFiles,
+      skippedFiles: taskSummary.skippedFiles,
       lastUpdated: new Date().toISOString(),
       error:
         task.errorMessage ||
@@ -602,7 +719,7 @@ export class TaskRunnerService {
       uploadTargetMode: task.uploadTargetMode,
       destinations: Object.fromEntries(
         destinations.map((destination) => {
-          const targets = destinationRepo.listFileTargets(
+          const summary = destinationRepo.summarizeFileTargets(
             task.id,
             destination.provider
           )
@@ -613,16 +730,10 @@ export class TaskRunnerService {
               uploadRelativePath: destination.uploadRelativePath,
               pathMode: destination.pathMode,
               objectKeyTemplate: destination.objectKeyTemplate,
-              totalFiles: targets.length,
-              uploadedFiles: targets.filter(
-                (target) => target.status === 'completed'
-              ).length,
-              failedFiles: targets.filter(
-                (target) => target.status === 'failed'
-              ).length,
-              skippedFiles: targets.filter(
-                (target) => target.status === 'skipped'
-              ).length,
+              totalFiles: summary.total,
+              uploadedFiles: summary.uploaded,
+              failedFiles: summary.failed,
+              skippedFiles: summary.skipped,
               error: destination.errorMessage
             }
           ]
@@ -641,10 +752,6 @@ export class TaskRunnerService {
     const now = Date.now()
     if (!force && now - runtime.lastBroadcastAt < 250) return
     runtime.lastBroadcastAt = now
-    const inFlightBytes = Array.from(runtime.activeUploads.values()).reduce(
-      (sum, bytes) => sum + bytes,
-      0
-    )
     const progress: TaskProgress = {
       taskId,
       provider,
@@ -652,7 +759,7 @@ export class TaskRunnerService {
       totalFiles: runtime.totalFiles,
       uploadedBytes: Math.min(
         runtime.totalBytes,
-        runtime.uploadedBytes + inFlightBytes
+        runtime.uploadedBytes + runtime.activeBytes
       ),
       totalBytes: runtime.totalBytes,
       speed: runtime.speed.getSpeed(),
@@ -729,10 +836,6 @@ export class TaskRunnerService {
       text.includes('socket hang up')
     )
   }
-}
-
-function taskRepoCount(taskId: string, status: string): number {
-  return getTaskRepo().listFiles(taskId, status).length
 }
 
 let instance: TaskRunnerService | null = null

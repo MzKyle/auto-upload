@@ -7,20 +7,18 @@ import {
   ArrowUpFromLine,
   ListTree,
 } from "lucide-react";
-import { useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
+import { Tooltip } from "@/components/ui/tooltip";
 import { formatBytes, formatSpeed } from "@/lib/utils";
 import type {
   CloudProvider,
   Task,
-  TaskDetail,
   TaskProgress,
 } from "@shared/types";
 import { CLOUD_PROVIDER_LABELS, TASK_STATUS_LABELS } from "@shared/constants";
-import { fetchTaskDetail } from "@/lib/ipc-client";
 
 const STATUS_VARIANT: Record<
   string,
@@ -46,6 +44,7 @@ interface TaskCardProps {
   onCancel: (id: string) => void;
   onRetry: (id: string, provider: CloudProvider) => void;
   onRestore: (id: string) => void;
+  onOpenDetail: (task: Task) => void;
 }
 
 export function TaskCard({
@@ -57,9 +56,8 @@ export function TaskCard({
   onCancel,
   onRetry,
   onRestore,
+  onOpenDetail,
 }: TaskCardProps) {
-  const [detail, setDetail] = useState<TaskDetail | null>(null);
-  const [detailOpen, setDetailOpen] = useState(false);
   const destination = task.destinations.find((item) => item.provider === provider);
   if (!destination) return null;
   const status = destination.status;
@@ -72,15 +70,27 @@ export function TaskCard({
   const isIgnoredDirectory =
     task.status === "skipped" && task.errorMessage === "非工作次目录";
   const errorText = destination.errorMessage || task.errorMessage;
-  const loadDetail = async () => {
-    if (!detailOpen && !detail) {
-      setDetail(await fetchTaskDetail(task.id));
-    }
-    setDetailOpen((value) => !value);
-  };
+  const canSkip =
+    task.status === "pending" ||
+    task.status === "scanning" ||
+    task.status === "uploading" ||
+    task.status === "retrying" ||
+    task.status === "paused" ||
+    task.status === "failed";
 
   return (
-    <Card className="mb-3">
+    <Card
+      className="mb-3 cursor-pointer transition-colors hover:border-primary/60 hover:bg-muted/20"
+      role="button"
+      tabIndex={0}
+      onClick={() => onOpenDetail(task)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpenDetail(task);
+        }
+      }}
+    >
       <CardContent className="p-4">
         <div className="flex items-start justify-between mb-3">
           <div className="flex items-center gap-2 min-w-0">
@@ -99,61 +109,84 @@ export function TaskCard({
           </div>
           <div className="flex items-center gap-1 flex-shrink-0">
             {task.status === "uploading" && status === "uploading" && (
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => onPause(task.id)}
-              >
-                <Pause className="h-3.5 w-3.5" />
-              </Button>
+              <Tooltip content="暂停任务">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7"
+                  title="暂停任务"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onPause(task.id);
+                  }}
+                >
+                  <Pause className="h-3.5 w-3.5" />
+                </Button>
+              </Tooltip>
             )}
             {task.status === "paused" && (
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => onResume(task.id)}
-              >
-                <Play className="h-3.5 w-3.5" />
-              </Button>
+              <Tooltip content="恢复任务">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7"
+                  title="恢复任务"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onResume(task.id);
+                  }}
+                >
+                  <Play className="h-3.5 w-3.5" />
+                </Button>
+              </Tooltip>
             )}
             {status === "failed" && (
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => onRetry(task.id, provider)}
-              >
-                <RotateCcw className="h-3.5 w-3.5" />
-              </Button>
+              <Tooltip content="重试此云端">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7"
+                  title="重试此云端"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onRetry(task.id, provider);
+                  }}
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                </Button>
+              </Tooltip>
             )}
             {task.status === "skipped" && (
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                title="恢复监控"
-                onClick={() => onRestore(task.id)}
-              >
-                <Play className="h-3.5 w-3.5" />
-              </Button>
+              <Tooltip content="恢复监控">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7"
+                  title="恢复监控"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onRestore(task.id);
+                  }}
+                >
+                  <Play className="h-3.5 w-3.5" />
+                </Button>
+              </Tooltip>
             )}
-            {(task.status === "pending" ||
-              task.status === "scanning" ||
-              task.status === "uploading" ||
-              task.status === "retrying" ||
-              task.status === "paused" ||
-              task.status === "failed") && (
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7 text-destructive"
-                onClick={() => onCancel(task.id)}
-                title="跳过此工作次"
-              >
-                <X className="h-3.5 w-3.5" />
-              </Button>
+            {canSkip && (
+              <Tooltip content="跳过此工作次">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 text-destructive"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onCancel(task.id);
+                  }}
+                  title="跳过此工作次"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </Button>
+              </Tooltip>
             )}
           </div>
         </div>
@@ -207,51 +240,18 @@ export function TaskCard({
           <div className="text-xs text-muted-foreground break-all">
             {task.folderPath}
           </div>
-          <Button variant="ghost" size="sm" onClick={loadDetail}>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenDetail(task);
+            }}
+          >
             <ListTree className="h-3.5 w-3.5 mr-1" />
-            {detailOpen ? "收起" : "文件详情"}
+            文件详情
           </Button>
         </div>
-
-        {detailOpen && detail && (
-          <div className="mt-2 max-h-56 overflow-auto rounded border text-xs">
-            {detail.files.length === 0 ? (
-              <div className="p-3 text-muted-foreground">尚未发现文件</div>
-            ) : (
-              detail.files.map((file) => {
-                const fileDestination = file.destinations.find(
-                  (item) => item.provider === provider,
-                );
-                return (
-                  <div
-                    key={`${file.id}:${provider}`}
-                    className="p-2 border-b last:border-b-0"
-                  >
-                    <div className="flex justify-between gap-3">
-                      <span className="break-all">{file.relativePath}</span>
-                      <span className="shrink-0 text-muted-foreground">
-                        {TASK_STATUS_LABELS[fileDestination?.status || file.status] ||
-                          fileDestination?.status ||
-                          file.status}
-                      </span>
-                    </div>
-                    {(fileDestination?.errorMessage || file.errorMessage) && (
-                      <div className="text-destructive mt-1 break-all">
-                        {fileDestination?.errorMessage || file.errorMessage}
-                      </div>
-                    )}
-                    {file.nextRetryAt && (
-                      <div className="text-muted-foreground mt-1">
-                        下次重试：
-                        {new Date(file.nextRetryAt).toLocaleString("zh-CN")}
-                      </div>
-                    )}
-                  </div>
-                );
-              })
-            )}
-          </div>
-        )}
       </CardContent>
     </Card>
   );

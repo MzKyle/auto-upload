@@ -16,15 +16,17 @@ import { getSettingsRepo } from './db/settings.repo'
 import { getScannerService } from './services/scanner.service'
 import { getTaskQueueService } from './services/task-queue.service'
 import { getTaskRunnerService } from './services/task-runner.service'
-import { getWebhookService } from './services/webhook.service'
+import { getExtensionRuntimeService } from './services/extension-runtime.service'
 import { getCleanupService } from './services/cleanup.service'
 import { getTaskRepo } from './db/task.repo'
 import { initLogger } from './utils/logger'
-import type { WebhookConfig, LogConfig } from '@shared/types'
+import { IPC } from '@shared/ipc-channels'
+import type { LogConfig } from '@shared/types'
 import log from 'electron-log'
 
 let mainWindow: BrowserWindow | null = null
 let startupWindow: BrowserWindow | null = null
+let ossPreviewWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let servicesStarted = false
 
@@ -177,9 +179,8 @@ function registerHotkey(): void {
 function startServices(): void {
   const taskQueue = getTaskQueueService()
   const taskRunner = getTaskRunnerService()
-  const webhookService = getWebhookService()
+  const extensionRuntime = getExtensionRuntimeService()
   const taskRepo = getTaskRepo()
-  const settingsRepo = getSettingsRepo()
   const scanner = getScannerService()
 
   // 连接任务队列和执行器
@@ -187,61 +188,35 @@ function startServices(): void {
     const finalStatus = await taskRunner.run(task, signal)
     if (signal.aborted) return finalStatus
 
-    // 上传完成后发送 webhook
-    const webhookConfig = settingsRepo.get<WebhookConfig>('webhook')
-    if (webhookConfig?.enabled && finalStatus === 'completed') {
+    if (finalStatus === 'completed') {
       const updatedTask = taskRepo.getById(task.id)
-      if (updatedTask) {
-        const createdAt = new Date(updatedTask.createdAt).getTime()
-        const now = Date.now()
-        const durationSeconds = Math.round((now - createdAt) / 1000)
-
-        webhookService.notify(webhookConfig, {
-          event: 'task_completed',
-          taskId: updatedTask.id,
-          folderName: updatedTask.folderName,
-          fileCount: updatedTask.totalFiles,
-          totalBytes: updatedTask.totalBytes,
-          durationSeconds,
-          status: 'completed',
-          timestamp: new Date().toISOString()
-        })
-      }
+      if (updatedTask) extensionRuntime.notifyTaskEvent(updatedTask, 'task_completed')
     }
     return finalStatus
   })
 
-  // 监听任务失败事件发送 webhook
   taskQueue.on('task:status-change', (event: { taskId: string; newStatus: string }) => {
     if (event.newStatus === 'failed') {
-      const webhookConfig = settingsRepo.get<WebhookConfig>('webhook')
-      if (webhookConfig?.enabled) {
-        const task = taskRepo.getById(event.taskId)
-        if (task) {
-          webhookService.notify(webhookConfig, {
-            event: 'task_failed',
-            taskId: task.id,
-            folderName: task.folderName,
-            fileCount: task.totalFiles,
-            totalBytes: task.totalBytes,
-            durationSeconds: 0,
-            status: 'failed',
-            timestamp: new Date().toISOString()
-          })
-        }
-      }
+      const task = taskRepo.getById(event.taskId)
+      if (task) extensionRuntime.notifyTaskEvent(task, 'task_failed')
     }
 
     // 广播状态变更到渲染进程
     for (const win of BrowserWindow.getAllWindows()) {
-      win.webContents.send('task:status-change', event)
+      win.webContents.send(IPC.TASK_STATUS_CHANGE, event)
+    }
+  })
+
+  taskQueue.on('upload-queue:event', (status) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send(IPC.UPLOAD_QUEUE_EVENT, status)
     }
   })
 
   // 恢复未完成的任务
-  const unfinished = taskRepo.getUnfinishedTasks()
-  if (unfinished.length > 0) {
-    log.info(`发现 ${unfinished.length} 个未完成任务，等待后台队列分批恢复`)
+  const unfinishedTaskIds = taskRepo.listUnfinishedTaskIds()
+  if (unfinishedTaskIds.length > 0) {
+    log.info(`发现 ${unfinishedTaskIds.length} 个未完成任务，等待后台队列分批恢复`)
   }
 
   // 启动任务队列
@@ -250,9 +225,7 @@ function startServices(): void {
   // 启动扫描器
   scanner.start()
 
-  for (const task of unfinished) {
-    scanner.queueReconcileTask(task)
-  }
+  scanner.queueReconcileTaskIds(unfinishedTaskIds)
 
   // 启动自动清理服务
   getCleanupService().start()
@@ -352,4 +325,44 @@ app.on('before-quit', () => {
 
 export function getMainWindow(): BrowserWindow | null {
   return mainWindow
+}
+
+export function createOSSPreviewWindow(key: string): void {
+  const encodedKey = encodeURIComponent(key)
+  const hash = `oss-preview?key=${encodedKey}`
+
+  if (ossPreviewWindow && !ossPreviewWindow.isDestroyed()) {
+    if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+      ossPreviewWindow.loadURL(`${process.env['ELECTRON_RENDERER_URL']}#/${hash}`)
+    } else {
+      ossPreviewWindow.loadFile(join(__dirname, '../renderer/index.html'), { hash })
+    }
+    ossPreviewWindow.show()
+    ossPreviewWindow.focus()
+    return
+  }
+
+  ossPreviewWindow = new BrowserWindow({
+    width: 1080,
+    height: 760,
+    minWidth: 760,
+    minHeight: 520,
+    title: 'OSS 预览',
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  })
+
+  ossPreviewWindow.on('closed', () => {
+    ossPreviewWindow = null
+  })
+
+  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+    ossPreviewWindow.loadURL(`${process.env['ELECTRON_RENDERER_URL']}#/${hash}`)
+  } else {
+    ossPreviewWindow.loadFile(join(__dirname, '../renderer/index.html'), { hash })
+  }
 }

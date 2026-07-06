@@ -3,6 +3,7 @@ import { rm } from 'fs/promises'
 import log from 'electron-log'
 import { getTaskRepo } from '../db/task.repo'
 import { getDayFolderRepo } from '../db/day-folder.repo'
+import { getPluginRunRepo } from '../db/plugin-run.repo'
 import { getSettingsRepo } from '../db/settings.repo'
 import type { CleanupConfig } from '@shared/types'
 
@@ -60,13 +61,16 @@ export class CleanupService {
       const retentionDays = this.normalizeRetentionDays(config)
       const taskRepo = getTaskRepo()
       const dayFolderRepo = getDayFolderRepo()
+      const pluginRunRepo = getPluginRunRepo()
       const tasks = taskRepo.getCompletedForCleanup(retentionDays)
       const dayFolders = dayFolderRepo.getCompletedForCleanup(retentionDays)
+      const stagingPaths = pluginRunRepo.listStagingPathsForCompletedTasks(retentionDays)
 
-      if (tasks.length === 0 && dayFolders.length === 0) return
+      if (tasks.length === 0 && dayFolders.length === 0 && stagingPaths.length === 0) return
 
       log.info(
-        `自动清理: 发现 ${dayFolders.length} 个日期目录和 ${tasks.length} 个独立任务可清理 ` +
+        `自动清理: 发现 ${dayFolders.length} 个日期目录、${tasks.length} 个独立任务和 ` +
+        `${stagingPaths.length} 个插件工作目录可清理 ` +
         `(保留天数: ${retentionDays})`
       )
 
@@ -97,6 +101,17 @@ export class CleanupService {
           log.info(`自动清理: 已删除 ${task.folderPath} (任务ID: ${task.id}, 完成于: ${task.completedAt})`)
         } catch (err) {
           log.error(`自动清理失败: ${task.folderPath}`, err)
+        }
+      }
+
+      for (const item of stagingPaths) {
+        try {
+          if (!existsSync(item.stagingPath)) continue
+          await rm(item.stagingPath, { recursive: true, force: true })
+          cleaned++
+          log.info(`自动清理: 已删除插件工作目录 ${item.stagingPath} (任务ID: ${item.taskId})`)
+        } catch (err) {
+          log.error(`自动清理插件工作目录失败: ${item.stagingPath}`, err)
         }
       }
 

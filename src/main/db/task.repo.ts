@@ -3,7 +3,9 @@ import { v4 as uuid } from 'uuid'
 import { normalize } from 'path'
 import type {
   CloudProvider,
+  TaskListQuery,
   Task,
+  TaskDestination,
   TaskFile,
   TaskFileDetail,
   TaskStatus,
@@ -19,7 +21,10 @@ function normalizeFolderPath(p: string): string {
   return normalize(p).replace(/[\\/]+$/, '')
 }
 
-function rowToTask(row: Record<string, unknown>): Task {
+function rowToTask(
+  row: Record<string, unknown>,
+  destinations?: TaskDestination[]
+): Task {
   const profileSnapshot =
     typeof row.profile_snapshot_json === 'string' && row.profile_snapshot_json
       ? safeParseProfile(row.profile_snapshot_json)
@@ -35,7 +40,8 @@ function rowToTask(row: Record<string, unknown>): Task {
     uploadedBytes: row.uploaded_bytes as number,
     ossPrefix: (row.oss_prefix as string) || '',
     uploadTargetMode: (row.upload_target_mode as UploadTargetMode) || 'aliyun',
-    destinations: getTaskDestinationRepo().listByTask(row.id as string),
+    destinations:
+      destinations ?? getTaskDestinationRepo().listByTask(row.id as string),
     dayFolderId: (row.day_folder_id as string) || null,
     uploadRelativePath: (row.upload_relative_path as string | null | undefined) ?? (row.folder_name as string),
     errorMessage: (row.error_message as string) || null,
@@ -58,6 +64,15 @@ function safeParseProfile(value: string): UploadProfile | null {
   }
 }
 
+const UPLOAD_QUEUE_CANDIDATE_STATUSES: TaskStatus[] = [
+  'pending',
+  'scanning',
+  'uploading',
+  'retrying',
+  'failed',
+  'paused'
+]
+
 function rowToTaskFile(row: Record<string, unknown>): TaskFile {
   return {
     id: row.id as string,
@@ -79,13 +94,72 @@ function rowToTaskFile(row: Record<string, unknown>): TaskFile {
   }
 }
 
+export interface TaskFileSummary {
+  totalFiles: number
+  totalBytes: number
+  completedFiles: number
+  completedBytes: number
+  failedFiles: number
+  skippedFiles: number
+}
+
+interface ReconcileFilesOptions {
+  replacePlannedObjectKeys?: boolean
+}
+
+interface ReconcileScannedFile {
+  relativePath: string
+  size: number
+  mtimeMs: number
+  plannedObjectKey?: string
+}
+
+interface ReconcileFilesResult {
+  changed: boolean
+  readyFiles: number
+  unstableFiles: number
+  failedFiles: number
+  skippedFiles: number
+}
+
 export class TaskRepo {
+  private rowsToTasks(rows: Record<string, unknown>[]): Task[] {
+    const destinationsByTask = getTaskDestinationRepo().listByTaskIds(
+      rows.map((row) => row.id as string)
+    )
+    return rows.map((row) =>
+      rowToTask(row, destinationsByTask.get(row.id as string) || [])
+    )
+  }
+
   listByStatus(status?: TaskStatus): Task[] {
+    return this.listByQuery(status ? { status } : undefined)
+  }
+
+  listByQuery(query?: TaskListQuery): Task[] {
     const db = getDb()
-    if (status) {
-      return (db.prepare('SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC').all(status) as Record<string, unknown>[]).map(rowToTask)
+    if (query?.statuses?.length) {
+      const statuses = Array.from(new Set(query.statuses))
+      const placeholders = statuses.map(() => '?').join(',')
+      const rows = db
+        .prepare(
+          `SELECT * FROM tasks
+           WHERE status IN (${placeholders})
+           ORDER BY created_at DESC`
+        )
+        .all(...statuses) as Record<string, unknown>[]
+      return this.rowsToTasks(rows)
     }
-    return (db.prepare('SELECT * FROM tasks ORDER BY created_at DESC').all() as Record<string, unknown>[]).map(rowToTask)
+    if (query?.status) {
+      const rows = db
+        .prepare('SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC')
+        .all(query.status) as Record<string, unknown>[]
+      return this.rowsToTasks(rows)
+    }
+    const rows = db
+      .prepare('SELECT * FROM tasks ORDER BY created_at DESC')
+      .all() as Record<string, unknown>[]
+    return this.rowsToTasks(rows)
   }
 
   listContinuouslyMonitored(dateName: string): Task[] {
@@ -99,10 +173,29 @@ export class TaskRepo {
          AND t.status NOT IN ('skipped', 'paused', 'completed')
        ORDER BY t.created_at ASC`
     ).all(dateName) as Record<string, unknown>[]
-    return rows.map(rowToTask)
+    return this.rowsToTasks(rows)
   }
 
-  listRunnable(now = new Date().toISOString()): Task[] {
+  listContinuouslyMonitoredTaskIds(dateName: string): string[] {
+    const rows = getDb().prepare(
+      `SELECT t.id
+       FROM tasks t
+       INNER JOIN day_folders df ON df.id = t.day_folder_id
+       WHERE t.source_type = 'local'
+         AND t.day_folder_id IS NOT NULL
+         AND df.date_value = ?
+         AND t.status NOT IN ('skipped', 'paused', 'completed')
+       ORDER BY t.created_at ASC`
+    ).all(dateName) as Array<{ id: string }>
+    return rows.map((row) => row.id)
+  }
+
+  listRunnable(now = new Date().toISOString(), limit?: number): Task[] {
+    const params: unknown[] = [now]
+    const boundedLimit =
+      typeof limit === 'number' && limit > 0 ? Math.floor(limit) : null
+    const limitClause = boundedLimit ? 'LIMIT ?' : ''
+    if (boundedLimit) params.push(boundedLimit)
     const rows = getDb().prepare(
       `SELECT DISTINCT t.*
        FROM tasks t
@@ -113,9 +206,10 @@ export class TaskRepo {
          AND tf.stable_count >= CASE WHEN t.source_type = 'local' THEN 2 ELSE 1 END
          AND (tf.next_retry_at IS NULL OR tf.next_retry_at <= ?)
          AND tfd.status = 'pending'
-       ORDER BY t.created_at ASC`
-    ).all(now) as Record<string, unknown>[]
-    return rows.map(rowToTask)
+       ORDER BY t.created_at ASC
+       ${limitClause}`
+    ).all(...params) as Record<string, unknown>[]
+    return this.rowsToTasks(rows)
   }
 
   getById(id: string): Task | null {
@@ -138,7 +232,10 @@ export class TaskRepo {
   findTaskContainingFile(filePath: string): Task | null {
     const db = getDb()
     const normalized = normalize(filePath)
-    const tasks = (db.prepare('SELECT * FROM tasks ORDER BY length(folder_path) DESC').all() as Record<string, unknown>[]).map(rowToTask)
+    const rows = db
+      .prepare('SELECT * FROM tasks ORDER BY length(folder_path) DESC')
+      .all() as Record<string, unknown>[]
+    const tasks = this.rowsToTasks(rows)
     return tasks.find((t) => {
       const fp = t.folderPath
       return normalized.startsWith(fp + '/') || normalized.startsWith(fp + '\\')
@@ -238,7 +335,7 @@ export class TaskRepo {
     const rows = getDb().prepare(
       'SELECT * FROM tasks WHERE day_folder_id = ? ORDER BY created_at DESC'
     ).all(dayFolderId) as Record<string, unknown>[]
-    return rows.map(rowToTask)
+    return this.rowsToTasks(rows)
   }
 
   updateStatus(id: string, status: TaskStatus, errorMessage?: string): void {
@@ -268,6 +365,24 @@ export class TaskRepo {
        WHERE task_id = ?`
     ).run(new Date().toISOString(), id)
     this.updateStatus(id, 'pending')
+  }
+
+  resumeForUpload(id: string): void {
+    const task = this.getById(id)
+    if (!task) return
+    if (
+      task.status === 'failed' ||
+      task.status === 'paused' ||
+      task.status === 'retrying'
+    ) {
+      this.retry(id)
+    }
+  }
+
+  resumeManyForUpload(ids: string[]): void {
+    for (const id of Array.from(new Set(ids))) {
+      this.resumeForUpload(id)
+    }
   }
 
   skip(id: string, reason = '用户跳过'): void {
@@ -421,6 +536,28 @@ export class TaskRepo {
     return (db.prepare('SELECT * FROM task_files WHERE task_id = ?').all(taskId) as Record<string, unknown>[]).map(rowToTaskFile)
   }
 
+  summarizeFiles(taskId: string): TaskFileSummary {
+    const row = getDb().prepare(
+      `SELECT
+         COUNT(*) AS total_files,
+         COALESCE(SUM(file_size), 0) AS total_bytes,
+         SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_files,
+         COALESCE(SUM(CASE WHEN status = 'completed' THEN file_size ELSE 0 END), 0) AS completed_bytes,
+         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_files,
+         SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped_files
+       FROM task_files
+       WHERE task_id = ?`
+    ).get(taskId) as Record<string, number>
+    return {
+      totalFiles: row.total_files || 0,
+      totalBytes: row.total_bytes || 0,
+      completedFiles: row.completed_files || 0,
+      completedBytes: row.completed_bytes || 0,
+      failedFiles: row.failed_files || 0,
+      skippedFiles: row.skipped_files || 0
+    }
+  }
+
   listFileDetails(taskId: string): TaskFileDetail[] {
     const files = this.listFiles(taskId)
     const destinations = getTaskDestinationRepo().listFileTargets(taskId)
@@ -439,124 +576,271 @@ export class TaskRepo {
 
   reconcileFiles(
     taskId: string,
-    files: Array<{ relativePath: string; size: number; mtimeMs: number }>,
-    requiredStableChecks: number
-  ): {
-    changed: boolean
-    readyFiles: number
-    unstableFiles: number
-    failedFiles: number
-    skippedFiles: number
-  } {
+    files: ReconcileScannedFile[],
+    requiredStableChecks: number,
+    options: ReconcileFilesOptions = {}
+  ): ReconcileFilesResult {
     const db = getDb()
     const task = this.getById(taskId)
     if (!task || task.status === 'skipped' || task.status === 'paused') {
-      return {
-        changed: false,
-        readyFiles: 0,
-        unstableFiles: 0,
-        failedFiles: 0,
-        skippedFiles: 0
-      }
+      return this.emptyReconcileResult()
     }
 
     const now = new Date().toISOString()
-    const existingRows = db.prepare(
-      'SELECT * FROM task_files WHERE task_id = ?'
-    ).all(taskId) as Record<string, unknown>[]
-    const existing = new Map(
-      existingRows.map((row) => [row.relative_path as string, rowToTaskFile(row)])
-    )
-    const seen = new Set<string>()
+    const tempTable = this.createReconcileTempTable()
+    const quotedTempTable = this.quoteIdentifier(tempTable)
+    let hasPlannedObjectKeys = false
     let changed = false
 
-    const insert = db.prepare(
-      `INSERT INTO task_files (
-        id, task_id, relative_path, file_size, status, mtime_ms,
-        last_seen_at, source_status, stable_count, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'pending', ?, ?, 'present', 1, ?, ?)`
-    )
-    const updateChanged = db.prepare(
-      `UPDATE task_files
-       SET file_size = ?, mtime_ms = ?, last_seen_at = ?, source_status = 'present',
-           stable_count = 1, status = 'pending', error_message = NULL,
-           retry_count = 0, next_retry_at = NULL, updated_at = ?
-       WHERE id = ?`
-    )
-    const updateStable = db.prepare(
-      `UPDATE task_files
-       SET last_seen_at = ?, source_status = 'present',
-           stable_count = MIN(stable_count + 1, ?), updated_at = ?
-       WHERE id = ?`
-    )
-    const resetTargets = db.prepare(
-      `UPDATE task_file_destinations
-       SET status = 'pending', object_key = NULL, upload_id = NULL,
-           error_message = NULL, updated_at = ?
-       WHERE task_file_id = ? AND status != 'uploading'`
-    )
-    const markFileMissing = db.prepare(
-      `UPDATE task_files
-       SET source_status = 'missing',
-           status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
-           error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源文件已删除' END,
-           next_retry_at = NULL, updated_at = ?
-       WHERE id = ?`
-    )
-    const markTargetsMissing = db.prepare(
-      `UPDATE task_file_destinations
-       SET status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
-           error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源文件已删除' END,
-           updated_at = ?
-       WHERE task_file_id = ? AND status != 'uploading'`
-    )
+    try {
+      this.insertReconcileBatch(quotedTempTable, files, (hasPlannedObjectKey) => {
+        hasPlannedObjectKeys = hasPlannedObjectKeys || hasPlannedObjectKey
+      })
+      changed = this.applyReconcileTempChanges(
+        taskId,
+        quotedTempTable,
+        now,
+        Math.max(1, requiredStableChecks)
+      )
+    } catch (error) {
+      db.prepare(`DROP TABLE IF EXISTS ${quotedTempTable}`).run()
+      throw error
+    }
 
-    const transaction = db.transaction(() => {
-      for (const file of files) {
-        seen.add(file.relativePath)
-        const current = existing.get(file.relativePath)
-        if (!current) {
-          insert.run(
-            uuid(),
-            taskId,
-            file.relativePath,
-            file.size,
-            file.mtimeMs,
-            now,
-            now,
-            now
-          )
-          changed = true
-          continue
-        }
+    try {
+      return this.completeReconcileFromTempTable(
+        task,
+        quotedTempTable,
+        now,
+        Math.max(1, requiredStableChecks),
+        changed,
+        options.replacePlannedObjectKeys ?? hasPlannedObjectKeys
+      )
+    } finally {
+      db.prepare(`DROP TABLE IF EXISTS ${quotedTempTable}`).run()
+    }
+  }
 
-        const fileChanged =
-          current.fileSize !== file.size ||
-          current.mtimeMs !== file.mtimeMs ||
-          current.sourceStatus === 'missing'
-        if (fileChanged) {
-          updateChanged.run(file.size, file.mtimeMs, now, now, current.id)
-          resetTargets.run(now, current.id)
-          changed = true
-        } else if (current.stableCount < Math.max(1, requiredStableChecks)) {
-          updateStable.run(
-            now,
-            Math.max(1, requiredStableChecks),
-            now,
-            current.id
-          )
-        }
+  async reconcileFileBatches(
+    taskId: string,
+    fileBatches: Iterable<ReconcileScannedFile[]> | AsyncIterable<ReconcileScannedFile[]>,
+    requiredStableChecks: number,
+    options: ReconcileFilesOptions = {}
+  ): Promise<ReconcileFilesResult> {
+    const db = getDb()
+    const task = this.getById(taskId)
+    if (!task || task.status === 'skipped' || task.status === 'paused') {
+      return this.emptyReconcileResult()
+    }
+
+    const now = new Date().toISOString()
+    const tempTable = this.createReconcileTempTable()
+    const quotedTempTable = this.quoteIdentifier(tempTable)
+    let hasPlannedObjectKeys = false
+    let changed = false
+
+    try {
+      for await (const batch of fileBatches) {
+        this.insertReconcileBatch(quotedTempTable, batch, (hasPlannedObjectKey) => {
+          hasPlannedObjectKeys = hasPlannedObjectKeys || hasPlannedObjectKey
+        })
       }
+      changed = this.applyReconcileTempChanges(
+        taskId,
+        quotedTempTable,
+        now,
+        Math.max(1, requiredStableChecks)
+      )
+      return this.completeReconcileFromTempTable(
+        task,
+        quotedTempTable,
+        now,
+        Math.max(1, requiredStableChecks),
+        changed,
+        options.replacePlannedObjectKeys ?? hasPlannedObjectKeys
+      )
+    } finally {
+      db.prepare(`DROP TABLE IF EXISTS ${quotedTempTable}`).run()
+    }
+  }
 
-      for (const current of existing.values()) {
-        if (seen.has(current.relativePath) || current.sourceStatus === 'missing') continue
-        markFileMissing.run(now, current.id)
-        markTargetsMissing.run(now, current.id)
-        changed = true
+  private insertReconcileBatch(
+    quotedTempTable: string,
+    files: ReconcileScannedFile[],
+    onPlannedObjectKeyPresence: (present: boolean) => void
+  ): void {
+    const insert = getDb().prepare(
+      `INSERT OR REPLACE INTO ${quotedTempTable} (
+        relative_path, file_size, mtime_ms, planned_object_key
+      ) VALUES (?, ?, ?, ?)`
+    )
+    let hasPlannedObjectKey = false
+    const transaction = getDb().transaction(() => {
+      for (const file of files) {
+        if (Object.prototype.hasOwnProperty.call(file, 'plannedObjectKey')) {
+          hasPlannedObjectKey = true
+        }
+        insert.run(
+          file.relativePath,
+          file.size,
+          file.mtimeMs,
+          file.plannedObjectKey || null
+        )
       }
     })
     transaction()
-    getTaskDestinationRepo().ensureForTaskFiles(taskId)
+    onPlannedObjectKeyPresence(hasPlannedObjectKey)
+  }
+
+  private applyReconcileTempChanges(
+    taskId: string,
+    quotedTempTable: string,
+    now: string,
+    requiredStableChecks: number
+  ): boolean {
+    const db = getDb()
+    let changed = false
+    const transaction = db.transaction(() => {
+      db.prepare(
+        `UPDATE task_file_destinations
+         SET status = 'pending', object_key = NULL, upload_id = NULL,
+             error_message = NULL, updated_at = ?
+         WHERE status != 'uploading'
+           AND task_file_id IN (
+             SELECT tf.id
+             FROM task_files tf
+             INNER JOIN ${quotedTempTable} scanned
+               ON scanned.relative_path = tf.relative_path
+             WHERE tf.task_id = ?
+               AND (
+                 tf.file_size != scanned.file_size
+                 OR tf.mtime_ms != scanned.mtime_ms
+                 OR tf.source_status = 'missing'
+               )
+           )`
+      ).run(now, taskId)
+
+      db.prepare(
+        `UPDATE task_files
+         SET last_seen_at = ?,
+             source_status = 'present',
+             stable_count = MIN(stable_count + 1, ?),
+             updated_at = ?
+         WHERE task_id = ?
+           AND source_status = 'present'
+           AND stable_count < ?
+           AND EXISTS (
+             SELECT 1
+             FROM ${quotedTempTable} scanned
+             WHERE scanned.relative_path = task_files.relative_path
+               AND task_files.file_size = scanned.file_size
+               AND task_files.mtime_ms = scanned.mtime_ms
+           )`
+      ).run(now, requiredStableChecks, now, taskId, requiredStableChecks)
+
+      const changedRows = db.prepare(
+        `UPDATE task_files
+         SET file_size = (
+             SELECT scanned.file_size
+             FROM ${quotedTempTable} scanned
+             WHERE scanned.relative_path = task_files.relative_path
+           ),
+           mtime_ms = (
+             SELECT scanned.mtime_ms
+             FROM ${quotedTempTable} scanned
+             WHERE scanned.relative_path = task_files.relative_path
+           ),
+           last_seen_at = ?,
+           source_status = 'present',
+           stable_count = 1,
+           status = 'pending',
+           error_message = NULL,
+           retry_count = 0,
+           next_retry_at = NULL,
+           updated_at = ?
+         WHERE task_id = ?
+           AND EXISTS (
+             SELECT 1
+             FROM ${quotedTempTable} scanned
+             WHERE scanned.relative_path = task_files.relative_path
+               AND (
+                 task_files.file_size != scanned.file_size
+                 OR task_files.mtime_ms != scanned.mtime_ms
+                 OR task_files.source_status = 'missing'
+               )
+           )`
+      ).run(now, now, taskId).changes
+
+      const insertedRows = db.prepare(
+        `INSERT INTO task_files (
+          id, task_id, relative_path, file_size, status, mtime_ms,
+          last_seen_at, source_status, stable_count, created_at, updated_at
+        )
+        SELECT lower(hex(randomblob(16))), ?, scanned.relative_path,
+          scanned.file_size, 'pending', scanned.mtime_ms, ?, 'present',
+          1, ?, ?
+        FROM ${quotedTempTable} scanned
+        LEFT JOIN task_files existing
+          ON existing.task_id = ?
+         AND existing.relative_path = scanned.relative_path
+        WHERE existing.id IS NULL`
+      ).run(taskId, now, now, now, taskId).changes
+
+      db.prepare(
+        `UPDATE task_file_destinations
+         SET status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
+             error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源文件已删除' END,
+             updated_at = ?
+         WHERE status != 'uploading'
+           AND task_file_id IN (
+             SELECT tf.id
+             FROM task_files tf
+             LEFT JOIN ${quotedTempTable} scanned
+               ON scanned.relative_path = tf.relative_path
+             WHERE tf.task_id = ?
+               AND tf.source_status != 'missing'
+               AND scanned.relative_path IS NULL
+           )`
+      ).run(now, taskId)
+
+      const missingRows = db.prepare(
+        `UPDATE task_files
+         SET source_status = 'missing',
+             status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
+             error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源文件已删除' END,
+             next_retry_at = NULL,
+             updated_at = ?
+         WHERE task_id = ?
+           AND source_status != 'missing'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM ${quotedTempTable} scanned
+             WHERE scanned.relative_path = task_files.relative_path
+           )`
+      ).run(now, taskId).changes
+
+      changed = changedRows > 0 || insertedRows > 0 || missingRows > 0
+    })
+    transaction()
+    return changed
+  }
+
+  private completeReconcileFromTempTable(
+    task: Task,
+    quotedTempTable: string,
+    now: string,
+    requiredStableChecks: number,
+    changed: boolean,
+    shouldReplacePlannedObjectKeys: boolean
+  ): ReconcileFilesResult {
+    const db = getDb()
+    const taskId = task.id
+    const destinationRepo = getTaskDestinationRepo()
+
+    destinationRepo.ensureForTaskFiles(taskId)
+    if (shouldReplacePlannedObjectKeys) {
+      this.replacePlannedObjectKeysFromTempTable(taskId, quotedTempTable, now)
+    }
 
     const counts = db.prepare(
       `SELECT
@@ -604,8 +888,7 @@ export class TaskRepo {
       now,
       taskId
     )
-    for (const destination of getTaskDestinationRepo().listByTask(taskId)) {
-      const destinationRepo = getTaskDestinationRepo()
+    for (const destination of destinationRepo.listByTask(taskId)) {
       destinationRepo.recalculateProgress(taskId, destination.provider)
       const summary = destinationRepo.summarizeFileTargets(
         taskId,
@@ -661,6 +944,94 @@ export class TaskRepo {
       failedFiles: counts.failed_files || 0,
       skippedFiles: counts.skipped_files || 0
     }
+  }
+
+  private createReconcileTempTable(): string {
+    const name = `tmp_reconcile_files_${uuid().replace(/-/g, '')}`
+    getDb().exec(`
+      CREATE TEMP TABLE ${this.quoteIdentifier(name)} (
+        relative_path TEXT PRIMARY KEY,
+        file_size INTEGER NOT NULL,
+        mtime_ms REAL NOT NULL,
+        planned_object_key TEXT
+      )
+    `)
+    return name
+  }
+
+  private replacePlannedObjectKeysFromTempTable(
+    taskId: string,
+    quotedTempTable: string,
+    now: string
+  ): void {
+    const db = getDb()
+    const transaction = db.transaction(() => {
+      db.prepare(
+        `UPDATE task_file_destinations
+         SET planned_object_key = NULL, updated_at = ?
+         WHERE planned_object_key IS NOT NULL
+           AND id IN (
+             SELECT tfd.id
+             FROM task_file_destinations tfd
+             INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+             LEFT JOIN ${quotedTempTable} scanned
+               ON scanned.relative_path = tf.relative_path
+              AND scanned.planned_object_key IS NOT NULL
+             WHERE tf.task_id = ?
+               AND scanned.relative_path IS NULL
+           )`
+      ).run(now, taskId)
+
+      db.prepare(
+        `UPDATE task_file_destinations
+         SET planned_object_key = (
+             SELECT scanned.planned_object_key
+             FROM task_files tf
+             INNER JOIN ${quotedTempTable} scanned
+               ON scanned.relative_path = tf.relative_path
+             WHERE tf.id = task_file_destinations.task_file_id
+               AND scanned.planned_object_key IS NOT NULL
+           ),
+           updated_at = ?
+         WHERE task_file_id IN (
+           SELECT tf.id
+           FROM task_files tf
+           INNER JOIN ${quotedTempTable} scanned
+             ON scanned.relative_path = tf.relative_path
+           WHERE tf.task_id = ?
+             AND scanned.planned_object_key IS NOT NULL
+         )
+         AND (
+           planned_object_key IS NULL
+           OR planned_object_key != (
+             SELECT scanned.planned_object_key
+             FROM task_files tf
+             INNER JOIN ${quotedTempTable} scanned
+               ON scanned.relative_path = tf.relative_path
+             WHERE tf.id = task_file_destinations.task_file_id
+               AND scanned.planned_object_key IS NOT NULL
+           )
+         )`
+      ).run(now, taskId)
+    })
+    transaction()
+  }
+
+  private emptyReconcileResult(): ReconcileFilesResult {
+    return {
+      changed: false,
+      readyFiles: 0,
+      unstableFiles: 0,
+      failedFiles: 0,
+      skippedFiles: 0
+    }
+  }
+
+  private quoteIdentifier(identifier: string): string {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(identifier)) {
+      throw new Error(`Invalid SQL identifier: ${identifier}`)
+    }
+    return `"${identifier}"`
   }
 
   markFileChanged(
@@ -747,23 +1118,69 @@ export class TaskRepo {
 
   getUnfinishedTasks(): Task[] {
     const db = getDb()
-    return (db.prepare(
+    const rows = db.prepare(
       `SELECT * FROM tasks
        WHERE status IN ('pending', 'uploading', 'scanning', 'retrying', 'failed', 'paused')
        ORDER BY created_at ASC`
-    ).all() as Record<string, unknown>[]).map(rowToTask)
+    ).all() as Record<string, unknown>[]
+    return this.rowsToTasks(rows)
+  }
+
+  listPendingUploadTaskIds(): string[] {
+    const placeholders = UPLOAD_QUEUE_CANDIDATE_STATUSES.map(() => '?').join(',')
+    const rows = getDb().prepare(
+      `SELECT id FROM tasks
+       WHERE status IN (${placeholders})
+       ORDER BY created_at ASC`
+    ).all(...UPLOAD_QUEUE_CANDIDATE_STATUSES) as Array<{ id: string }>
+    return rows.map((row) => row.id)
+  }
+
+  listPendingUploadTaskIdsByDayFolderIds(dayFolderIds: string[]): string[] {
+    const uniqueIds = Array.from(new Set(dayFolderIds)).filter(Boolean)
+    if (uniqueIds.length === 0) return []
+    const folderPlaceholders = uniqueIds.map(() => '?').join(',')
+    const statusPlaceholders = UPLOAD_QUEUE_CANDIDATE_STATUSES.map(() => '?').join(',')
+    const rows = getDb().prepare(
+      `SELECT id FROM tasks
+       WHERE day_folder_id IN (${folderPlaceholders})
+         AND status IN (${statusPlaceholders})
+       ORDER BY created_at ASC`
+    ).all(...uniqueIds, ...UPLOAD_QUEUE_CANDIDATE_STATUSES) as Array<{ id: string }>
+    return rows.map((row) => row.id)
+  }
+
+  listMonitorableLocalUnfinishedTasks(): Task[] {
+    const rows = getDb().prepare(
+      `SELECT * FROM tasks
+       WHERE source_type = 'local'
+         AND day_folder_id IS NOT NULL
+         AND status NOT IN ('completed', 'synced', 'skipped')
+       ORDER BY created_at ASC`
+    ).all() as Record<string, unknown>[]
+    return this.rowsToTasks(rows)
+  }
+
+  listUnfinishedTaskIds(): string[] {
+    const rows = getDb().prepare(
+      `SELECT id FROM tasks
+       WHERE status IN ('pending', 'uploading', 'scanning', 'retrying', 'failed', 'paused')
+       ORDER BY created_at ASC`
+    ).all() as Array<{ id: string }>
+    return rows.map((row) => row.id)
   }
 
   getCompletedForCleanup(retentionDays: number): Task[] {
     const db = getDb()
     const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString()
-    return (db.prepare(
+    const rows = db.prepare(
       `SELECT * FROM tasks
        WHERE status = 'completed'
          AND (source_type = 'rsync' OR (source_type = 'local' AND day_folder_id IS NULL))
          AND completed_at IS NOT NULL AND completed_at < ?
        ORDER BY completed_at ASC`
-    ).all(cutoff) as Record<string, unknown>[]).map(rowToTask)
+    ).all(cutoff) as Record<string, unknown>[]
+    return this.rowsToTasks(rows)
   }
 }
 

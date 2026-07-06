@@ -8,15 +8,17 @@ import { getTaskQueueService } from '../services/task-queue.service'
 import { getSSHRsyncService } from '../services/ssh-rsync.service'
 import { getOSSUploadService } from '../services/oss-upload.service'
 import { getTencentS3UploadService } from '../services/tencent-s3-upload.service'
+import { getOSSBrowserService } from '../services/oss-browser.service'
+import { getExtensionRuntimeService } from '../services/extension-runtime.service'
 import { getCleanupService } from '../services/cleanup.service'
 import { getDayFolderRepo } from '../db/day-folder.repo'
 import { getDayFolderService } from '../services/day-folder.service'
-import { getMainWindow } from '../index'
+import { createOSSPreviewWindow, getMainWindow } from '../index'
 import { getDb } from '../db/database'
 import { getDataCollectService } from '../services/data-collect.service'
 import { getTaskDestinationRepo } from '../db/task-destination.repo'
 import { v4 as uuid } from 'uuid'
-import type { AppSettings, CloudProvider, HistoryQuery, TaskStatus, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, DayFolderListQuery, UploadPathMode, UploadProfile } from '@shared/types'
+import type { AppSettings, CloudProvider, HistoryQuery, TaskListQuery, SSHMachine, SSHMachineInput, RsyncProgress, TransferMode, DiskUsageInfo, DayFolderListQuery, UploadPathMode, UploadProfile, UploadQueueStartInput, UploadQueueStopInput, OSSListQuery } from '@shared/types'
 import { basename, dirname, normalize } from 'path'
 import { isDateFolderName } from '@shared/day-folder'
 import { shouldRestartScannerAfterSettingsSave } from '@shared/settings-effects'
@@ -64,8 +66,8 @@ export function registerAllIpc(): void {
   }
 
   // ---- 任务管理 ----
-  ipcMain.handle(IPC.TASK_LIST, (_event, args?: { status?: TaskStatus }) => {
-    return getTaskRepo().listByStatus(args?.status)
+  ipcMain.handle(IPC.TASK_LIST, (_event, args?: TaskListQuery) => {
+    return getTaskRepo().listByQuery(args)
   })
 
   ipcMain.handle(IPC.TASK_GET, (_event, args: { taskId: string }) => {
@@ -152,6 +154,19 @@ export function registerAllIpc(): void {
     getTaskRepo().retry(args.taskId, args.provider)
     getDayFolderService().refreshForTask(args.taskId)
     broadcastStatusChange(args.taskId, 'pending')
+  })
+
+  // ---- 上传队列 ----
+  ipcMain.handle(IPC.UPLOAD_QUEUE_STATUS, () => {
+    return getTaskQueueService().getStatus()
+  })
+
+  ipcMain.handle(IPC.UPLOAD_QUEUE_START, (_event, args: UploadQueueStartInput) => {
+    return getTaskQueueService().startUploading(args)
+  })
+
+  ipcMain.handle(IPC.UPLOAD_QUEUE_STOP, (_event, args: UploadQueueStopInput) => {
+    return getTaskQueueService().stopUploading(args)
   })
 
   // ---- 扫描器 ----
@@ -326,6 +341,49 @@ export function registerAllIpc(): void {
       }
     }
   )
+
+  // ---- 项目能力 ----
+  ipcMain.handle(IPC.CAPABILITY_LIST, () => {
+    return getExtensionRuntimeService().listCapabilities()
+  })
+
+  ipcMain.handle(IPC.CAPABILITY_PROFILE_STATUS, (_event, args?: { profileId?: string }) => {
+    return getExtensionRuntimeService().getProjectCapabilityStatus(args?.profileId)
+  })
+
+  ipcMain.handle(IPC.CAPABILITY_TASK_RUNS, (_event, args: { taskId: string }) => {
+    return getExtensionRuntimeService().listTaskRuns(args.taskId)
+  })
+
+  // ---- 项目插件兼容别名 ----
+  ipcMain.handle(IPC.PLUGIN_LIST, () => {
+    return getExtensionRuntimeService().listManifests()
+  })
+
+  ipcMain.handle(IPC.PLUGIN_PROFILE_STATUS, (_event, args?: { profileId?: string }) => {
+    return getExtensionRuntimeService().getProfileStatus(args?.profileId)
+  })
+
+  ipcMain.handle(IPC.PLUGIN_TASK_RUNS, (_event, args: { taskId: string }) => {
+    return getExtensionRuntimeService().listTaskRuns(args.taskId)
+  })
+
+  // ---- OSS 浏览器工具插件 ----
+  ipcMain.handle(IPC.OSS_BROWSER_LIST, async (_event, args: OSSListQuery) => {
+    return getOSSBrowserService().list(args?.prefix, args?.continuationToken, args?.maxKeys)
+  })
+
+  ipcMain.handle(IPC.OSS_BROWSER_HEAD, async (_event, args: { key: string }) => {
+    return getOSSBrowserService().head(args.key)
+  })
+
+  ipcMain.handle(IPC.OSS_BROWSER_GET_IMAGE, async (_event, args: { key: string; maxBytes?: number }) => {
+    return getOSSBrowserService().getImagePreview(args.key, args.maxBytes)
+  })
+
+  ipcMain.handle(IPC.OSS_BROWSER_OPEN_PREVIEW_WINDOW, (_event, args: { key: string }) => {
+    createOSSPreviewWindow(args.key)
+  })
 
   // ---- SSH 机器 CRUD ----
   ipcMain.handle(IPC.SSH_LIST_MACHINES, () => {

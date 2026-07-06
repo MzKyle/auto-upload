@@ -1,4 +1,4 @@
-import { useEffect, useCallback } from 'react'
+import { useEffect, useCallback, useRef } from 'react'
 import { IPC } from '@shared/ipc-channels'
 import type {
   TaskDestinationStatusEvent,
@@ -6,28 +6,56 @@ import type {
   TaskStatusEvent
 } from '@shared/types'
 import { useTaskStore } from '@/stores/task.store'
+import { progressKey } from '@shared/cloud-upload'
+
+const PROGRESS_FLUSH_MS = 150
+const TASK_REFRESH_DEBOUNCE_MS = 1000
 
 export function useTaskProgress(): void {
-  const setProgress = useTaskStore((s) => s.setProgress)
+  const setProgressBatch = useTaskStore((s) => s.setProgressBatch)
   const updateTaskStatus = useTaskStore((s) => s.updateTaskStatus)
   const loadTasks = useTaskStore((s) => s.loadTasks)
   const updateDestinationStatus = useTaskStore((s) => s.updateDestinationStatus)
+  const progressBufferRef = useRef<Map<string, TaskProgress>>(new Map())
+  const progressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const flushProgress = useCallback(() => {
+    progressTimerRef.current = null
+    const items = Array.from(progressBufferRef.current.values())
+    progressBufferRef.current.clear()
+    setProgressBatch(items)
+  }, [setProgressBatch])
+
+  const scheduleTaskRefresh = useCallback(() => {
+    if (refreshTimerRef.current) return
+    refreshTimerRef.current = setTimeout(() => {
+      refreshTimerRef.current = null
+      void loadTasks()
+    }, TASK_REFRESH_DEBOUNCE_MS)
+  }, [loadTasks])
 
   const handleProgress = useCallback(
     (_event: unknown, data: unknown) => {
-      setProgress(data as TaskProgress)
+      const progress = data as TaskProgress
+      progressBufferRef.current.set(
+        progressKey(progress.taskId, progress.provider),
+        progress
+      )
+      if (!progressTimerRef.current) {
+        progressTimerRef.current = setTimeout(flushProgress, PROGRESS_FLUSH_MS)
+      }
     },
-    [setProgress]
+    [flushProgress]
   )
 
   const handleStatusChange = useCallback(
     (_event: unknown, data: unknown) => {
       const ev = data as TaskStatusEvent
       updateTaskStatus(ev.taskId, ev.newStatus)
-      // 状态变更时重新加载完整列表
-      loadTasks()
+      scheduleTaskRefresh()
     },
-    [updateTaskStatus, loadTasks]
+    [updateTaskStatus, scheduleTaskRefresh]
   )
 
   useEffect(() => {
@@ -43,6 +71,17 @@ export function useTaskProgress(): void {
       offProgress()
       offStatus()
       offDestination()
+      if (progressTimerRef.current) {
+        clearTimeout(progressTimerRef.current)
+        progressTimerRef.current = null
+      }
+      if (refreshTimerRef.current) {
+        clearTimeout(refreshTimerRef.current)
+        refreshTimerRef.current = null
+      }
+      const items = Array.from(progressBufferRef.current.values())
+      progressBufferRef.current.clear()
+      setProgressBatch(items)
     }
-  }, [handleProgress, handleStatusChange, updateDestinationStatus])
+  }, [handleProgress, handleStatusChange, setProgressBatch, updateDestinationStatus])
 }
