@@ -1,6 +1,6 @@
 {
   "name": "electron-uploader",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "云桥上传器：工业采集数据多云归档工具",
   "author": {
     "name": "WeldingTeam",
