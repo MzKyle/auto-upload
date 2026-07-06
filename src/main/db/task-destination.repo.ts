@@ -263,23 +263,66 @@ export class TaskDestinationRepo {
   ): void {
     const db = getDb()
     const now = new Date().toISOString()
-    const clear = db.prepare(
+    db.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS tmp_planned_object_keys (
+        relative_path TEXT PRIMARY KEY,
+        object_key TEXT NOT NULL
+      )
+    `)
+    const insertPlannedKey = db.prepare(
+      `INSERT OR REPLACE INTO tmp_planned_object_keys (relative_path, object_key)
+       VALUES (?, ?)`
+    )
+    const clearStale = db.prepare(
       `UPDATE task_file_destinations
        SET planned_object_key = NULL, updated_at = ?
-       WHERE task_file_id IN (SELECT id FROM task_files WHERE task_id = ?)`
+       WHERE id IN (
+         SELECT tfd.id
+         FROM task_file_destinations tfd
+         INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+         LEFT JOIN tmp_planned_object_keys planned
+           ON planned.relative_path = tf.relative_path
+         WHERE tf.task_id = ?
+           AND tfd.planned_object_key IS NOT NULL
+           AND planned.relative_path IS NULL
+       )`
     )
-    const update = db.prepare(
+    const updateChanged = db.prepare(
       `UPDATE task_file_destinations
-       SET planned_object_key = ?, updated_at = ?
+       SET planned_object_key = (
+           SELECT planned.object_key
+           FROM task_files tf
+           INNER JOIN tmp_planned_object_keys planned
+             ON planned.relative_path = tf.relative_path
+           WHERE tf.id = task_file_destinations.task_file_id
+         ),
+         updated_at = ?
        WHERE task_file_id IN (
-         SELECT id FROM task_files WHERE task_id = ? AND relative_path = ?
+         SELECT tf.id
+         FROM task_files tf
+         INNER JOIN tmp_planned_object_keys planned
+           ON planned.relative_path = tf.relative_path
+         WHERE tf.task_id = ?
+       )
+       AND (
+         planned_object_key IS NULL
+         OR planned_object_key != (
+           SELECT planned.object_key
+           FROM task_files tf
+           INNER JOIN tmp_planned_object_keys planned
+             ON planned.relative_path = tf.relative_path
+           WHERE tf.id = task_file_destinations.task_file_id
+         )
        )`
     )
     const transaction = db.transaction(() => {
-      clear.run(now, taskId)
+      db.prepare('DELETE FROM tmp_planned_object_keys').run()
       for (const [relativePath, objectKey] of plannedKeysByRelativePath) {
-        update.run(objectKey, now, taskId, relativePath)
+        insertPlannedKey.run(relativePath, objectKey)
       }
+      clearStale.run(now, taskId)
+      updateChanged.run(now, taskId)
+      db.prepare('DELETE FROM tmp_planned_object_keys').run()
     })
     transaction()
   }

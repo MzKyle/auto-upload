@@ -9,6 +9,32 @@ import { TaskDestinationRepo } from '../src/main/db/task-destination.repo'
 import { TaskRepo } from '../src/main/db/task.repo'
 import { TaskRunnerService } from '../src/main/services/task-runner.service'
 
+function createDatabase(): Database.Database {
+  const db = new Database(':memory:')
+  db.pragma('foreign_keys = ON')
+  runMigrations(db)
+  setDbForTests(db)
+  return db
+}
+
+function closeDatabase(db: Database.Database): void {
+  setDbForTests(null)
+  db.close()
+}
+
+function insertDayFolder(
+  db: Database.Database,
+  id: string,
+  dateValue = '2026-06-30'
+): void {
+  const now = new Date().toISOString()
+  db.prepare(`
+    INSERT INTO day_folders (
+      id, folder_path, folder_name, date_value, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `).run(id, `/data/${id}`, id, dateValue, now, now)
+}
+
 test('logical progress persistence is throttled and force flushes latest values', () => {
   const originalUpdateProgress = TaskRepo.prototype.updateProgress
   const originalNow = Date.now
@@ -73,10 +99,7 @@ test('logical progress persistence is throttled and force flushes latest values'
 })
 
 test('unfinished task id listing avoids destination hydration', () => {
-  const db = new Database(':memory:')
-  db.pragma('foreign_keys = ON')
-  runMigrations(db)
-  setDbForTests(db)
+  const db = createDatabase()
 
   const originalListByTaskIds = TaskDestinationRepo.prototype.listByTaskIds
   let destinationBatchLoads = 0
@@ -134,7 +157,122 @@ test('unfinished task id listing avoids destination hydration', () => {
     assert.equal(destinationBatchLoads, 0)
   } finally {
     TaskDestinationRepo.prototype.listByTaskIds = originalListByTaskIds
-    setDbForTests(null)
-    db.close()
+    closeDatabase(db)
+  }
+})
+
+test('continuous monitor id listing avoids destination hydration', () => {
+  const db = createDatabase()
+  const repo = new TaskRepo()
+  const originalListByTaskIds = TaskDestinationRepo.prototype.listByTaskIds
+  let destinationBatchLoads = 0
+
+  try {
+    insertDayFolder(db, 'day-1')
+    insertDayFolder(db, 'day-2', '2026-07-01')
+    const pending = repo.create({
+      folderPath: '/data/day-1/work-pending',
+      folderName: 'work-pending',
+      dayFolderId: 'day-1',
+      uploadRelativePath: 'day-1/work-pending'
+    })
+    const skipped = repo.create({
+      folderPath: '/data/day-1/work-skipped',
+      folderName: 'work-skipped',
+      dayFolderId: 'day-1',
+      uploadRelativePath: 'day-1/work-skipped'
+    })
+    repo.skip(skipped.id)
+    repo.create({
+      folderPath: '/data/day-2/work-other',
+      folderName: 'work-other',
+      dayFolderId: 'day-2',
+      uploadRelativePath: 'day-2/work-other'
+    })
+
+    TaskDestinationRepo.prototype.listByTaskIds = function (taskIds: string[]) {
+      destinationBatchLoads++
+      return originalListByTaskIds.call(this, taskIds)
+    }
+
+    assert.deepEqual(repo.listContinuouslyMonitoredTaskIds('2026-06-30'), [
+      pending.id
+    ])
+    assert.equal(destinationBatchLoads, 0)
+  } finally {
+    TaskDestinationRepo.prototype.listByTaskIds = originalListByTaskIds
+    closeDatabase(db)
+  }
+})
+
+test('scanner-style reconcile does not rewrite planned object keys', () => {
+  const db = createDatabase()
+  const taskRepo = new TaskRepo()
+  const destinationRepo = new TaskDestinationRepo()
+  const originalReplace =
+    TaskDestinationRepo.prototype.replacePlannedObjectKeys
+  let replaceCalls = 0
+
+  try {
+    const task = taskRepo.create({
+      folderPath: '/tmp/source',
+      folderName: 'source',
+      uploadTargetMode: 'both',
+      destinationPrefixes: { aliyun: '', tencent: '' },
+      sourceType: 'manual'
+    })
+    const file = {
+      relativePath: 'sample/camera_0/10000000.jpg',
+      size: 10,
+      mtimeMs: 1000
+    }
+    const plannedObjectKey =
+      'station2/vla/1mm/2026-07-05/sample/camera_0/10000000.jpg'
+
+    taskRepo.reconcileFiles(
+      task.id,
+      [{ ...file, plannedObjectKey }],
+      1
+    )
+
+    assert.ok(
+      destinationRepo
+        .listReadyFileTargets(task.id, 1)
+        .every((target) => target.plannedObjectKey === plannedObjectKey)
+    )
+
+    TaskDestinationRepo.prototype.replacePlannedObjectKeys = function (
+      taskId,
+      plannedKeysByRelativePath
+    ) {
+      replaceCalls++
+      return originalReplace.call(this, taskId, plannedKeysByRelativePath)
+    }
+
+    taskRepo.reconcileFiles(task.id, [file], 1)
+
+    assert.equal(replaceCalls, 0)
+    assert.ok(
+      destinationRepo
+        .listReadyFileTargets(task.id, 1)
+        .every((target) => target.plannedObjectKey === plannedObjectKey)
+    )
+
+    taskRepo.reconcileFiles(
+      task.id,
+      [{ ...file, plannedObjectKey: undefined }],
+      1,
+      { replacePlannedObjectKeys: true }
+    )
+
+    assert.equal(replaceCalls, 1)
+    assert.ok(
+      destinationRepo
+        .listReadyFileTargets(task.id, 1)
+        .every((target) => target.plannedObjectKey === null)
+    )
+  } finally {
+    TaskDestinationRepo.prototype.replacePlannedObjectKeys = originalReplace
+    closeDatabase(db)
   }
 })

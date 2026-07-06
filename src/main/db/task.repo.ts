@@ -103,6 +103,10 @@ export interface TaskFileSummary {
   skippedFiles: number
 }
 
+interface ReconcileFilesOptions {
+  replacePlannedObjectKeys?: boolean
+}
+
 export class TaskRepo {
   private rowsToTasks(rows: Record<string, unknown>[]): Task[] {
     const destinationsByTask = getTaskDestinationRepo().listByTaskIds(
@@ -157,7 +161,26 @@ export class TaskRepo {
     return this.rowsToTasks(rows)
   }
 
-  listRunnable(now = new Date().toISOString()): Task[] {
+  listContinuouslyMonitoredTaskIds(dateName: string): string[] {
+    const rows = getDb().prepare(
+      `SELECT t.id
+       FROM tasks t
+       INNER JOIN day_folders df ON df.id = t.day_folder_id
+       WHERE t.source_type = 'local'
+         AND t.day_folder_id IS NOT NULL
+         AND df.date_value = ?
+         AND t.status NOT IN ('skipped', 'paused', 'completed')
+       ORDER BY t.created_at ASC`
+    ).all(dateName) as Array<{ id: string }>
+    return rows.map((row) => row.id)
+  }
+
+  listRunnable(now = new Date().toISOString(), limit?: number): Task[] {
+    const params: unknown[] = [now]
+    const boundedLimit =
+      typeof limit === 'number' && limit > 0 ? Math.floor(limit) : null
+    const limitClause = boundedLimit ? 'LIMIT ?' : ''
+    if (boundedLimit) params.push(boundedLimit)
     const rows = getDb().prepare(
       `SELECT DISTINCT t.*
        FROM tasks t
@@ -168,8 +191,9 @@ export class TaskRepo {
          AND tf.stable_count >= CASE WHEN t.source_type = 'local' THEN 2 ELSE 1 END
          AND (tf.next_retry_at IS NULL OR tf.next_retry_at <= ?)
          AND tfd.status = 'pending'
-       ORDER BY t.created_at ASC`
-    ).all(now) as Record<string, unknown>[]
+       ORDER BY t.created_at ASC
+       ${limitClause}`
+    ).all(...params) as Record<string, unknown>[]
     return this.rowsToTasks(rows)
   }
 
@@ -538,7 +562,8 @@ export class TaskRepo {
   reconcileFiles(
     taskId: string,
     files: Array<{ relativePath: string; size: number; mtimeMs: number; plannedObjectKey?: string }>,
-    requiredStableChecks: number
+    requiredStableChecks: number,
+    options: ReconcileFilesOptions = {}
   ): {
     changed: boolean
     readyFiles: number
@@ -567,6 +592,11 @@ export class TaskRepo {
     )
     const seen = new Set<string>()
     const plannedKeys = new Map<string, string>()
+    const shouldReplacePlannedObjectKeys =
+      options.replacePlannedObjectKeys ??
+      files.some((file) =>
+        Object.prototype.hasOwnProperty.call(file, 'plannedObjectKey')
+      )
     let changed = false
 
     const insert = db.prepare(
@@ -658,8 +688,11 @@ export class TaskRepo {
       }
     })
     transaction()
-    getTaskDestinationRepo().ensureForTaskFiles(taskId)
-    getTaskDestinationRepo().replacePlannedObjectKeys(taskId, plannedKeys)
+    const destinationRepo = getTaskDestinationRepo()
+    destinationRepo.ensureForTaskFiles(taskId)
+    if (shouldReplacePlannedObjectKeys) {
+      destinationRepo.replacePlannedObjectKeys(taskId, plannedKeys)
+    }
 
     const counts = db.prepare(
       `SELECT
@@ -707,8 +740,7 @@ export class TaskRepo {
       now,
       taskId
     )
-    for (const destination of getTaskDestinationRepo().listByTask(taskId)) {
-      const destinationRepo = getTaskDestinationRepo()
+    for (const destination of destinationRepo.listByTask(taskId)) {
       destinationRepo.recalculateProgress(taskId, destination.provider)
       const summary = destinationRepo.summarizeFileTargets(
         taskId,

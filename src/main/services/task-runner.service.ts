@@ -248,7 +248,8 @@ export class TaskRunnerService {
     getTaskRepo().reconcileFiles(
       task.id,
       files,
-      stableChecks
+      stableChecks,
+      { replacePlannedObjectKeys: true }
     )
   }
 

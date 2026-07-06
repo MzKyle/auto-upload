@@ -466,14 +466,14 @@ export class ScannerService {
 
   private checkStability(): void {
     const today = this.formatLocalDate(new Date())
-    const tasks = getTaskRepo().listContinuouslyMonitored(today)
-    if (tasks.length > 0) {
-      const batchSize = Math.min(RECONCILE_BATCH_SIZE, tasks.length)
+    const taskIds = getTaskRepo().listContinuouslyMonitoredTaskIds(today)
+    if (taskIds.length > 0) {
+      const batchSize = Math.min(RECONCILE_BATCH_SIZE, taskIds.length)
       for (let i = 0; i < batchSize; i++) {
-        const task = tasks[(this.stabilityCursor + i) % tasks.length]
-        if (task) this.queueReconcileTask(task)
+        const taskId = taskIds[(this.stabilityCursor + i) % taskIds.length]
+        if (taskId) this.queueReconcileTask(taskId)
       }
-      this.stabilityCursor = (this.stabilityCursor + batchSize) % tasks.length
+      this.stabilityCursor = (this.stabilityCursor + batchSize) % taskIds.length
     }
     this.broadcastStatus()
   }

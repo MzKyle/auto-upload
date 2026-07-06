@@ -157,7 +157,9 @@ export class TaskQueueService extends EventEmitter {
     const availableSlots = maxConcurrent - this.runningTasks.size
     if (availableSlots <= 0) return
 
-    const pendingTasks = taskRepo.listRunnable()
+    const pendingTasks = this.priorityActive
+      ? taskRepo.listRunnable()
+      : taskRepo.listRunnable(undefined, 1)
     const prioritizedTasks = this.priorityActive
       ? pendingTasks.filter((task) => this.priorityTaskIds.has(task.id))
       : pendingTasks
