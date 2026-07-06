@@ -4,12 +4,17 @@
  */
 export class UploadSemaphore {
   private current = 0
-  private waiting: Array<{ resolve: () => void; id: symbol }> = []
+  private waiting: Array<{ resolve: () => void; id: symbol; weight: number }> = []
 
-  constructor(private max: number) { }
+  constructor(private max: number) {
+    this.max = this.normalizeMax(max)
+  }
 
   setMax(max: number): void {
-    this.max = max
+    this.max = this.normalizeMax(max)
+    for (const entry of this.waiting) {
+      entry.weight = Math.min(entry.weight, this.max)
+    }
     // 如果新上限更高，唤醒等待者
     this.drain()
   }
@@ -22,13 +27,17 @@ export class UploadSemaphore {
     return this.current
   }
 
-  async acquire(signal?: AbortSignal): Promise<void> {
+  async acquire(signal?: AbortSignal, weight = 1): Promise<void> {
     if (signal?.aborted) {
       throw new DOMException('Semaphore acquire aborted', 'AbortError')
     }
+    const effectiveWeight = this.normalizeAcquireWeight(weight)
 
-    if (this.current < this.max) {
-      this.current++
+    if (
+      this.waiting.length === 0 &&
+      this.current + effectiveWeight <= this.max
+    ) {
+      this.current += effectiveWeight
       return
     }
 
@@ -37,11 +46,12 @@ export class UploadSemaphore {
 
       const entry = {
         resolve: () => {
-          this.current++
+          this.current += entry.weight
           cleanup()
           resolve()
         },
-        id
+        id,
+        weight: effectiveWeight
       }
 
       const onAbort = (): void => {
@@ -58,19 +68,35 @@ export class UploadSemaphore {
 
       signal?.addEventListener('abort', onAbort, { once: true })
       this.waiting.push(entry)
+      this.drain()
     })
   }
 
-  release(): void {
-    this.current--
+  release(weight = 1): void {
+    this.current = Math.max(0, this.current - this.normalizeReleaseWeight(weight))
     this.drain()
   }
 
   private drain(): void {
-    while (this.waiting.length > 0 && this.current < this.max) {
-      const next = this.waiting.shift()!
+    while (this.waiting.length > 0) {
+      const next = this.waiting[0]
+      next.weight = Math.min(next.weight, this.max)
+      if (this.current + next.weight > this.max) return
+      this.waiting.shift()
       next.resolve()
     }
+  }
+
+  private normalizeMax(max: number): number {
+    return Math.max(1, Math.floor(max || 1))
+  }
+
+  private normalizeAcquireWeight(weight: number): number {
+    return Math.max(1, Math.min(this.normalizeReleaseWeight(weight), this.max))
+  }
+
+  private normalizeReleaseWeight(weight: number): number {
+    return Math.max(1, Math.floor(weight || 1))
   }
 }
 
@@ -78,7 +104,7 @@ let instance: UploadSemaphore | null = null
 
 export function getUploadSemaphore(max?: number): UploadSemaphore {
   if (!instance) {
-    instance = new UploadSemaphore(max ?? 30)
+    instance = new UploadSemaphore(max ?? 12)
   } else if (max !== undefined) {
     instance.setMax(max)
   }

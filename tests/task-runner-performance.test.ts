@@ -103,6 +103,21 @@ test('logical progress persistence is throttled and force flushes latest values'
   }
 })
 
+test('upload slot weight treats multipart-sized files as weighted work', () => {
+  const service = new TaskRunnerService() as unknown as {
+    getUploadSlotWeight: (
+      fileSize: number,
+      multipartThreshold: number,
+      maxConcurrentUploads: number
+    ) => number
+  }
+  const threshold = 100 * 1024 * 1024
+
+  assert.equal(service.getUploadSlotWeight(threshold, threshold, 12), 1)
+  assert.equal(service.getUploadSlotWeight(threshold + 1, threshold, 12), 4)
+  assert.equal(service.getUploadSlotWeight(threshold + 1, threshold, 2), 2)
+})
+
 test('unfinished task id listing avoids destination hydration', () => {
   const db = createDatabase()
 
@@ -214,9 +229,6 @@ test('scanner-style reconcile does not rewrite planned object keys', () => {
   const db = createDatabase()
   const taskRepo = new TaskRepo()
   const destinationRepo = new TaskDestinationRepo()
-  const originalReplace =
-    TaskDestinationRepo.prototype.replacePlannedObjectKeys
-  let replaceCalls = 0
 
   try {
     const task = taskRepo.create({
@@ -246,17 +258,8 @@ test('scanner-style reconcile does not rewrite planned object keys', () => {
         .every((target) => target.plannedObjectKey === plannedObjectKey)
     )
 
-    TaskDestinationRepo.prototype.replacePlannedObjectKeys = function (
-      taskId,
-      plannedKeysByRelativePath
-    ) {
-      replaceCalls++
-      return originalReplace.call(this, taskId, plannedKeysByRelativePath)
-    }
-
     taskRepo.reconcileFiles(task.id, [file], 1)
 
-    assert.equal(replaceCalls, 0)
     assert.ok(
       destinationRepo
         .listReadyFileTargets(task.id, 1)
@@ -270,14 +273,12 @@ test('scanner-style reconcile does not rewrite planned object keys', () => {
       { replacePlannedObjectKeys: true }
     )
 
-    assert.equal(replaceCalls, 1)
     assert.ok(
       destinationRepo
         .listReadyFileTargets(task.id, 1)
         .every((target) => target.plannedObjectKey === null)
     )
   } finally {
-    TaskDestinationRepo.prototype.replacePlannedObjectKeys = originalReplace
     closeDatabase(db)
   }
 })

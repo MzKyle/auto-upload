@@ -15,7 +15,7 @@
 | 稳定性 | `checkCount` | `2` | 连续稳定次数 |
 | 上传 | `maxConcurrentTasks` | `4` | 最大并发任务 |
 | 上传 | `maxFilesPerTask` | `12` | 单任务文件并发 |
-| 上传 | `maxConcurrentUploads` | `24` | 全局上传文件并发 |
+| 上传 | `maxConcurrentUploads` | `12` | 全局上传文件并发 |
 | 上传 | `multipartThreshold` | `100 MB` | 分片上传阈值 |
 | 上传 | `startAfterTime` | `20:30` | 默认开始时间 |
 | 上传 | `endBeforeTime` | `23:59` | 默认结束时间 |

@@ -692,18 +692,16 @@ export class ScannerService {
 
     try {
       const settings = getSettingsRepo().getAll()
-      const files = await new FileFilterService(task.profileSnapshot?.filter || settings.filter).scanFolderAsync(task.folderPath)
+      const fileFilter = new FileFilterService(
+        task.profileSnapshot?.filter || settings.filter
+      )
       const stableChecks =
         task.sourceType === 'local' && task.dayFolderId
           ? Math.max(2, settings.stability.checkCount || 2)
           : 1
-      getTaskRepo().reconcileFiles(
+      await getTaskRepo().reconcileFileBatches(
         task.id,
-        files.map((file) => ({
-          relativePath: file.relativePath,
-          size: file.size,
-          mtimeMs: file.mtimeMs
-        })),
+        fileFilter.scanFolderBatches(task.folderPath),
         stableChecks
       )
       const updated = getTaskRepo().getById(task.id)

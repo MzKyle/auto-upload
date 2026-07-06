@@ -24,7 +24,7 @@ export const DEFAULT_SETTINGS = {
   upload: {
     maxConcurrentTasks: 4,
     maxFilesPerTask: 12,
-    maxConcurrentUploads: 24,
+    maxConcurrentUploads: 12,
     multipartThreshold: 100 * 1024 * 1024, // 100MB
     startAfterTime: '20:30',
     endBeforeTime: '23:59'

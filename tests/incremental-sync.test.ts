@@ -32,6 +32,31 @@ function insertDayFolder(db: Database.Database, id: string): void {
   )
 }
 
+function chunk<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = []
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size))
+  }
+  return chunks
+}
+
+function listComparableTaskFiles(
+  db: Database.Database,
+  taskId: string
+): Array<Record<string, unknown>> {
+  return db.prepare(
+    `SELECT relative_path AS relativePath,
+       file_size AS fileSize,
+       mtime_ms AS mtimeMs,
+       status,
+       source_status AS sourceStatus,
+       stable_count AS stableCount
+     FROM task_files
+     WHERE task_id = ?
+     ORDER BY relative_path`
+  ).all(taskId) as Array<Record<string, unknown>>
+}
+
 test('incremental discovery waits for stability and requeues changed files', () => {
   const db = createDatabase()
   const repo = new TaskRepo()
@@ -86,6 +111,55 @@ test('incremental discovery waits for stability and requeues changed files', () 
   db.close()
 })
 
+test('batched reconcile matches array reconcile for changed and missing files', async () => {
+  const db = createDatabase()
+  const repo = new TaskRepo()
+  insertDayFolder(db, 'day-batched-equivalence')
+  const arrayTask = repo.create({
+    folderPath: '/data/2026-06-18/work-array',
+    folderName: 'work-array',
+    dayFolderId: 'day-batched-equivalence',
+    uploadRelativePath: '2026-06-18/work-array'
+  })
+  const batchedTask = repo.create({
+    folderPath: '/data/2026-06-18/work-batched',
+    folderName: 'work-batched',
+    dayFolderId: 'day-batched-equivalence',
+    uploadRelativePath: '2026-06-18/work-batched'
+  })
+  const initialFiles = [
+    { relativePath: 'camera/1.jpg', size: 10, mtimeMs: 100 },
+    { relativePath: 'camera/2.jpg', size: 20, mtimeMs: 100 },
+    { relativePath: 'camera/3.jpg', size: 30, mtimeMs: 100 }
+  ]
+  const nextFiles = [
+    { relativePath: 'camera/1.jpg', size: 10, mtimeMs: 100 },
+    { relativePath: 'camera/2.jpg', size: 22, mtimeMs: 200 },
+    { relativePath: 'camera/4.jpg', size: 40, mtimeMs: 100 }
+  ]
+
+  repo.reconcileFiles(arrayTask.id, initialFiles, 2)
+  repo.reconcileFiles(arrayTask.id, initialFiles, 2)
+  await repo.reconcileFileBatches(batchedTask.id, chunk(initialFiles, 2), 2)
+  await repo.reconcileFileBatches(batchedTask.id, chunk(initialFiles, 2), 2)
+
+  const arrayResult = repo.reconcileFiles(arrayTask.id, nextFiles, 2)
+  const batchedResult = await repo.reconcileFileBatches(
+    batchedTask.id,
+    chunk(nextFiles, 2),
+    2
+  )
+
+  assert.deepEqual(batchedResult, arrayResult)
+  assert.deepEqual(
+    listComparableTaskFiles(db, batchedTask.id),
+    listComparableTaskFiles(db, arrayTask.id)
+  )
+
+  setDbForTests(null)
+  db.close()
+})
+
 test('reconciling 10000 small files remains idempotent', () => {
   const db = createDatabase()
   const repo = new TaskRepo()
@@ -104,6 +178,41 @@ test('reconciling 10000 small files remains idempotent', () => {
 
   repo.reconcileFiles(task.id, files, 2)
   repo.reconcileFiles(task.id, files, 2)
+
+  const fileCount = db.prepare(
+    'SELECT COUNT(*) AS count FROM task_files WHERE task_id = ?'
+  ).get(task.id) as { count: number }
+  const targetCount = db.prepare(
+    `SELECT COUNT(*) AS count
+     FROM task_file_destinations
+     WHERE task_file_id IN (SELECT id FROM task_files WHERE task_id = ?)`
+  ).get(task.id) as { count: number }
+  assert.equal(fileCount.count, 10_000)
+  assert.equal(targetCount.count, 10_000)
+  assert.equal(repo.getById(task.id)?.status, 'pending')
+
+  setDbForTests(null)
+  db.close()
+})
+
+test('batched reconcile handles 10000 small files idempotently', async () => {
+  const db = createDatabase()
+  const repo = new TaskRepo()
+  insertDayFolder(db, 'day-batched-10000')
+  const task = repo.create({
+    folderPath: '/data/2026-06-18/work-batched-10000',
+    folderName: 'work-batched-10000',
+    dayFolderId: 'day-batched-10000',
+    uploadRelativePath: '2026-06-18/work-batched-10000'
+  })
+  const files = Array.from({ length: 10_000 }, (_, index) => ({
+    relativePath: `camera/${String(index).padStart(5, '0')}.jpg`,
+    size: 1024,
+    mtimeMs: 100
+  }))
+
+  await repo.reconcileFileBatches(task.id, chunk(files, 500), 2)
+  await repo.reconcileFileBatches(task.id, chunk(files, 500), 2)
 
   const fileCount = db.prepare(
     'SELECT COUNT(*) AS count FROM task_files WHERE task_id = ?'

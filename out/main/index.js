@@ -1083,23 +1083,66 @@ class TaskDestinationRepo {
   replacePlannedObjectKeys(taskId, plannedKeysByRelativePath) {
     const db2 = getDb();
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    const clear = db2.prepare(
+    db2.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS tmp_planned_object_keys (
+        relative_path TEXT PRIMARY KEY,
+        object_key TEXT NOT NULL
+      )
+    `);
+    const insertPlannedKey = db2.prepare(
+      `INSERT OR REPLACE INTO tmp_planned_object_keys (relative_path, object_key)
+       VALUES (?, ?)`
+    );
+    const clearStale = db2.prepare(
       `UPDATE task_file_destinations
        SET planned_object_key = NULL, updated_at = ?
-       WHERE task_file_id IN (SELECT id FROM task_files WHERE task_id = ?)`
+       WHERE id IN (
+         SELECT tfd.id
+         FROM task_file_destinations tfd
+         INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+         LEFT JOIN tmp_planned_object_keys planned
+           ON planned.relative_path = tf.relative_path
+         WHERE tf.task_id = ?
+           AND tfd.planned_object_key IS NOT NULL
+           AND planned.relative_path IS NULL
+       )`
     );
-    const update = db2.prepare(
+    const updateChanged = db2.prepare(
       `UPDATE task_file_destinations
-       SET planned_object_key = ?, updated_at = ?
+       SET planned_object_key = (
+           SELECT planned.object_key
+           FROM task_files tf
+           INNER JOIN tmp_planned_object_keys planned
+             ON planned.relative_path = tf.relative_path
+           WHERE tf.id = task_file_destinations.task_file_id
+         ),
+         updated_at = ?
        WHERE task_file_id IN (
-         SELECT id FROM task_files WHERE task_id = ? AND relative_path = ?
+         SELECT tf.id
+         FROM task_files tf
+         INNER JOIN tmp_planned_object_keys planned
+           ON planned.relative_path = tf.relative_path
+         WHERE tf.task_id = ?
+       )
+       AND (
+         planned_object_key IS NULL
+         OR planned_object_key != (
+           SELECT planned.object_key
+           FROM task_files tf
+           INNER JOIN tmp_planned_object_keys planned
+             ON planned.relative_path = tf.relative_path
+           WHERE tf.id = task_file_destinations.task_file_id
+         )
        )`
     );
     const transaction = db2.transaction(() => {
-      clear.run(now, taskId);
+      db2.prepare("DELETE FROM tmp_planned_object_keys").run();
       for (const [relativePath, objectKey] of plannedKeysByRelativePath) {
-        update.run(objectKey, now, taskId, relativePath);
+        insertPlannedKey.run(relativePath, objectKey);
       }
+      clearStale.run(now, taskId);
+      updateChanged.run(now, taskId);
+      db2.prepare("DELETE FROM tmp_planned_object_keys").run();
     });
     transaction();
   }
@@ -1387,7 +1430,24 @@ class TaskRepo {
     ).all(dateName);
     return this.rowsToTasks(rows);
   }
-  listRunnable(now = (/* @__PURE__ */ new Date()).toISOString()) {
+  listContinuouslyMonitoredTaskIds(dateName) {
+    const rows = getDb().prepare(
+      `SELECT t.id
+       FROM tasks t
+       INNER JOIN day_folders df ON df.id = t.day_folder_id
+       WHERE t.source_type = 'local'
+         AND t.day_folder_id IS NOT NULL
+         AND df.date_value = ?
+         AND t.status NOT IN ('skipped', 'paused', 'completed')
+       ORDER BY t.created_at ASC`
+    ).all(dateName);
+    return rows.map((row) => row.id);
+  }
+  listRunnable(now = (/* @__PURE__ */ new Date()).toISOString(), limit) {
+    const params = [now];
+    const boundedLimit = typeof limit === "number" && limit > 0 ? Math.floor(limit) : null;
+    const limitClause = boundedLimit ? "LIMIT ?" : "";
+    if (boundedLimit) params.push(boundedLimit);
     const rows = getDb().prepare(
       `SELECT DISTINCT t.*
        FROM tasks t
@@ -1398,8 +1458,9 @@ class TaskRepo {
          AND tf.stable_count >= CASE WHEN t.source_type = 'local' THEN 2 ELSE 1 END
          AND (tf.next_retry_at IS NULL OR tf.next_retry_at <= ?)
          AND tfd.status = 'pending'
-       ORDER BY t.created_at ASC`
-    ).all(now);
+       ORDER BY t.created_at ASC
+       ${limitClause}`
+    ).all(...params);
     return this.rowsToTasks(rows);
   }
   getById(id) {
@@ -1705,113 +1766,231 @@ class TaskRepo {
       destinations: (destinationsByFile.get(file.id) || []).map(({ taskId: _taskId, relativePath: _path, fileSize: _size, ...destination }) => destination)
     }));
   }
-  reconcileFiles(taskId, files, requiredStableChecks) {
+  reconcileFiles(taskId, files, requiredStableChecks, options = {}) {
     const db2 = getDb();
     const task = this.getById(taskId);
     if (!task || task.status === "skipped" || task.status === "paused") {
-      return {
-        changed: false,
-        readyFiles: 0,
-        unstableFiles: 0,
-        failedFiles: 0,
-        skippedFiles: 0
-      };
+      return this.emptyReconcileResult();
     }
     const now = (/* @__PURE__ */ new Date()).toISOString();
-    const existingRows = db2.prepare(
-      "SELECT * FROM task_files WHERE task_id = ?"
-    ).all(taskId);
-    const existing = new Map(
-      existingRows.map((row) => [row.relative_path, rowToTaskFile(row)])
-    );
-    const seen = /* @__PURE__ */ new Set();
-    const plannedKeys = /* @__PURE__ */ new Map();
+    const tempTable = this.createReconcileTempTable();
+    const quotedTempTable = this.quoteIdentifier(tempTable);
+    let hasPlannedObjectKeys = false;
     let changed = false;
-    const insert = db2.prepare(
-      `INSERT INTO task_files (
-        id, task_id, relative_path, file_size, status, mtime_ms,
-        last_seen_at, source_status, stable_count, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'pending', ?, ?, 'present', 1, ?, ?)`
-    );
-    const updateChanged = db2.prepare(
-      `UPDATE task_files
-       SET file_size = ?, mtime_ms = ?, last_seen_at = ?, source_status = 'present',
-           stable_count = 1, status = 'pending', error_message = NULL,
-           retry_count = 0, next_retry_at = NULL, updated_at = ?
-       WHERE id = ?`
-    );
-    const updateStable = db2.prepare(
-      `UPDATE task_files
-       SET last_seen_at = ?, source_status = 'present',
-           stable_count = MIN(stable_count + 1, ?), updated_at = ?
-       WHERE id = ?`
-    );
-    const resetTargets = db2.prepare(
-      `UPDATE task_file_destinations
-       SET status = 'pending', object_key = NULL, upload_id = NULL,
-           error_message = NULL, updated_at = ?
-       WHERE task_file_id = ? AND status != 'uploading'`
-    );
-    const markFileMissing = db2.prepare(
-      `UPDATE task_files
-       SET source_status = 'missing',
-           status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
-           error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源文件已删除' END,
-           next_retry_at = NULL, updated_at = ?
-       WHERE id = ?`
-    );
-    const markTargetsMissing = db2.prepare(
-      `UPDATE task_file_destinations
-       SET status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
-           error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源文件已删除' END,
-           updated_at = ?
-       WHERE task_file_id = ? AND status != 'uploading'`
-    );
-    const transaction = db2.transaction(() => {
-      for (const file of files) {
-        seen.add(file.relativePath);
-        if (file.plannedObjectKey) {
-          plannedKeys.set(file.relativePath, file.plannedObjectKey);
-        }
-        const current = existing.get(file.relativePath);
-        if (!current) {
-          insert.run(
-            uuid.v4(),
-            taskId,
-            file.relativePath,
-            file.size,
-            file.mtimeMs,
-            now,
-            now,
-            now
-          );
-          changed = true;
-          continue;
-        }
-        const fileChanged = current.fileSize !== file.size || current.mtimeMs !== file.mtimeMs || current.sourceStatus === "missing";
-        if (fileChanged) {
-          updateChanged.run(file.size, file.mtimeMs, now, now, current.id);
-          resetTargets.run(now, current.id);
-          changed = true;
-        } else if (current.stableCount < Math.max(1, requiredStableChecks)) {
-          updateStable.run(
-            now,
-            Math.max(1, requiredStableChecks),
-            now,
-            current.id
-          );
-        }
+    try {
+      this.insertReconcileBatch(quotedTempTable, files, (hasPlannedObjectKey) => {
+        hasPlannedObjectKeys = hasPlannedObjectKeys || hasPlannedObjectKey;
+      });
+      changed = this.applyReconcileTempChanges(
+        taskId,
+        quotedTempTable,
+        now,
+        Math.max(1, requiredStableChecks)
+      );
+    } catch (error) {
+      db2.prepare(`DROP TABLE IF EXISTS ${quotedTempTable}`).run();
+      throw error;
+    }
+    try {
+      return this.completeReconcileFromTempTable(
+        task,
+        quotedTempTable,
+        now,
+        Math.max(1, requiredStableChecks),
+        changed,
+        options.replacePlannedObjectKeys ?? hasPlannedObjectKeys
+      );
+    } finally {
+      db2.prepare(`DROP TABLE IF EXISTS ${quotedTempTable}`).run();
+    }
+  }
+  async reconcileFileBatches(taskId, fileBatches, requiredStableChecks, options = {}) {
+    const db2 = getDb();
+    const task = this.getById(taskId);
+    if (!task || task.status === "skipped" || task.status === "paused") {
+      return this.emptyReconcileResult();
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const tempTable = this.createReconcileTempTable();
+    const quotedTempTable = this.quoteIdentifier(tempTable);
+    let hasPlannedObjectKeys = false;
+    let changed = false;
+    try {
+      for await (const batch of fileBatches) {
+        this.insertReconcileBatch(quotedTempTable, batch, (hasPlannedObjectKey) => {
+          hasPlannedObjectKeys = hasPlannedObjectKeys || hasPlannedObjectKey;
+        });
       }
-      for (const current of existing.values()) {
-        if (seen.has(current.relativePath) || current.sourceStatus === "missing") continue;
-        markFileMissing.run(now, current.id);
-        markTargetsMissing.run(now, current.id);
-        changed = true;
+      changed = this.applyReconcileTempChanges(
+        taskId,
+        quotedTempTable,
+        now,
+        Math.max(1, requiredStableChecks)
+      );
+      return this.completeReconcileFromTempTable(
+        task,
+        quotedTempTable,
+        now,
+        Math.max(1, requiredStableChecks),
+        changed,
+        options.replacePlannedObjectKeys ?? hasPlannedObjectKeys
+      );
+    } finally {
+      db2.prepare(`DROP TABLE IF EXISTS ${quotedTempTable}`).run();
+    }
+  }
+  insertReconcileBatch(quotedTempTable, files, onPlannedObjectKeyPresence) {
+    const insert = getDb().prepare(
+      `INSERT OR REPLACE INTO ${quotedTempTable} (
+        relative_path, file_size, mtime_ms, planned_object_key
+      ) VALUES (?, ?, ?, ?)`
+    );
+    let hasPlannedObjectKey = false;
+    const transaction = getDb().transaction(() => {
+      for (const file of files) {
+        if (Object.prototype.hasOwnProperty.call(file, "plannedObjectKey")) {
+          hasPlannedObjectKey = true;
+        }
+        insert.run(
+          file.relativePath,
+          file.size,
+          file.mtimeMs,
+          file.plannedObjectKey || null
+        );
       }
     });
     transaction();
-    getTaskDestinationRepo().ensureForTaskFiles(taskId);
-    getTaskDestinationRepo().replacePlannedObjectKeys(taskId, plannedKeys);
+    onPlannedObjectKeyPresence(hasPlannedObjectKey);
+  }
+  applyReconcileTempChanges(taskId, quotedTempTable, now, requiredStableChecks) {
+    const db2 = getDb();
+    let changed = false;
+    const transaction = db2.transaction(() => {
+      db2.prepare(
+        `UPDATE task_file_destinations
+         SET status = 'pending', object_key = NULL, upload_id = NULL,
+             error_message = NULL, updated_at = ?
+         WHERE status != 'uploading'
+           AND task_file_id IN (
+             SELECT tf.id
+             FROM task_files tf
+             INNER JOIN ${quotedTempTable} scanned
+               ON scanned.relative_path = tf.relative_path
+             WHERE tf.task_id = ?
+               AND (
+                 tf.file_size != scanned.file_size
+                 OR tf.mtime_ms != scanned.mtime_ms
+                 OR tf.source_status = 'missing'
+               )
+           )`
+      ).run(now, taskId);
+      db2.prepare(
+        `UPDATE task_files
+         SET last_seen_at = ?,
+             source_status = 'present',
+             stable_count = MIN(stable_count + 1, ?),
+             updated_at = ?
+         WHERE task_id = ?
+           AND source_status = 'present'
+           AND stable_count < ?
+           AND EXISTS (
+             SELECT 1
+             FROM ${quotedTempTable} scanned
+             WHERE scanned.relative_path = task_files.relative_path
+               AND task_files.file_size = scanned.file_size
+               AND task_files.mtime_ms = scanned.mtime_ms
+           )`
+      ).run(now, requiredStableChecks, now, taskId, requiredStableChecks);
+      const changedRows = db2.prepare(
+        `UPDATE task_files
+         SET file_size = (
+             SELECT scanned.file_size
+             FROM ${quotedTempTable} scanned
+             WHERE scanned.relative_path = task_files.relative_path
+           ),
+           mtime_ms = (
+             SELECT scanned.mtime_ms
+             FROM ${quotedTempTable} scanned
+             WHERE scanned.relative_path = task_files.relative_path
+           ),
+           last_seen_at = ?,
+           source_status = 'present',
+           stable_count = 1,
+           status = 'pending',
+           error_message = NULL,
+           retry_count = 0,
+           next_retry_at = NULL,
+           updated_at = ?
+         WHERE task_id = ?
+           AND EXISTS (
+             SELECT 1
+             FROM ${quotedTempTable} scanned
+             WHERE scanned.relative_path = task_files.relative_path
+               AND (
+                 task_files.file_size != scanned.file_size
+                 OR task_files.mtime_ms != scanned.mtime_ms
+                 OR task_files.source_status = 'missing'
+               )
+           )`
+      ).run(now, now, taskId).changes;
+      const insertedRows = db2.prepare(
+        `INSERT INTO task_files (
+          id, task_id, relative_path, file_size, status, mtime_ms,
+          last_seen_at, source_status, stable_count, created_at, updated_at
+        )
+        SELECT lower(hex(randomblob(16))), ?, scanned.relative_path,
+          scanned.file_size, 'pending', scanned.mtime_ms, ?, 'present',
+          1, ?, ?
+        FROM ${quotedTempTable} scanned
+        LEFT JOIN task_files existing
+          ON existing.task_id = ?
+         AND existing.relative_path = scanned.relative_path
+        WHERE existing.id IS NULL`
+      ).run(taskId, now, now, now, taskId).changes;
+      db2.prepare(
+        `UPDATE task_file_destinations
+         SET status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
+             error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源文件已删除' END,
+             updated_at = ?
+         WHERE status != 'uploading'
+           AND task_file_id IN (
+             SELECT tf.id
+             FROM task_files tf
+             LEFT JOIN ${quotedTempTable} scanned
+               ON scanned.relative_path = tf.relative_path
+             WHERE tf.task_id = ?
+               AND tf.source_status != 'missing'
+               AND scanned.relative_path IS NULL
+           )`
+      ).run(now, taskId);
+      const missingRows = db2.prepare(
+        `UPDATE task_files
+         SET source_status = 'missing',
+             status = CASE WHEN status = 'completed' THEN status ELSE 'skipped' END,
+             error_message = CASE WHEN status = 'completed' THEN error_message ELSE '源文件已删除' END,
+             next_retry_at = NULL,
+             updated_at = ?
+         WHERE task_id = ?
+           AND source_status != 'missing'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM ${quotedTempTable} scanned
+             WHERE scanned.relative_path = task_files.relative_path
+           )`
+      ).run(now, taskId).changes;
+      changed = changedRows > 0 || insertedRows > 0 || missingRows > 0;
+    });
+    transaction();
+    return changed;
+  }
+  completeReconcileFromTempTable(task, quotedTempTable, now, requiredStableChecks, changed, shouldReplacePlannedObjectKeys) {
+    const db2 = getDb();
+    const taskId = task.id;
+    const destinationRepo = getTaskDestinationRepo();
+    destinationRepo.ensureForTaskFiles(taskId);
+    if (shouldReplacePlannedObjectKeys) {
+      this.replacePlannedObjectKeysFromTempTable(taskId, quotedTempTable, now);
+    }
     const counts = db2.prepare(
       `SELECT
          COUNT(*) AS total_files,
@@ -1857,8 +2036,7 @@ class TaskRepo {
       now,
       taskId
     );
-    for (const destination of getTaskDestinationRepo().listByTask(taskId)) {
-      const destinationRepo = getTaskDestinationRepo();
+    for (const destination of destinationRepo.listByTask(taskId)) {
       destinationRepo.recalculateProgress(taskId, destination.provider);
       const summary = destinationRepo.summarizeFileTargets(
         taskId,
@@ -1910,6 +2088,85 @@ class TaskRepo {
       failedFiles: counts.failed_files || 0,
       skippedFiles: counts.skipped_files || 0
     };
+  }
+  createReconcileTempTable() {
+    const name = `tmp_reconcile_files_${uuid.v4().replace(/-/g, "")}`;
+    getDb().exec(`
+      CREATE TEMP TABLE ${this.quoteIdentifier(name)} (
+        relative_path TEXT PRIMARY KEY,
+        file_size INTEGER NOT NULL,
+        mtime_ms REAL NOT NULL,
+        planned_object_key TEXT
+      )
+    `);
+    return name;
+  }
+  replacePlannedObjectKeysFromTempTable(taskId, quotedTempTable, now) {
+    const db2 = getDb();
+    const transaction = db2.transaction(() => {
+      db2.prepare(
+        `UPDATE task_file_destinations
+         SET planned_object_key = NULL, updated_at = ?
+         WHERE planned_object_key IS NOT NULL
+           AND id IN (
+             SELECT tfd.id
+             FROM task_file_destinations tfd
+             INNER JOIN task_files tf ON tf.id = tfd.task_file_id
+             LEFT JOIN ${quotedTempTable} scanned
+               ON scanned.relative_path = tf.relative_path
+              AND scanned.planned_object_key IS NOT NULL
+             WHERE tf.task_id = ?
+               AND scanned.relative_path IS NULL
+           )`
+      ).run(now, taskId);
+      db2.prepare(
+        `UPDATE task_file_destinations
+         SET planned_object_key = (
+             SELECT scanned.planned_object_key
+             FROM task_files tf
+             INNER JOIN ${quotedTempTable} scanned
+               ON scanned.relative_path = tf.relative_path
+             WHERE tf.id = task_file_destinations.task_file_id
+               AND scanned.planned_object_key IS NOT NULL
+           ),
+           updated_at = ?
+         WHERE task_file_id IN (
+           SELECT tf.id
+           FROM task_files tf
+           INNER JOIN ${quotedTempTable} scanned
+             ON scanned.relative_path = tf.relative_path
+           WHERE tf.task_id = ?
+             AND scanned.planned_object_key IS NOT NULL
+         )
+         AND (
+           planned_object_key IS NULL
+           OR planned_object_key != (
+             SELECT scanned.planned_object_key
+             FROM task_files tf
+             INNER JOIN ${quotedTempTable} scanned
+               ON scanned.relative_path = tf.relative_path
+             WHERE tf.id = task_file_destinations.task_file_id
+               AND scanned.planned_object_key IS NOT NULL
+           )
+         )`
+      ).run(now, taskId);
+    });
+    transaction();
+  }
+  emptyReconcileResult() {
+    return {
+      changed: false,
+      readyFiles: 0,
+      unstableFiles: 0,
+      failedFiles: 0,
+      skippedFiles: 0
+    };
+  }
+  quoteIdentifier(identifier) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(identifier)) {
+      throw new Error(`Invalid SQL identifier: ${identifier}`);
+    }
+    return `"${identifier}"`;
   }
   markFileChanged(fileId, fileSize, mtimeMs) {
     const db2 = getDb();
@@ -2164,7 +2421,7 @@ const DEFAULT_SETTINGS = {
   upload: {
     maxConcurrentTasks: 4,
     maxFilesPerTask: 12,
-    maxConcurrentUploads: 24,
+    maxConcurrentUploads: 12,
     multipartThreshold: 100 * 1024 * 1024,
     // 100MB
     startAfterTime: "20:30",
@@ -4081,7 +4338,7 @@ class TaskQueueService extends events.EventEmitter {
     const taskRepo = getTaskRepo();
     const availableSlots = maxConcurrent - this.runningTasks.size;
     if (availableSlots <= 0) return;
-    const pendingTasks = taskRepo.listRunnable();
+    const pendingTasks = this.priorityActive ? taskRepo.listRunnable() : taskRepo.listRunnable(void 0, 1);
     const prioritizedTasks = this.priorityActive ? pendingTasks.filter((task) => this.priorityTaskIds.has(task.id)) : pendingTasks;
     const eligibleTasks = prioritizedTasks.filter(
       (task) => canOverrideWindow || this.isTaskEligibleForCurrentStartCycle(
@@ -4249,6 +4506,13 @@ function getTaskQueueService() {
   if (!instance$d) instance$d = new TaskQueueService();
   return instance$d;
 }
+const MARKER_FILE_NAMES = /* @__PURE__ */ new Set([
+  "tmp_upload.json",
+  "process_task.json",
+  "day_upload.json"
+]);
+const ASYNC_STAT_BATCH_SIZE = 64;
+const DEFAULT_SCAN_BATCH_SIZE = 1e3;
 class FileFilterService {
   rules;
   whitelist = [];
@@ -4307,8 +4571,26 @@ class FileFilterService {
   }
   async scanFolderAsync(folderPath) {
     const results = [];
-    await this.walkDirAsync(folderPath, folderPath, results);
+    for await (const batch of this.scanFolderBatches(folderPath)) {
+      results.push(...batch);
+    }
     return results;
+  }
+  async *scanFolderBatches(folderPath, batchSize = DEFAULT_SCAN_BATCH_SIZE) {
+    const normalizedBatchSize = Math.max(1, Math.floor(batchSize || 1));
+    const pendingStats = [];
+    const batch = [];
+    yield* this.walkDirAsync(
+      folderPath,
+      folderPath,
+      pendingStats,
+      batch,
+      normalizedBatchSize
+    );
+    yield* this.flushPendingStats(pendingStats, batch, normalizedBatchSize);
+    if (batch.length > 0) {
+      yield batch.splice(0, batch.length);
+    }
   }
   walkDir(basePath, currentPath, results) {
     const entries = fs.readdirSync(currentPath, { withFileTypes: true });
@@ -4319,7 +4601,7 @@ class FileFilterService {
         this.walkDir(basePath, fullPath, results);
       } else if (entry.isFile()) {
         const relativePath = fullPath.slice(basePath.length + 1);
-        if (entry.name === "tmp_upload.json" || entry.name === "process_task.json" || entry.name === "day_upload.json") continue;
+        if (MARKER_FILE_NAMES.has(entry.name)) continue;
         if (this.shouldInclude(relativePath)) {
           const stat2 = fs.statSync(fullPath);
           results.push({
@@ -4332,28 +4614,53 @@ class FileFilterService {
       }
     }
   }
-  async walkDirAsync(basePath, currentPath, results) {
+  async *walkDirAsync(basePath, currentPath, pendingStats, batch, batchSize) {
     const entries = await promises.readdir(currentPath, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = path.join(currentPath, entry.name);
       if (entry.isDirectory()) {
         if (entry.name.startsWith(".")) continue;
-        await this.walkDirAsync(basePath, fullPath, results);
+        yield* this.walkDirAsync(
+          basePath,
+          fullPath,
+          pendingStats,
+          batch,
+          batchSize
+        );
       } else if (entry.isFile()) {
         const relativePath = fullPath.slice(basePath.length + 1);
-        if (entry.name === "tmp_upload.json" || entry.name === "process_task.json" || entry.name === "day_upload.json") continue;
+        if (MARKER_FILE_NAMES.has(entry.name)) continue;
         if (!this.shouldInclude(relativePath)) continue;
-        try {
-          const fileStat = await promises.stat(fullPath);
-          results.push({
-            relativePath,
-            absolutePath: fullPath,
-            size: fileStat.size,
-            mtimeMs: fileStat.mtimeMs
-          });
-        } catch {
+        pendingStats.push(this.statScannedFile(fullPath, relativePath));
+        if (pendingStats.length >= ASYNC_STAT_BATCH_SIZE) {
+          yield* this.flushPendingStats(pendingStats, batch, batchSize);
         }
       }
+    }
+  }
+  async *flushPendingStats(pendingStats, batch, batchSize) {
+    if (pendingStats.length === 0) return;
+    const statBatch = pendingStats.splice(0, pendingStats.length);
+    const files = await Promise.all(statBatch);
+    for (const file of files) {
+      if (!file) continue;
+      batch.push(file);
+      if (batch.length >= batchSize) {
+        yield batch.splice(0, batch.length);
+      }
+    }
+  }
+  async statScannedFile(fullPath, relativePath) {
+    try {
+      const fileStat = await promises.stat(fullPath);
+      return {
+        relativePath,
+        absolutePath: fullPath,
+        size: fileStat.size,
+        mtimeMs: fileStat.mtimeMs
+      };
+    } catch {
+      return null;
     }
   }
   compileRules() {
@@ -4773,14 +5080,14 @@ class ScannerService {
   }
   checkStability() {
     const today = this.formatLocalDate(/* @__PURE__ */ new Date());
-    const tasks = getTaskRepo().listContinuouslyMonitored(today);
-    if (tasks.length > 0) {
-      const batchSize = Math.min(RECONCILE_BATCH_SIZE, tasks.length);
+    const taskIds = getTaskRepo().listContinuouslyMonitoredTaskIds(today);
+    if (taskIds.length > 0) {
+      const batchSize = Math.min(RECONCILE_BATCH_SIZE, taskIds.length);
       for (let i = 0; i < batchSize; i++) {
-        const task = tasks[(this.stabilityCursor + i) % tasks.length];
-        if (task) this.queueReconcileTask(task);
+        const taskId = taskIds[(this.stabilityCursor + i) % taskIds.length];
+        if (taskId) this.queueReconcileTask(taskId);
       }
-      this.stabilityCursor = (this.stabilityCursor + batchSize) % tasks.length;
+      this.stabilityCursor = (this.stabilityCursor + batchSize) % taskIds.length;
     }
     this.broadcastStatus();
   }
@@ -4954,15 +5261,13 @@ class ScannerService {
     }
     try {
       const settings = getSettingsRepo().getAll();
-      const files = await new FileFilterService(task.profileSnapshot?.filter || settings.filter).scanFolderAsync(task.folderPath);
+      const fileFilter = new FileFilterService(
+        task.profileSnapshot?.filter || settings.filter
+      );
       const stableChecks = task.sourceType === "local" && task.dayFolderId ? Math.max(2, settings.stability.checkCount || 2) : 1;
-      getTaskRepo().reconcileFiles(
+      await getTaskRepo().reconcileFileBatches(
         task.id,
-        files.map((file) => ({
-          relativePath: file.relativePath,
-          size: file.size,
-          mtimeMs: file.mtimeMs
-        })),
+        fileFilter.scanFolderBatches(task.folderPath),
         stableChecks
       );
       const updated = getTaskRepo().getById(task.id);
@@ -7131,11 +7436,15 @@ class SpeedCalculator {
 class UploadSemaphore {
   constructor(max) {
     this.max = max;
+    this.max = this.normalizeMax(max);
   }
   current = 0;
   waiting = [];
   setMax(max) {
-    this.max = max;
+    this.max = this.normalizeMax(max);
+    for (const entry of this.waiting) {
+      entry.weight = Math.min(entry.weight, this.max);
+    }
     this.drain();
   }
   getMax() {
@@ -7144,23 +7453,25 @@ class UploadSemaphore {
   getCurrent() {
     return this.current;
   }
-  async acquire(signal) {
+  async acquire(signal, weight = 1) {
     if (signal?.aborted) {
       throw new DOMException("Semaphore acquire aborted", "AbortError");
     }
-    if (this.current < this.max) {
-      this.current++;
+    const effectiveWeight = this.normalizeAcquireWeight(weight);
+    if (this.waiting.length === 0 && this.current + effectiveWeight <= this.max) {
+      this.current += effectiveWeight;
       return;
     }
     return new Promise((resolve, reject) => {
       const id = Symbol();
       const entry = {
         resolve: () => {
-          this.current++;
+          this.current += entry.weight;
           cleanup();
           resolve();
         },
-        id
+        id,
+        weight: effectiveWeight
       };
       const onAbort = () => {
         const idx = this.waiting.findIndex((w) => w.id === id);
@@ -7173,23 +7484,36 @@ class UploadSemaphore {
       };
       signal?.addEventListener("abort", onAbort, { once: true });
       this.waiting.push(entry);
+      this.drain();
     });
   }
-  release() {
-    this.current--;
+  release(weight = 1) {
+    this.current = Math.max(0, this.current - this.normalizeReleaseWeight(weight));
     this.drain();
   }
   drain() {
-    while (this.waiting.length > 0 && this.current < this.max) {
-      const next = this.waiting.shift();
+    while (this.waiting.length > 0) {
+      const next = this.waiting[0];
+      next.weight = Math.min(next.weight, this.max);
+      if (this.current + next.weight > this.max) return;
+      this.waiting.shift();
       next.resolve();
     }
+  }
+  normalizeMax(max) {
+    return Math.max(1, Math.floor(max || 1));
+  }
+  normalizeAcquireWeight(weight) {
+    return Math.max(1, Math.min(this.normalizeReleaseWeight(weight), this.max));
+  }
+  normalizeReleaseWeight(weight) {
+    return Math.max(1, Math.floor(weight || 1));
   }
 }
 let instance$1 = null;
 function getUploadSemaphore(max) {
   if (!instance$1) {
-    instance$1 = new UploadSemaphore(max ?? 30);
+    instance$1 = new UploadSemaphore(max ?? 12);
   } else if (max !== void 0) {
     instance$1.setMax(max);
   }
@@ -7230,6 +7554,10 @@ class TaskRunnerService {
     if (destinations.length === 0) {
       throw new Error("任务没有配置任何上传目标");
     }
+    const destinationByProvider = new Map(
+      destinations.map((destination) => [destination.provider, destination])
+    );
+    const objectKeyBaseContext = this.buildObjectKeyBaseContext(task);
     const jobs = destinationRepo.listReadyFileTargets(
       task.id,
       requiredStableChecks
@@ -7238,7 +7566,11 @@ class TaskRunnerService {
       taskRepo.recalculateProgress(task.id);
       return this.updateDestinationFinalStates(task);
     }
-    this.assertNoDuplicateObjectKeys(task, destinations, jobs);
+    this.assertNoDuplicateObjectKeys(
+      destinationByProvider,
+      jobs,
+      objectKeyBaseContext
+    );
     const jobProviders = new Set(jobs.map((job) => job.provider));
     for (const destination of destinations) {
       if (!jobProviders.has(destination.provider)) continue;
@@ -7255,11 +7587,11 @@ class TaskRunnerService {
       uploadedBytes: initialLogicalSummary.completedBytes,
       lastPersistAt: 0
     };
-    const providers = Array.from(new Set(jobs.map((job) => job.provider)));
+    const providers = Array.from(jobProviders);
     const runtimes = /* @__PURE__ */ new Map();
     try {
       for (const provider of providers) {
-        const destination = destinations.find((item) => item.provider === provider);
+        const destination = destinationByProvider.get(provider);
         if (!destination) continue;
         const uploader = await getCloudUploadService().createTaskUploader(
           provider,
@@ -7281,6 +7613,7 @@ class TaskRunnerService {
           failedFiles: providerSummary.failed,
           skippedFiles: providerSummary.skipped,
           activeUploads: /* @__PURE__ */ new Map(),
+          activeBytes: 0,
           transferredBytes: 0,
           lastBroadcastAt: 0,
           lastProgressPersistAt: 0
@@ -7296,7 +7629,9 @@ class TaskRunnerService {
       for (const runtime of runtimes.values()) runtime.uploader.abort();
     };
     signal?.addEventListener("abort", abortUploaders, { once: true });
-    const markerDestinations = destinationRepo.listByTask(task.id);
+    const markerDestinations = destinations.map(
+      (destination) => jobProviders.has(destination.provider) ? { ...destination, status: "uploading" } : destination
+    );
     const marker = this.createCompactMarker(
       { ...task, status: "uploading" },
       markerDestinations
@@ -7310,9 +7645,9 @@ class TaskRunnerService {
         this.createCompactMarker(currentTask2, currentTask2.destinations)
       );
     }, MARKER_WRITE_INTERVAL_MS);
-    const semaphore = getUploadSemaphore(
-      settings.upload.maxConcurrentUploads || 24
-    );
+    const maxConcurrentUploads = settings.upload.maxConcurrentUploads || DEFAULT_SETTINGS.upload.maxConcurrentUploads;
+    const multipartThreshold = settings.upload.multipartThreshold || DEFAULT_SETTINGS.upload.multipartThreshold;
+    const semaphore = getUploadSemaphore(maxConcurrentUploads);
     let nextIndex = 0;
     const workerCount = Math.max(
       1,
@@ -7324,11 +7659,13 @@ class TaskRunnerService {
         await this.uploadTarget(
           task,
           target,
-          destinations,
           runtimes,
           semaphore,
           logicalProgress,
+          destinationByProvider,
+          objectKeyBaseContext,
           uploadRootPath,
+          multipartThreshold,
           signal
         );
       }
@@ -7369,21 +7706,20 @@ class TaskRunnerService {
     getTaskRepo().reconcileFiles(
       task.id,
       files,
-      stableChecks
+      stableChecks,
+      { replacePlannedObjectKeys: true }
     );
   }
-  assertNoDuplicateObjectKeys(task, destinations, jobs) {
+  assertNoDuplicateObjectKeys(destinationByProvider, jobs, objectKeyBaseContext) {
     const keysByProvider = /* @__PURE__ */ new Map();
     for (const target of jobs) {
-      const destination = destinations.find(
-        (item) => item.provider === target.provider
-      );
+      const destination = destinationByProvider.get(target.provider);
       if (!destination) continue;
       const objectKey = this.renderTaskObjectKey(
-        task,
         destination,
         target.relativePath,
-        target.plannedObjectKey
+        target.plannedObjectKey,
+        objectKeyBaseContext
       );
       const providerKeys = keysByProvider.get(target.provider) || /* @__PURE__ */ new Map();
       const existing = providerKeys.get(objectKey);
@@ -7396,7 +7732,7 @@ class TaskRunnerService {
       keysByProvider.set(target.provider, providerKeys);
     }
   }
-  renderTaskObjectKey(task, destination, relativePath, plannedObjectKey) {
+  renderTaskObjectKey(destination, relativePath, plannedObjectKey, objectKeyBaseContext) {
     if (plannedObjectKey) return plannedObjectKey;
     return renderObjectKey(
       {
@@ -7406,10 +7742,10 @@ class TaskRunnerService {
         pathMode: destination.pathMode,
         objectKeyTemplate: destination.objectKeyTemplate
       },
-      this.buildObjectKeyContext(task, relativePath)
+      this.buildObjectKeyContext(objectKeyBaseContext, relativePath)
     );
   }
-  buildObjectKeyContext(task, relativePath) {
+  buildObjectKeyBaseContext(task) {
     const dateContext = this.deriveDateContext(task.folderPath);
     return {
       sourcePath: task.folderPath,
@@ -7417,10 +7753,15 @@ class TaskRunnerService {
       dateName: dateContext.dateName,
       workDirName: dateContext.workDirName || task.folderName,
       folderName: task.folderName,
-      relativePath,
       profileId: task.profileId,
       profileName: task.profileName,
       createdAt: task.createdAt
+    };
+  }
+  buildObjectKeyContext(baseContext, relativePath) {
+    return {
+      ...baseContext,
+      relativePath
     };
   }
   deriveDateContext(folderPath) {
@@ -7443,13 +7784,11 @@ class TaskRunnerService {
     }
     return void 0;
   }
-  async uploadTarget(task, target, destinations, runtimes, semaphore, logicalProgress, uploadRootPath, signal) {
+  async uploadTarget(task, target, runtimes, semaphore, logicalProgress, destinationByProvider, objectKeyBaseContext, uploadRootPath, multipartThreshold, signal) {
     const taskRepo = getTaskRepo();
     const destinationRepo = getTaskDestinationRepo();
     const runtime = runtimes.get(target.provider);
-    const destination = destinations.find(
-      (item) => item.provider === target.provider
-    );
+    const destination = destinationByProvider.get(target.provider);
     if (!runtime || !destination) return;
     const localPath = path.join(uploadRootPath, target.relativePath);
     if (!fs.existsSync(localPath)) {
@@ -7468,8 +7807,13 @@ class TaskRunnerService {
       return;
     }
     let acquired = false;
+    const uploadWeight = this.getUploadSlotWeight(
+      target.fileSize,
+      multipartThreshold,
+      semaphore.getMax()
+    );
     try {
-      await semaphore.acquire(signal);
+      await semaphore.acquire(signal, uploadWeight);
       acquired = true;
       if (signal?.aborted) throw new DOMException("Upload aborted", "AbortError");
       const before = fs.statSync(localPath);
@@ -7493,10 +7837,10 @@ class TaskRunnerService {
         true
       );
       const objectKey = this.renderTaskObjectKey(
-        task,
         destination,
         target.relativePath,
-        target.plannedObjectKey
+        target.plannedObjectKey,
+        objectKeyBaseContext
       );
       let previousLoaded = 0;
       const result = await runtime.uploader.uploadFile(
@@ -7511,6 +7855,7 @@ class TaskRunnerService {
           const delta = Math.max(0, loaded - previousLoaded);
           previousLoaded = loaded;
           runtime.transferredBytes += delta;
+          runtime.activeBytes += loaded - (runtime.activeUploads.get(target.id) || 0);
           runtime.activeUploads.set(target.id, loaded);
           runtime.speed.addSample(runtime.transferredBytes);
           this.broadcastProgress(
@@ -7592,11 +7937,19 @@ class TaskRunnerService {
         );
       }
     } finally {
+      runtime.activeBytes = Math.max(
+        0,
+        runtime.activeBytes - (runtime.activeUploads.get(target.id) || 0)
+      );
       runtime.activeUploads.delete(target.id);
-      if (acquired) semaphore.release();
+      if (acquired) semaphore.release(uploadWeight);
       this.persistProviderProgress(task.id, target.provider, runtime);
       this.broadcastProgress(task.id, target.provider, runtime, null, true);
     }
+  }
+  getUploadSlotWeight(fileSize, multipartThreshold, maxConcurrentUploads) {
+    if (fileSize <= multipartThreshold) return 1;
+    return Math.max(1, Math.min(4, Math.floor(maxConcurrentUploads || 1)));
   }
   persistProviderProgress(taskId, provider, runtime, force = false) {
     const now = Date.now();
@@ -7730,10 +8083,6 @@ class TaskRunnerService {
     const now = Date.now();
     if (!force && now - runtime.lastBroadcastAt < 250) return;
     runtime.lastBroadcastAt = now;
-    const inFlightBytes = Array.from(runtime.activeUploads.values()).reduce(
-      (sum, bytes) => sum + bytes,
-      0
-    );
     const progress = {
       taskId,
       provider,
@@ -7741,7 +8090,7 @@ class TaskRunnerService {
       totalFiles: runtime.totalFiles,
       uploadedBytes: Math.min(
         runtime.totalBytes,
-        runtime.uploadedBytes + inFlightBytes
+        runtime.uploadedBytes + runtime.activeBytes
       ),
       totalBytes: runtime.totalBytes,
       speed: runtime.speed.getSpeed(),

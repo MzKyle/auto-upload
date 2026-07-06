@@ -9,7 +9,7 @@ interface PatternMatcher {
   wildcard?: RegExp
 }
 
-interface ScannedFile {
+export interface ScannedFile {
   relativePath: string
   absolutePath: string
   size: number
@@ -22,6 +22,7 @@ const MARKER_FILE_NAMES = new Set([
   'day_upload.json'
 ])
 const ASYNC_STAT_BATCH_SIZE = 64
+const DEFAULT_SCAN_BATCH_SIZE = 1000
 
 /**
  * 文件过滤规则引擎
@@ -102,19 +103,31 @@ export class FileFilterService {
 
   async scanFolderAsync(folderPath: string): Promise<ScannedFile[]> {
     const results: ScannedFile[] = []
-    const pendingStats: Array<Promise<ScannedFile | null>> = []
-    const flushStats = async (): Promise<void> => {
-      if (pendingStats.length === 0) return
-      const batch = pendingStats.splice(0, pendingStats.length)
-      const files = await Promise.all(batch)
-      for (const file of files) {
-        if (file) results.push(file)
-      }
+    for await (const batch of this.scanFolderBatches(folderPath)) {
+      results.push(...batch)
     }
-
-    await this.walkDirAsync(folderPath, folderPath, pendingStats, flushStats)
-    await flushStats()
     return results
+  }
+
+  async *scanFolderBatches(
+    folderPath: string,
+    batchSize = DEFAULT_SCAN_BATCH_SIZE
+  ): AsyncGenerator<ScannedFile[]> {
+    const normalizedBatchSize = Math.max(1, Math.floor(batchSize || 1))
+    const pendingStats: Array<Promise<ScannedFile | null>> = []
+    const batch: ScannedFile[] = []
+
+    yield* this.walkDirAsync(
+      folderPath,
+      folderPath,
+      pendingStats,
+      batch,
+      normalizedBatchSize
+    )
+    yield* this.flushPendingStats(pendingStats, batch, normalizedBatchSize)
+    if (batch.length > 0) {
+      yield batch.splice(0, batch.length)
+    }
   }
 
   private walkDir(
@@ -146,18 +159,25 @@ export class FileFilterService {
     }
   }
 
-  private async walkDirAsync(
+  private async *walkDirAsync(
     basePath: string,
     currentPath: string,
     pendingStats: Array<Promise<ScannedFile | null>>,
-    flushStats: () => Promise<void>
-  ): Promise<void> {
+    batch: ScannedFile[],
+    batchSize: number
+  ): AsyncGenerator<ScannedFile[]> {
     const entries = await readdir(currentPath, { withFileTypes: true })
     for (const entry of entries) {
       const fullPath = join(currentPath, entry.name)
       if (entry.isDirectory()) {
         if (entry.name.startsWith('.')) continue
-        await this.walkDirAsync(basePath, fullPath, pendingStats, flushStats)
+        yield* this.walkDirAsync(
+          basePath,
+          fullPath,
+          pendingStats,
+          batch,
+          batchSize
+        )
       } else if (entry.isFile()) {
         const relativePath = fullPath.slice(basePath.length + 1)
         if (MARKER_FILE_NAMES.has(entry.name)) continue
@@ -165,8 +185,25 @@ export class FileFilterService {
 
         pendingStats.push(this.statScannedFile(fullPath, relativePath))
         if (pendingStats.length >= ASYNC_STAT_BATCH_SIZE) {
-          await flushStats()
+          yield* this.flushPendingStats(pendingStats, batch, batchSize)
         }
+      }
+    }
+  }
+
+  private async *flushPendingStats(
+    pendingStats: Array<Promise<ScannedFile | null>>,
+    batch: ScannedFile[],
+    batchSize: number
+  ): AsyncGenerator<ScannedFile[]> {
+    if (pendingStats.length === 0) return
+    const statBatch = pendingStats.splice(0, pendingStats.length)
+    const files = await Promise.all(statBatch)
+    for (const file of files) {
+      if (!file) continue
+      batch.push(file)
+      if (batch.length >= batchSize) {
+        yield batch.splice(0, batch.length)
       }
     }
   }

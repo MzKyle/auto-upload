@@ -4,6 +4,7 @@ import { BrowserWindow } from 'electron'
 import log from 'electron-log'
 import { IPC } from '@shared/ipc-channels'
 import { isDateFolderName } from '@shared/day-folder'
+import { DEFAULT_SETTINGS } from '@shared/constants'
 import {
   renderObjectKey,
   type ObjectKeyRenderContext
@@ -195,9 +196,13 @@ export class TaskRunnerService {
       )
     }, MARKER_WRITE_INTERVAL_MS)
 
-    const semaphore = getUploadSemaphore(
-      settings.upload.maxConcurrentUploads || 24
-    )
+    const maxConcurrentUploads =
+      settings.upload.maxConcurrentUploads ||
+      DEFAULT_SETTINGS.upload.maxConcurrentUploads
+    const multipartThreshold =
+      settings.upload.multipartThreshold ||
+      DEFAULT_SETTINGS.upload.multipartThreshold
+    const semaphore = getUploadSemaphore(maxConcurrentUploads)
     let nextIndex = 0
     const workerCount = Math.max(
       1,
@@ -216,6 +221,7 @@ export class TaskRunnerService {
           destinationByProvider,
           objectKeyBaseContext,
           uploadRootPath,
+          multipartThreshold,
           signal
         )
       }
@@ -378,6 +384,7 @@ export class TaskRunnerService {
     destinationByProvider: Map<CloudProvider, Task['destinations'][number]>,
     objectKeyBaseContext: ObjectKeyBaseContext,
     uploadRootPath: string,
+    multipartThreshold: number,
     signal?: AbortSignal
   ): Promise<void> {
     const taskRepo = getTaskRepo()
@@ -404,8 +411,13 @@ export class TaskRunnerService {
     }
 
     let acquired = false
+    const uploadWeight = this.getUploadSlotWeight(
+      target.fileSize,
+      multipartThreshold,
+      semaphore.getMax()
+    )
     try {
-      await semaphore.acquire(signal)
+      await semaphore.acquire(signal, uploadWeight)
       acquired = true
       if (signal?.aborted) throw new DOMException('Upload aborted', 'AbortError')
 
@@ -549,10 +561,19 @@ export class TaskRunnerService {
         runtime.activeBytes - (runtime.activeUploads.get(target.id) || 0)
       )
       runtime.activeUploads.delete(target.id)
-      if (acquired) semaphore.release()
+      if (acquired) semaphore.release(uploadWeight)
       this.persistProviderProgress(task.id, target.provider, runtime)
       this.broadcastProgress(task.id, target.provider, runtime, null, true)
     }
+  }
+
+  private getUploadSlotWeight(
+    fileSize: number,
+    multipartThreshold: number,
+    maxConcurrentUploads: number
+  ): number {
+    if (fileSize <= multipartThreshold) return 1
+    return Math.max(1, Math.min(4, Math.floor(maxConcurrentUploads || 1)))
   }
 
   private persistProviderProgress(
